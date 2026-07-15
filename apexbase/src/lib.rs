@@ -3,6 +3,11 @@
 //! A high-performance embedded database storage engine implemented in Rust.
 //! Provides Python bindings via PyO3 for seamless integration.
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
+
 pub mod data;
 pub mod embedded;
 #[cfg(feature = "flight")]

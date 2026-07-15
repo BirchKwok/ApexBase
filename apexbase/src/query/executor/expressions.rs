@@ -337,6 +337,29 @@ impl ApexExecutor {
                 values,
                 negated,
             } => Self::evaluate_in_values(batch, column, values, *negated),
+            SqlExpr::FtsResolved { doc_ids } => {
+                let ids = Self::get_column_by_name(batch, "_id")
+                    .ok_or_else(|| err_not_found("Column: _id"))?;
+                if let Some(ids) = ids.as_any().downcast_ref::<UInt64Array>() {
+                    Ok(BooleanArray::from_iter(
+                        (0..ids.len()).map(|row| {
+                            (!ids.is_null(row)).then(|| doc_ids.contains(ids.value(row)))
+                        }),
+                    ))
+                } else if let Some(ids) = ids.as_any().downcast_ref::<Int64Array>() {
+                    Ok(BooleanArray::from_iter((0..ids.len()).map(|row| {
+                        (!ids.is_null(row)).then(|| {
+                            let id = ids.value(row);
+                            id >= 0 && doc_ids.contains(id as u64)
+                        })
+                    })))
+                } else {
+                    Err(err_data("FTS requires an Int64 or UInt64 _id column"))
+                }
+            }
+            SqlExpr::FtsScore { .. } | SqlExpr::FtsScoreResolved { .. } => {
+                Err(err_data("FTS_SCORE() is numeric and cannot be used as a predicate directly"))
+            }
             SqlExpr::Like {
                 column,
                 pattern,
@@ -1532,10 +1555,45 @@ impl ApexExecutor {
             SqlExpr::Like { .. }
             | SqlExpr::Regexp { .. }
             | SqlExpr::In { .. }
+            | SqlExpr::FtsResolved { .. }
             | SqlExpr::Between { .. }
             | SqlExpr::IsNull { .. } => {
                 Ok(Arc::new(Self::evaluate_predicate(batch, expr)?) as ArrayRef)
             }
+            SqlExpr::FtsScoreResolved { scores } => {
+                let ids = Self::get_column_by_name(batch, "_id")
+                    .ok_or_else(|| err_not_found("Column: _id"))?;
+                let values: Vec<f64> = if let Some(ids) = ids.as_any().downcast_ref::<UInt64Array>() {
+                    (0..ids.len())
+                        .map(|row| {
+                            if ids.is_null(row) {
+                                0.0
+                            } else {
+                                scores.get(&ids.value(row)).copied().unwrap_or(0.0) as f64
+                            }
+                        })
+                        .collect()
+                } else if let Some(ids) = ids.as_any().downcast_ref::<Int64Array>() {
+                    (0..ids.len())
+                        .map(|row| {
+                            if ids.is_null(row) || ids.value(row) < 0 {
+                                0.0
+                            } else {
+                                scores
+                                    .get(&(ids.value(row) as u64))
+                                    .copied()
+                                    .unwrap_or(0.0) as f64
+                            }
+                        })
+                        .collect()
+                } else {
+                    return Err(err_data("FTS_SCORE() requires an Int64 or UInt64 _id column"));
+                };
+                Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+            }
+            SqlExpr::FtsScore { .. } => Err(err_data(
+                "FTS_SCORE() was not resolved; initialise FTS and provide MATCH() or an explicit query",
+            )),
             SqlExpr::Case {
                 when_then,
                 else_expr,
@@ -5808,9 +5866,8 @@ impl ApexExecutor {
             };
         }
 
-        // Fast path for integer columns: one hash-set build plus one O(N) scan.
-        // Large FTS result sets are rewritten to `_id IN (...)`; evaluating one
-        // Arrow equality kernel per id turns hybrid search into O(N * K).
+        // Fast path for explicit integer IN lists: one hash-set build plus one
+        // O(N) scan. FTS result sets use the dedicated Roaring predicate above.
         if let Some(int_arr) = target.as_any().downcast_ref::<Int64Array>() {
             if let Some(int_set) = values
                 .iter()

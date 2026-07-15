@@ -214,12 +214,13 @@ class TestFTSPersistenceLifecycle:
             _ = client.search_text("python")
             client.close()
 
-            index_path = Path(temp_dir) / "fts_indexes" / "default.nfts"
-            # Index file may not exist on some platforms until flushed, but drop_fts should try to remove it if present
+            index_path = Path(temp_dir) / "fts_indexes" / "default.afts"
+            assert index_path.exists()
             client2 = ApexClient(dirpath=temp_dir)
             client2.create_table("default")
             client2.drop_fts()
             client2.close()
+            assert not index_path.exists()
 
             cfg_path = Path(temp_dir) / "fts_config.json"
             if cfg_path.exists():
@@ -812,6 +813,183 @@ class TestFTSStatistics:
             warmed_count = client.warmup_fts_terms(["nonexistent"])
             assert warmed_count == 0
             
+            client.close()
+
+
+class TestApexFTSStorage:
+    """ApexFTS-owned storage, analyzer, and lifecycle guarantees."""
+
+    def test_multilingual_unicode_analyzer_and_query_punctuation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.init_fts(index_fields=["content"])
+            client.store([
+                {"content": "Hello, café crème"},
+                {"content": "Привет мир"},
+                {"content": "مرحبا بالعالم"},
+                {"content": "日本語テスト"},
+                {"content": "한국어 검색"},
+                {"content": "人工智能数据库"},
+            ])
+
+            for query, expected_id in [
+                ("hello,", 1),
+                ("CAFÉ", 1),
+                ("привет", 2),
+                ("مرحبا", 3),
+                ("テスト", 4),
+                ("한국어", 5),
+                ("人工智能", 6),
+            ]:
+                assert client.search_text(query).tolist() == [expected_id]
+            client.close()
+
+    def test_bm25_phrase_search_sql_bitmap_and_reopen(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.init_fts(index_fields=["title", "body"])
+            client.store([
+                {"title": "quick brown", "body": "rust rust rust database"},
+                {"title": "quick red brown", "body": "rust database"},
+                {"title": "quick", "body": "brown rust"},
+            ])
+
+            ranked = client.search_text_with_scores("rust")
+            assert ranked[0][0] == 1
+            assert {doc_id for doc_id, _ in ranked} == {1, 2, 3}
+            assert ranked[0][1] > max(score for _, score in ranked[1:])
+            assert set(client.search_text("quick brown").tolist()) == {1, 2, 3}
+            assert client.search_text('"quick brown"').tolist() == [1]
+
+            matched = client.execute(
+                "SELECT _id FROM default WHERE MATCH('quick') AND _id >= 2 ORDER BY _id"
+            ).to_pandas()
+            assert matched["_id"].tolist() == [2, 3]
+            client.close()
+
+            client = ApexClient(dirpath=temp_dir)
+            client.use_table("default")
+            assert client.search_text('"quick brown"').tolist() == [1]
+            reopened = client.search_text_with_scores("rust")
+            assert reopened[0][0] == 1
+            assert reopened[0][1] > reopened[1][1]
+            client.close()
+
+    def test_sql_fts_score_projection_alias_and_direct_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.init_fts(index_fields=["body"], lazy_load=True, cache_size=2)
+            client.store([
+                {"body": "rust rust rust database"},
+                {"body": "rust database"},
+                {"body": "database only"},
+            ])
+            client.compact_fts_index()
+
+            ranked = client.execute(
+                "SELECT _id, FTS_SCORE() AS relevance FROM default "
+                "WHERE MATCH('rust') ORDER BY relevance DESC"
+            ).to_pandas()
+            assert ranked["_id"].tolist() == [1, 2]
+            assert ranked["relevance"].iloc[0] > ranked["relevance"].iloc[1] > 0
+
+            direct = client.execute(
+                "SELECT _id FROM default WHERE MATCH('rust') "
+                "ORDER BY FTS_SCORE('rust') DESC"
+            ).to_pandas()
+            assert direct["_id"].tolist() == [1, 2]
+            client.close()
+
+            reopened = ApexClient(dirpath=temp_dir)
+            reopened.use_table("default")
+            rows = reopened.execute(
+                "SELECT _id, FTS_SCORE() AS relevance FROM default "
+                "WHERE MATCH('rust') ORDER BY relevance DESC"
+            ).to_pandas()
+            assert rows["_id"].tolist() == [1, 2]
+            reopened.close()
+
+    def test_replace_delete_and_wal_survive_reopen(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.init_fts(index_fields=["content"])
+            client.store({"content": "old searchable value"})
+            assert client.replace(1, {"content": "new searchable value"})
+            assert client.search_text("old").tolist() == []
+            assert client.search_text("new").tolist() == [1]
+            client.close()
+
+            client = ApexClient(dirpath=temp_dir)
+            client.use_table("default")
+            assert client.search_text("old").tolist() == []
+            assert client.search_text("new").tolist() == [1]
+            assert client.delete(1)
+            client.close()
+
+            client = ApexClient(dirpath=temp_dir)
+            client.use_table("default")
+            assert client.search_text("new").tolist() == []
+            client.close()
+
+    def test_sql_update_and_create_index_rebuild_remove_stale_terms(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.init_fts(index_fields=["title"])
+            client.store({"title": "old title", "body": "new body"})
+
+            client.execute("UPDATE default SET title = 'updated title' WHERE _id = 1")
+            assert client.search_text("old").tolist() == []
+            assert client.search_text("updated").tolist() == [1]
+
+            client.execute("CREATE FTS INDEX ON default (body)")
+            assert client.search_text("updated").tolist() == []
+            assert client.search_text("body").tolist() == [1]
+            client.close()
+
+    def test_legacy_index_is_rebuilt_from_apex_table(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.store({"content": "migration source of truth"})
+            client.close()
+
+            fts_dir = Path(temp_dir) / "fts_indexes"
+            fts_dir.mkdir()
+            (fts_dir / "default.nfts").write_bytes(b"legacy nanofts data")
+            (Path(temp_dir) / "fts_config.json").write_text(json.dumps({
+                "default": {
+                    "enabled": True,
+                    "index_fields": ["content"],
+                    "config": {"lazy_load": False, "cache_size": 10000},
+                }
+            }), encoding="utf-8")
+
+            client = ApexClient(dirpath=temp_dir)
+            client.use_table("default")
+            assert client.search_text("migration").tolist() == [1]
+            client.close()
+            assert (fts_dir / "default.afts").exists()
+
+    def test_named_table_search_initializes_and_restores_current_table(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("articles")
+            client.init_fts(index_fields=["content"])
+            client.store({"content": "article needle"})
+            client.create_table("comments")
+            client.init_fts(index_fields=["content"])
+            client.store({"content": "comment needle"})
+
+            client.use_table("articles")
+            assert client.search_text("comment", table_name="comments").tolist() == [1]
+            assert client._current_table == "articles"
+            assert client.search_text("article").tolist() == [1]
+            assert client.search_text("comment").tolist() == []
             client.close()
 
 

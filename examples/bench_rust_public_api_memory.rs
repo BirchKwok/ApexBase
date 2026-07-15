@@ -19,9 +19,9 @@ use arrow::record_batch::RecordBatch;
 use serde::Serialize;
 
 extern "C" {
-    // ApexBase already uses mimalloc through nanofts. This allocator-provided
+    // ApexBase uses mimalloc directly. This allocator-provided
     // API reports precise current/peak RSS on macOS without replacing the
-    // process allocator (which would conflict with nanofts).
+    // process allocator.
     fn mi_process_info(
         elapsed_msecs: *mut usize,
         user_msecs: *mut usize,

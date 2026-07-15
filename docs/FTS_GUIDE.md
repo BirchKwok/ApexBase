@@ -1,6 +1,6 @@
 # Full-Text Search (FTS) Guide
 
-ApexBase integrates a high-performance full-text search engine ([NanoFTS](https://crates.io/crates/nanofts)) directly into the Rust SQL executor. FTS is a **first-class SQL feature** — indexes are created with DDL statements and queried with standard `WHERE` predicates, making FTS available through every interface: Python API, PostgreSQL Wire, and Arrow Flight.
+ApexBase includes **ApexFTS**, its native Rust full-text storage engine, directly in the SQL executor. FTS is a **first-class SQL feature** — indexes are created with DDL statements and queried with standard `WHERE` predicates, making FTS available through every interface: Python API, PostgreSQL Wire, and Arrow Flight. No external NanoFTS package is required.
 
 ---
 
@@ -15,6 +15,7 @@ ApexBase integrates a high-performance full-text search engine ([NanoFTS](https:
    - [SHOW FTS INDEXES](#show-fts-indexes)
 4. [Query Reference](#query-reference)
    - [MATCH()](#match)
+   - [FTS_SCORE()](#fts_score)
    - [FUZZY_MATCH()](#fuzzy_match)
 5. [Combining FTS with SQL](#combining-fts-with-sql)
 6. [Python API](#python-api)
@@ -34,7 +35,7 @@ ApexBase integrates a high-performance full-text search engine ([NanoFTS](https:
                     │                                      │
   Python API  ───►  │  parse SQL → detect MATCH() →       │
   PG Wire     ───►  │  look up FtsManager →               │
-  Arrow Flight ───► │  search → _id IN (...) → filter     │
+  Arrow Flight ───► │  search → Roaring bitmap → filter   │
                     │                                      │
                     └────────────┬────────────────────────┘
                                  │
@@ -45,15 +46,20 @@ ApexBase integrates a high-performance full-text search engine ([NanoFTS](https:
                     └────────────┬────────────────────────┘
                                  │
                     ┌────────────▼────────────────────────┐
-                    │  Disk: {dir}/fts_indexes/{table}.nfts│
+                    │  Disk: {dir}/fts_indexes/{table}.afts│
+                    │        + {table}.afts.wal            │
                     │         {dir}/fts_config.json        │
                     └─────────────────────────────────────┘
 ```
 
 Key design points:
 - FTS state is stored in a **global Rust registry** keyed by database directory, so PG Wire and Arrow Flight connections share the same FTS engines as Python API calls.
-- `MATCH('query')` in a `WHERE` clause is resolved to `_id IN (matching_ids)` before the query planner runs — zero changes to the rest of the execution pipeline.
+- `MATCH('query')` in a `WHERE` clause is resolved once to an `Arc<RoaringTreemap>`; Arrow batches test `_id` membership directly without materializing an `IN` list.
 - The configuration is persisted in `fts_config.json` alongside the `.apex` data files, and is re-loaded automatically on process restart.
+- Postings use 64-bit Roaring bitmaps. Packed per-document token streams provide BM25 term frequency, document length, and phrase positions without duplicating the term dictionary.
+- Updates and deletes are recorded in a checksummed WAL and compacted into an atomically replaced v3 snapshot.
+- With `lazy_load=true`, the fixed-width term directory and posting blobs remain mmap-backed; posting bitmaps are decoded on first access into a bounded cache.
+- Text is NFKC-normalized and Unicode-lowercased. Unicode word boundaries cover Latin, Cyrillic, Arabic and other spaced scripts; n-grams cover Han, Hiragana, Katakana and Hangul.
 
 ---
 
@@ -104,7 +110,7 @@ CREATE FTS INDEX ON table_name
 
 **Effect:**
 - Registers the table in `fts_config.json` with `enabled = true`.
-- Creates (or opens) the NanoFTS engine for the table under `{dir}/fts_indexes/{table}.nfts`.
+- Creates (or opens) the ApexFTS engine for the table under `{dir}/fts_indexes/{table}.afts` and replays `{table}.afts.wal`.
 - **Existing rows are back-filled automatically** — all rows already in the table are indexed immediately. The status message reports the number of rows indexed.
 - New documents stored via `store()` / `INSERT` are indexed automatically on every write.
 
@@ -124,8 +130,8 @@ CREATE FTS INDEX ON articles
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `lazy_load` | bool | `false` | Load index lazily on first search instead of at startup |
-| `cache_size` | int | `10000` | Number of terms to keep in the LRU cache |
+| `lazy_load` | bool | `false` | mmap the v3 term directory and decode postings on first access |
+| `cache_size` | int | `10000` | Maximum decoded posting bitmaps retained in lazy mode |
 
 ```sql
 CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)
@@ -138,10 +144,10 @@ CREATE FTS INDEX ON articles (title) WITH (cache_size=100000)
 # Index title + content
 client.execute("CREATE FTS INDEX ON articles (title, content)")
 
-# Index all string columns with a large cache
+# Retain up to 200,000 decoded posting bitmaps
 client.execute("CREATE FTS INDEX ON wiki WITH (cache_size=200000)")
 
-# Large index with lazy loading
+# Keep the term directory and postings mmap-backed across reopen
 client.execute("CREATE FTS INDEX ON emails (subject, body) WITH (lazy_load=true)")
 ```
 
@@ -155,7 +161,7 @@ DROP FTS INDEX ON table_name
 
 **Effect:**
 - Removes the table entry from `fts_config.json`.
-- Deletes the `.nfts` index file and its WAL from `{dir}/fts_indexes/`.
+- Deletes the `.afts` snapshot and WAL from `{dir}/fts_indexes/`, together with legacy `.nfts` files when present.
 - Removes the in-memory engine from the global registry.
 
 ```python
@@ -216,8 +222,8 @@ Returns a result set describing all FTS-configured tables across **all databases
 | `table` | string | Table name |
 | `enabled` | bool | Whether FTS is currently active |
 | `fields` | string | Indexed columns (comma-separated, or `(all string cols)`) |
-| `lazy_load` | bool | Lazy-load mode |
-| `cache_size` | int | LRU cache size |
+| `lazy_load` | bool | Stored compatibility setting |
+| `cache_size` | int | Stored compatibility setting |
 
 ```python
 df = client.execute("SHOW FTS INDEXES").to_pandas()
@@ -247,13 +253,30 @@ SELECT * FROM articles WHERE MATCH('python')
 -- Multi-term (all terms must appear)
 SELECT * FROM articles WHERE MATCH('machine learning')
 
+-- Exact phrase: terms must be adjacent and in this order
+SELECT * FROM articles WHERE MATCH('"machine learning"')
+
 -- Chinese / CJK supported
 SELECT * FROM articles WHERE MATCH('人工智能')
 ```
 
-**Return behaviour:** Internally resolves to `_id IN (doc1, doc2, ...)` — zero rows returned if no matches.
+**Return behaviour:** The executor retains matches as a compressed bitmap and evaluates `_id` membership directly — zero rows are returned if there are no matches. SQL rows follow normal query ordering; add `ORDER BY` when deterministic SQL order is required.
 
 ---
+
+### FTS_SCORE()
+
+`FTS_SCORE()` exposes the BM25 relevance of the unique `MATCH()` query in the same statement:
+
+```sql
+SELECT title, FTS_SCORE() AS relevance
+FROM articles
+WHERE MATCH('embedded database')
+ORDER BY relevance DESC
+LIMIT 20;
+```
+
+An explicit query is also supported: `ORDER BY FTS_SCORE('embedded database') DESC`. Without an argument, the statement must contain exactly one non-fuzzy `MATCH()` query.
 
 ### FUZZY_MATCH()
 
@@ -348,6 +371,19 @@ client.init_fts(index_fields=["title", "content"])
 ids = client.search_text("query", table_name=None)  # → np.ndarray[int64]
 ```
 
+Results are ordered by BM25 relevance. Wrap the query in double quotes for an exact phrase:
+
+```python
+ids = client.search_text('"distributed database"')
+```
+
+### search_text_with_scores
+
+```python
+hits = client.search_text_with_scores("query", limit=1000)
+# [(document_id, bm25_score), ...]
+```
+
 ### fuzzy_search_text
 
 ```python
@@ -421,9 +457,11 @@ No extra configuration required — the FTS registry is global within the server
 ├── articles.apex          ← table data
 ├── fts_config.json        ← FTS configuration (shared with Python API)
 └── fts_indexes/
-    ├── articles.nfts      ← NanoFTS index file
-    └── articles.nfts.wal  ← Write-ahead log
+    ├── articles.afts      ← ApexFTS atomic snapshot
+    └── articles.afts.wal  ← checksummed write-ahead log
 ```
+
+When an enabled table has only a legacy `.nfts` file, ApexBase treats the `.apex` table as the source of truth and rebuilds an `.afts` snapshot on first initialization. Unknown or corrupt ApexFTS versions are quarantined instead of being opened as valid data.
 
 **`fts_config.json` format:**
 
@@ -450,19 +488,8 @@ This file is written by both the Rust DDL handlers (`CREATE FTS INDEX`) and the 
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `lazy_load` | `false` | Load index from disk only on first search. Reduces startup time for large indexes. |
-| `cache_size` | `10000` | Number of terms held in the LRU cache. Larger = faster repeated queries, more RAM. |
-
-Typical values:
-
-| Use case | `cache_size` | `lazy_load` |
-|----------|-------------|-------------|
-| Small table (< 100K docs) | `10000` | `false` |
-| Medium table (100K–1M docs) | `50000` | `false` |
-| Large table (> 1M docs) | `100000`–`500000` | `true` |
-| Log table (write-heavy) | `10000` | `true` |
-
----
+| `lazy_load` | `false` | Keep the v3 term directory and postings mmap-backed. |
+| `cache_size` | `10000` | Maximum decoded posting bitmaps retained in lazy mode. |
 
 ## Performance Tips
 
@@ -470,7 +497,7 @@ Typical values:
 
 2. **Use `MATCH()` for known-correct queries.** `FUZZY_MATCH()` is slower due to edit-distance computation — reserve it for user search boxes.
 
-3. **Combine with secondary indexes.** FTS resolves to `_id IN (...)` which the executor filters efficiently. Add a B-Tree index on high-selectivity non-FTS columns to speed up compound predicates:
+3. **Combine with secondary indexes.** FTS supplies a compressed `_id` bitmap which the executor filters efficiently. Add a B-Tree index on high-selectivity non-FTS columns to speed up compound predicates:
    ```sql
    CREATE INDEX idx_cat ON articles (category);
    SELECT * FROM articles WHERE MATCH('python') AND category = 'tutorial';
@@ -478,13 +505,11 @@ Typical values:
 
 4. **Flush before searching.** After a bulk `store()`, call `client._storage._fts_flush()` (or just wait — the WAL is flushed automatically on close) to ensure all documents are searchable.
 
-5. **Lazy load for large indexes.** Set `lazy_load=true` for indexes > 500 MB to avoid long startup times:
-   ```sql
-   CREATE FTS INDEX ON large_table WITH (lazy_load=true, cache_size=200000)
-   ```
+5. **Compact after write-heavy periods.** `client.compact_fts_index()` merges snapshot, WAL, updates, and tombstones into one atomic `.afts` snapshot.
 
 ---
 
 ## Known Constraints
 
-- **No ranking scores.** `MATCH()` returns a boolean filter (matched / not matched). Document ranking scores are not exposed in SQL; use the Python `search_text()` API for ranked result ordering.
+- `FTS_SCORE()` currently scores exact `MATCH()` queries; fuzzy edit-distance candidates do not expose BM25 scores through SQL.
+- Legacy v2 snapshots use the eager compatibility loader and upgrade to v3 on the next compaction.

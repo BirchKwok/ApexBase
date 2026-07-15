@@ -58,6 +58,8 @@ Cargo.lock
 *.ipynb
 *.apex
 *.nfts
+*.afts
+*.afts.wal
 
 .cursor/
 .windsurf/

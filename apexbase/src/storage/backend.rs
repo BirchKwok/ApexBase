@@ -6,7 +6,7 @@
 //! Memory-efficient persistence using the V4 format
 
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -61,8 +61,7 @@ fn evict_global_dict_cache(
     max_entries: usize,
 ) {
     while !cache.is_empty()
-        && (current_bytes.saturating_add(incoming_bytes) > max_bytes
-            || cache.len() >= max_entries)
+        && (current_bytes.saturating_add(incoming_bytes) > max_bytes || cache.len() >= max_entries)
     {
         let Some(key) = cache
             .iter()
@@ -488,6 +487,18 @@ pub struct TableStorageBackend {
 }
 
 impl TableStorageBackend {
+    /// Read the persisted row count without opening the full table backend.
+    ///
+    /// This is a scheduling hint: V4 deletion vectors are accounted for when
+    /// the backend is opened by the worker, while this path intentionally
+    /// touches only the fixed-size header.
+    pub(crate) fn persisted_row_count_hint(path: &Path) -> io::Result<u64> {
+        let mut file = std::fs::File::open(path)?;
+        let mut header_bytes = [0u8; 256];
+        file.read_exact(&mut header_bytes)?;
+        Ok(crate::storage::on_demand::OnDemandHeader::from_bytes(&header_bytes)?.row_count)
+    }
+
     /// Helper to build Self from storage (reduces code duplication)
     #[inline]
     fn from_storage_with_row_count(path: &Path, storage: OnDemandStorage, row_count: u64) -> Self {
@@ -4632,6 +4643,24 @@ mod tests {
         assert_eq!(bytes, 4);
         assert!(!cache.contains_key(&(PathBuf::from("old.apex"), "value".to_string())));
         assert!(cache.contains_key(&(PathBuf::from("hot.apex"), "value".to_string())));
+    }
+
+    #[test]
+    fn persisted_row_count_hint_reads_only_header_count() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("row_count_hint.apex");
+        let backend = TableStorageBackend::create(&path).unwrap();
+        let rows = (0..3)
+            .map(|value| HashMap::from([("value".to_string(), Value::Int64(value))]))
+            .collect::<Vec<_>>();
+        backend.insert_rows(&rows).unwrap();
+        backend.save().unwrap();
+        drop(backend);
+
+        assert_eq!(
+            TableStorageBackend::persisted_row_count_hint(&path).unwrap(),
+            3
+        );
     }
 
     #[test]

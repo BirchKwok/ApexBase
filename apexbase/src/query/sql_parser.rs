@@ -14,7 +14,10 @@
 use crate::data::DataType;
 use crate::data::Value;
 use crate::ApexError;
+use ahash::AHashMap;
+use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Column-level constraint kinds
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -488,6 +491,20 @@ pub enum SqlExpr {
     IsNull { column: String, negated: bool },
     /// FTS: MATCH('query') or FUZZY_MATCH('query') in WHERE clause
     FtsMatch { query: String, fuzzy: bool },
+    /// Executor-only compressed result set. It is never emitted by the parser
+    /// or persisted in views; cloning a statement only clones the Arc.
+    FtsResolved {
+        #[serde(skip)]
+        doc_ids: Arc<RoaringTreemap>,
+    },
+    /// BM25 relevance for an explicit query, or for the unique MATCH() query
+    /// in the same statement when `query` is omitted.
+    FtsScore { query: Option<String> },
+    /// Executor-only score map shared by every batch evaluation.
+    FtsScoreResolved {
+        #[serde(skip)]
+        scores: Arc<AHashMap<u64, f32>>,
+    },
     /// Function call
     Function { name: String, args: Vec<SqlExpr> },
     /// Session variable reference: $varname
@@ -749,7 +766,10 @@ impl SelectStatement {
             SqlExpr::UnaryOp { expr, .. } => {
                 Self::extract_columns_from_expr(expr, columns);
             }
-            SqlExpr::FtsMatch { .. } => {} // FTS — no column to extract
+            SqlExpr::FtsMatch { .. } => {} // Resolved before projection planning.
+            SqlExpr::FtsResolved { .. }
+            | SqlExpr::FtsScore { .. }
+            | SqlExpr::FtsScoreResolved { .. } => columns.push("_id".to_string()),
             SqlExpr::Like { column, .. }
             | SqlExpr::Regexp { column, .. }
             | SqlExpr::In { column, .. }
@@ -4778,6 +4798,27 @@ impl SqlParser {
         let upper = name.to_uppercase();
         let mut result_name = name.clone();
 
+        if upper == "FTS_SCORE" {
+            let query = if matches!(self.current(), Token::RParen) {
+                None
+            } else {
+                match self.current().clone() {
+                    Token::StringLit(query) => {
+                        self.advance();
+                        Some(query)
+                    }
+                    other => {
+                        return Err(ApexError::QueryParseError(format!(
+                            "FTS_SCORE() accepts no argument or one string literal, got {:?}",
+                            other
+                        )))
+                    }
+                }
+            };
+            self.expect(Token::RParen)?;
+            return Ok(SqlExpr::FtsScore { query });
+        }
+
         // topk_distance(col, [q1,q2,...], k, 'metric')
         if upper == "TOPK_DISTANCE" {
             let col = self.parse_identifier()?;
@@ -5384,6 +5425,27 @@ impl SqlParser {
                         };
                         self.expect(Token::RParen)?;
                         return Ok(SqlExpr::FtsMatch { query, fuzzy });
+                    }
+                    if upper == "FTS_SCORE" {
+                        self.advance(); // consume '('
+                        let query = if matches!(self.current(), Token::RParen) {
+                            None
+                        } else {
+                            match self.current().clone() {
+                                Token::StringLit(query) => {
+                                    self.advance();
+                                    Some(query)
+                                }
+                                other => {
+                                    return Err(ApexError::QueryParseError(format!(
+                                        "FTS_SCORE() accepts no argument or one string literal, got {:?}",
+                                        other
+                                    )))
+                                }
+                            }
+                        };
+                        self.expect(Token::RParen)?;
+                        return Ok(SqlExpr::FtsScore { query });
                     }
                     return self.parse_function_call_from_name(name);
                 }

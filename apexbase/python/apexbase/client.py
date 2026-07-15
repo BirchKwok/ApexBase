@@ -16,7 +16,7 @@ import ast
 
 import json
 
-from typing import List, Dict, Union, Optional
+from typing import List, Dict, Union, Optional, Tuple
 from pathlib import Path
 import numpy as np
 
@@ -394,6 +394,7 @@ class ApexClient:
         
         # FTS configuration
         self._fts_tables: Dict[str, Dict] = {}
+        self._fts_initialized_tables = set()
         self._fts_dirty: bool = False
 
         # Persisted FTS configuration path
@@ -455,6 +456,7 @@ class ApexClient:
             except FileNotFoundError:
                 self._fts_config_known_present = False
                 self._fts_config_mtime_ns = None
+                self._fts_initialized_tables.clear()
                 if self._fts_tables:
                     self._fts_tables = {}
                 return
@@ -466,18 +468,23 @@ class ApexClient:
             if isinstance(data, dict):
                 # Only accept dict[str, dict] shape
                 self._fts_tables = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+                self._fts_initialized_tables.clear()
             self._fts_config_known_present = True
             self._fts_config_mtime_ns = mtime_ns
         except Exception:
             # Best-effort: if config is corrupted, ignore it
             self._fts_tables = {}
+            self._fts_initialized_tables.clear()
             self._fts_config_known_present = False
             self._fts_config_mtime_ns = None
 
     def _save_fts_config(self) -> None:
         try:
-            with open(self._fts_config_path, 'w', encoding='utf-8') as f:
+            temp_path = self._fts_config_path.with_suffix('.json.tmp')
+            with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(self._fts_tables, f, ensure_ascii=False)
+                f.flush()
+            os.replace(temp_path, self._fts_config_path)
             try:
                 self._fts_config_mtime_ns = self._fts_config_path.stat().st_mtime_ns
             except FileNotFoundError:
@@ -498,23 +505,38 @@ class ApexClient:
         table = table_name or self._current_table
         if not self._is_fts_enabled(table):
             return False
+        if table in self._fts_initialized_tables:
+            return True
 
         # Lazily initialize Rust FTS engine on first use, using persisted config
         try:
-            if not self._storage._is_fts_enabled():
-                fts_config = self._fts_tables.get(table, {})
-                cfg = fts_config.get('config', {}) if isinstance(fts_config, dict) else {}
-                index_fields = fts_config.get('index_fields') if isinstance(fts_config, dict) else None
-                self._storage._init_fts(
-                    index_fields=index_fields,
-                    lazy_load=bool(cfg.get('lazy_load', False)),
-                    cache_size=int(cfg.get('cache_size', 10000)),
-                )
+            if table != self._current_table:
+                return False
+            fts_config = self._fts_tables.get(table, {})
+            cfg = fts_config.get('config', {}) if isinstance(fts_config, dict) else {}
+            index_fields = fts_config.get('index_fields') if isinstance(fts_config, dict) else None
+            self._storage._init_fts(
+                index_fields=index_fields,
+                lazy_load=bool(cfg.get('lazy_load', False)),
+                cache_size=int(cfg.get('cache_size', 10000)),
+            )
+            self._fts_initialized_tables.add(table)
         except Exception:
             # If initialization fails, report as not initialized
             return False
 
         return True
+
+    @contextlib.contextmanager
+    def _fts_table_context(self, table: str):
+        original = self._current_table
+        if table != original:
+            self.use_table(table)
+        try:
+            yield
+        finally:
+            if original is not None and table != original:
+                self.use_table(original)
 
     def _sync_fts_config_from_disk(self, initialize_current: bool = True) -> None:
         """Refresh Python-side FTS state after SQL DDL updates fts_config.json."""
@@ -681,6 +703,15 @@ class ApexClient:
 
     def drop_table(self, table_name: str):
         self._check_connection()
+
+        # Detach the engine while the table can still be selected.
+        if table_name in self._fts_tables:
+            try:
+                with self._fts_table_context(table_name):
+                    self._storage._fts_remove_engine(True)
+            except Exception:
+                pass
+
         storage_lock = getattr(self, '_storage_lock', None)
         storage_context = storage_lock if storage_lock is not None else _NULL_CONTEXT
         with storage_context:
@@ -694,35 +725,19 @@ class ApexClient:
         
         if table_name in self._fts_tables:
             self._fts_tables.pop(table_name, None)
+            self._fts_initialized_tables.discard(table_name)
             self._save_fts_config()
-
-        # Best-effort: remove FTS index files for dropped table
-        try:
-            if table_name != self._current_table:
-                original = self._current_table
-                self.use_table(table_name)
-                self._storage._fts_remove_engine(True)
-                self.use_table(original)
-            else:
-                self._storage._fts_remove_engine(True)
-        except Exception:
-            pass
 
         # Best-effort Python-side cleanup in case the engine keeps files open
         try:
             fts_dir = self._dirpath / "fts_indexes"
-            index_path = fts_dir / f"{table_name}.nfts"
-            wal_path = fts_dir / f"{table_name}.nfts.wal"
-            if index_path.exists():
-                try:
-                    index_path.unlink()
-                except Exception:
-                    pass
-            if wal_path.exists():
-                try:
-                    wal_path.unlink()
-                except Exception:
-                    pass
+            for suffix in (".afts", ".afts.wal", ".afts.tmp", ".nfts", ".nfts.wal"):
+                path = fts_dir / f"{table_name}{suffix}"
+                if path.exists():
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
         except Exception:
             pass
         
@@ -830,6 +845,7 @@ class ApexClient:
                 lazy_load=lazy_load,
                 cache_size=cache_size
             )
+            self._fts_initialized_tables.add(table)
 
             # Persist config so it auto-enables on reopen
             self._save_fts_config()
@@ -841,7 +857,7 @@ class ApexClient:
         return self
 
     def _fts_index_from_arrow(self, table: pa.Table, id_column: str = 'id', text_columns: List[str] = None) -> int:
-        """Index FTS from an Arrow table using the Rust nanofts engine.
+        """Index FTS from an Arrow table using the native Rust ApexFTS engine.
         
         Args:
             table: PyArrow Table with data
@@ -882,7 +898,7 @@ class ApexClient:
         return count
 
     def _fts_index_from_pandas(self, df: pd.DataFrame, id_column: str = 'id', text_columns: List[str] = None) -> int:
-        """Index FTS from a Pandas DataFrame using the Rust nanofts engine.
+        """Index FTS from a Pandas DataFrame using the native Rust ApexFTS engine.
         
         Args:
             df: Pandas DataFrame with data
@@ -947,26 +963,20 @@ class ApexClient:
 
         # Remove persisted config
         self._fts_tables.pop(table, None)
+        self._fts_initialized_tables.discard(table)
         self._save_fts_config()
 
-        # Remove engine and index files in Rust layer
+        # Remove engine and index files in Rust layer while the target table is selected.
         try:
-            # Ensure Rust manager exists; otherwise remove_engine is a no-op
-            if not self._storage._is_fts_enabled():
-                cfg = prev_cfg.get('config', {}) if isinstance(prev_cfg, dict) else {}
-                index_fields = prev_cfg.get('index_fields') if isinstance(prev_cfg, dict) else None
-                self._storage._init_fts(
-                    index_fields=index_fields,
-                    lazy_load=bool(cfg.get('lazy_load', False)),
-                    cache_size=int(cfg.get('cache_size', 10000)),
-                )
-
-            if table_name and table_name != self._current_table:
-                original = self._current_table
-                self.use_table(table)
-                self._storage._fts_remove_engine(True)
-                self.use_table(original)
-            else:
+            with self._fts_table_context(table):
+                if not self._storage._is_fts_enabled():
+                    cfg = prev_cfg.get('config', {}) if isinstance(prev_cfg, dict) else {}
+                    index_fields = prev_cfg.get('index_fields') if isinstance(prev_cfg, dict) else None
+                    self._storage._init_fts(
+                        index_fields=index_fields,
+                        lazy_load=bool(cfg.get('lazy_load', False)),
+                        cache_size=int(cfg.get('cache_size', 10000)),
+                    )
                 self._storage._fts_remove_engine(True)
         except Exception:
             pass
@@ -974,18 +984,13 @@ class ApexClient:
         # Best-effort Python-side cleanup in case the engine keeps files open
         try:
             fts_dir = self._dirpath / "fts_indexes"
-            index_path = fts_dir / f"{table}.nfts"
-            wal_path = fts_dir / f"{table}.nfts.wal"
-            if index_path.exists():
-                try:
-                    index_path.unlink()
-                except Exception:
-                    pass
-            if wal_path.exists():
-                try:
-                    wal_path.unlink()
-                except Exception:
-                    pass
+            for suffix in (".afts", ".afts.wal", ".afts.tmp", ".nfts", ".nfts.wal"):
+                path = fts_dir / f"{table}{suffix}"
+                if path.exists():
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -3218,22 +3223,22 @@ class ApexClient:
             
             # Case 2: Delete by ID(s)
             if id is not None:
-                # Remove from FTS index if enabled
-                if fts_enabled:
-                    ids_to_remove = [id] if isinstance(id, int) else id
-                    for doc_id in ids_to_remove:
-                        self._storage._fts_remove(doc_id)
-                
                 if isinstance(id, int):
                     result = self._storage.delete(id)
                     if result:
+                        if fts_enabled:
+                            self._storage._fts_remove(id)
                         self._invalidate_replace_cache()
                     elif missing_cache_key is not None:
                         self._last_missing_delete_key = missing_cache_key
                     return result
                 elif isinstance(id, list):
                     self._invalidate_replace_cache()
-                    return self._storage.delete_batch(id)
+                    result = self._storage.delete_batch(id)
+                    if result and fts_enabled:
+                        for doc_id in id:
+                            self._storage._fts_remove(doc_id)
+                    return result
                 else:
                     raise ValueError("id must be an int or a list of ints")
 
@@ -3246,6 +3251,10 @@ class ApexClient:
                 return True
             result = self._storage.replace(id_, data)
             if result:
+                if self._is_fts_enabled(self._current_table):
+                    self._ensure_fts_initialized(self._current_table)
+                    content = self._extract_indexable_content(data)
+                    self._storage._fts_index(id_, " ".join(content.values()))
                 self._invalidate_replace_cache()
                 self._remember_exact_replace(id_, data)
             elif self._last_exact_replace_key == cache_key:
@@ -3541,16 +3550,30 @@ class ApexClient:
         if not self._is_fts_enabled(table):
             raise ValueError(f"Full-text search is not enabled for table '{table}'. Call init_fts() first.")
 
-        if not self._ensure_fts_initialized(table):
-            return np.array([], dtype=np.int64)
-        
-        results = self._storage.search_text(query, limit=1000)
+        with self._fts_table_context(table):
+            if not self._ensure_fts_initialized(table):
+                return np.array([], dtype=np.int64)
+            results = self._storage.search_text(query, limit=1000)
         if results is None:
             return np.array([], dtype=np.int64)
         if not results:
             return np.array([], dtype=np.int64)
         
         return np.array([r[0] for r in results], dtype=np.int64)
+
+    def search_text_with_scores(self, query: str, table_name: str = None,
+                                limit: int = 1000) -> List[Tuple[int, float]]:
+        """Return BM25-ranked ``(document_id, score)`` pairs."""
+        self._check_connection()
+        table = table_name or self._current_table
+        if not self._is_fts_enabled(table):
+            raise ValueError(f"Full-text search is not enabled for table '{table}'. Call init_fts() first.")
+
+        with self._fts_table_context(table):
+            if not self._ensure_fts_initialized(table):
+                return []
+            results = self._storage.search_text(query, limit=max(0, limit))
+        return [(int(doc_id), float(score)) for doc_id, score in (results or [])]
 
     def fuzzy_search_text(self, query: str, min_results: int = 1, table_name: str = None) -> Optional[np.ndarray]:
         self._check_connection()
@@ -3559,10 +3582,10 @@ class ApexClient:
         if not self._is_fts_enabled(table):
             raise ValueError(f"Full-text search is not enabled for table '{table}'. Call init_fts() first.")
 
-        if not self._ensure_fts_initialized(table):
-            return np.array([], dtype=np.int64)
-        
-        results = self._storage.fuzzy_search_text(query, limit=1000)
+        with self._fts_table_context(table):
+            if not self._ensure_fts_initialized(table):
+                return np.array([], dtype=np.int64)
+            results = self._storage.fuzzy_search_text(query, limit=1000, min_results=min_results)
         if not results:
             return np.array([], dtype=np.int64)
         
@@ -3576,25 +3599,15 @@ class ApexClient:
         if not self._is_fts_enabled(target_table):
             raise ValueError(f"Full-text search is not enabled for table '{target_table}'. Call init_fts() first.")
 
-        if not self._ensure_fts_initialized(target_table):
-            return _empty_result_view()
-
-        # Switch to target table for search
-        old_table = self._current_table
-        if target_table != old_table:
-            self.use_table(target_table)
-
-        try:
+        with self._fts_table_context(target_table):
+            if not self._ensure_fts_initialized(target_table):
+                return _empty_result_view()
             # Default path: dict format - fastest for typical use cases
-            result = self._storage.search_and_retrieve(query, limit=limit)
+            result = self._storage.search_and_retrieve(query, limit=limit, offset=offset)
             columns_dict = result.get('columns_dict') if isinstance(result, dict) else None
             if columns_dict:
                 return ResultView(lazy_pydict=columns_dict)
             return _empty_result_view()
-        finally:
-            # Restore original table
-            if target_table != old_table:
-                self.use_table(old_table)
 
     def search_and_retrieve_top(self, query: str, n: int = 100, table_name: str = None) -> 'ResultView':
         self._check_connection()
@@ -3603,7 +3616,11 @@ class ApexClient:
     def set_fts_fuzzy_config(self, threshold: float = 0.7, max_distance: int = 2, 
                              max_candidates: int = 20, table_name: str = None):
         self._check_connection()
-        pass  # ApexStorage doesn't expose this yet
+        table = table_name or self._current_table
+        with self._fts_table_context(table):
+            if not self._ensure_fts_initialized(table):
+                raise ValueError(f"Full-text search is not enabled for table '{table}'.")
+            self._storage._fts_set_fuzzy_config(threshold, max_distance, max_candidates)
 
     def get_fts_stats(self, table_name: str = None) -> Dict:
         self._check_connection()
@@ -3612,7 +3629,10 @@ class ApexClient:
         if not self._is_fts_enabled(table):
             return {'fts_enabled': False, 'table': table}
         
-        stats = self._storage.get_fts_stats()
+        with self._fts_table_context(table):
+            if not self._ensure_fts_initialized(table):
+                return {'fts_enabled': True, 'engine_initialized': False, 'table': table}
+            stats = self._storage.get_fts_stats()
         if stats:
             return {
                 'fts_enabled': True,
@@ -3624,11 +3644,19 @@ class ApexClient:
 
     def compact_fts_index(self, table_name: str = None):
         self._check_connection()
-        pass  # ApexStorage doesn't expose this yet
+        table = table_name or self._current_table
+        with self._fts_table_context(table):
+            if not self._ensure_fts_initialized(table):
+                raise ValueError(f"Full-text search is not enabled for table '{table}'.")
+            self._storage._fts_compact()
 
     def warmup_fts_terms(self, terms: List[str], table_name: str = None) -> int:
         self._check_connection()
-        return 0  # ApexStorage doesn't expose this yet
+        table = table_name or self._current_table
+        with self._fts_table_context(table):
+            if not self._ensure_fts_initialized(table):
+                return 0
+            return self._storage._fts_warmup(terms)
 
     # ============ Lifecycle ============
 

@@ -27,8 +27,7 @@ extern "C" {
     );
 }
 
-pub const RUST_INTERNAL_MEMORY_CASES: &[&str] =
-    &["row_insert", "delta_insert", "typed_append"];
+pub const RUST_INTERNAL_MEMORY_CASES: &[&str] = &["row_insert", "delta_insert", "typed_append"];
 
 #[derive(Serialize)]
 struct Measurement<'a> {

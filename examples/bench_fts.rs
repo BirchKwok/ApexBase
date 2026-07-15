@@ -151,7 +151,7 @@ fn main() {
     let fts_dir = dir.join("fts_indexes");
     std::fs::create_dir_all(&fts_dir).unwrap();
 
-    let engine_a = FtsEngine::new(fts_dir.join("bench_a.nfts"), FtsConfig::default())
+    let engine_a = FtsEngine::new(fts_dir.join("bench_a.afts"), FtsConfig::default())
         .expect("FtsEngine::new failed");
     let t = Instant::now();
     engine_a
@@ -172,7 +172,7 @@ fn main() {
     );
 
     // ── Phase 4a-async: flush_async + wait_flush ────────────────────────────
-    let engine_a2 = FtsEngine::new(fts_dir.join("bench_a2.nfts"), FtsConfig::default())
+    let engine_a2 = FtsEngine::new(fts_dir.join("bench_a2.afts"), FtsConfig::default())
         .expect("FtsEngine::new failed");
     let owned_cols2: Vec<(String, Vec<String>)> = ["name", "city", "category"]
         .iter()
@@ -212,7 +212,6 @@ fn main() {
 
     // ── Phase 4b: add_documents_arrow_str — zero-copy &str path ───────────
     let t = Instant::now();
-    let ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
     let mut arrow_cols: Vec<(String, Vec<&str>)> = Vec::new();
     for col_name in &["name", "city", "category"] {
         if let Some(col) = batch.column_by_name(col_name) {
@@ -227,11 +226,11 @@ fn main() {
     let t_build_str = t.elapsed();
     println!("[FTS_BENCH] build Vec<&str>:       {:>10.2?}", t_build_str);
 
-    let engine_b = FtsEngine::new(fts_dir.join("bench_b.nfts"), FtsConfig::default())
+    let engine_b = FtsEngine::new(fts_dir.join("bench_b.afts"), FtsConfig::default())
         .expect("FtsEngine::new failed");
     let t = Instant::now();
     engine_b
-        .add_documents_arrow_str(&ids_u32, arrow_cols)
+        .add_documents_arrow_str(&ids, arrow_cols)
         .expect("add_documents_arrow_str failed");
     let t_index_str = t.elapsed();
     println!(

@@ -16,10 +16,12 @@ impl ApexExecutor {
         base_dir: &Path,
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
-        // Resolve MATCH()/FUZZY_MATCH() predicates to _id IN (...) before anything else
+        let (_, table_name) = crate::query::executor::base_dir_and_table_pub(storage_path);
+        Self::resolve_fts_scores_in_statement(&mut stmt, base_dir, &table_name)?;
+
+        // Resolve MATCH()/FUZZY_MATCH() once to compressed runtime bitmaps.
         if let Some(ref wc) = stmt.where_clause {
             if Self::expr_has_fts_match(wc) {
-                let (_, table_name) = crate::query::executor::base_dir_and_table_pub(storage_path);
                 let resolved = Self::resolve_fts_in_expr(
                     stmt.where_clause.take().unwrap(),
                     base_dir,
@@ -5818,11 +5820,193 @@ impl ApexExecutor {
         }
     }
 
-    // ========== FTS Helper: resolve MATCH()/FUZZY_MATCH() to _id IN (...) ==========
+    // ========== FTS Helper: resolve MATCH()/FUZZY_MATCH() to a compressed bitmap ==========
 
-    /// Recursively replace every `FtsMatch { query, fuzzy }` node in an expression with
-    /// `In { column: "_id", values: [matching doc ids] }`.  Requires the FtsManager to
-    /// be registered for `base_dir` (via `register_fts_manager` or `CREATE FTS INDEX`).
+    fn collect_fts_queries(expr: &SqlExpr, matches: &mut Vec<String>, scores: &mut Vec<Option<String>>) {
+        match expr {
+            SqlExpr::FtsMatch { query, fuzzy: false } => matches.push(query.clone()),
+            SqlExpr::FtsScore { query } => scores.push(query.clone()),
+            SqlExpr::BinaryOp { left, right, .. } => {
+                Self::collect_fts_queries(left, matches, scores);
+                Self::collect_fts_queries(right, matches, scores);
+            }
+            SqlExpr::UnaryOp { expr, .. }
+            | SqlExpr::Paren(expr)
+            | SqlExpr::Cast { expr, .. } => Self::collect_fts_queries(expr, matches, scores),
+            SqlExpr::Function { args, .. } => {
+                for arg in args {
+                    Self::collect_fts_queries(arg, matches, scores);
+                }
+            }
+            SqlExpr::Case { when_then, else_expr } => {
+                for (when, then) in when_then {
+                    Self::collect_fts_queries(when, matches, scores);
+                    Self::collect_fts_queries(then, matches, scores);
+                }
+                if let Some(expr) = else_expr {
+                    Self::collect_fts_queries(expr, matches, scores);
+                }
+            }
+            SqlExpr::Between { low, high, .. } => {
+                Self::collect_fts_queries(low, matches, scores);
+                Self::collect_fts_queries(high, matches, scores);
+            }
+            SqlExpr::ArrayIndex { array, index } => {
+                Self::collect_fts_queries(array, matches, scores);
+                Self::collect_fts_queries(index, matches, scores);
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_fts_score_expr(
+        expr: SqlExpr,
+        default_query: Option<&str>,
+        score_maps: &AHashMap<String, Arc<AHashMap<u64, f32>>>,
+    ) -> io::Result<SqlExpr> {
+        match expr {
+            SqlExpr::FtsScore { query } => {
+                let query = query
+                    .as_deref()
+                    .or(default_query)
+                    .ok_or_else(|| err_input(
+                        "FTS_SCORE() requires exactly one MATCH() query or an explicit string argument",
+                    ))?;
+                let scores = score_maps
+                    .get(query)
+                    .cloned()
+                    .ok_or_else(|| err_data("FTS score map was not prepared"))?;
+                Ok(SqlExpr::FtsScoreResolved { scores })
+            }
+            SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+                left: Box::new(Self::resolve_fts_score_expr(*left, default_query, score_maps)?),
+                op,
+                right: Box::new(Self::resolve_fts_score_expr(*right, default_query, score_maps)?),
+            }),
+            SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+                op,
+                expr: Box::new(Self::resolve_fts_score_expr(*expr, default_query, score_maps)?),
+            }),
+            SqlExpr::Paren(expr) => Ok(SqlExpr::Paren(Box::new(Self::resolve_fts_score_expr(
+                *expr, default_query, score_maps,
+            )?))),
+            SqlExpr::Function { name, args } => Ok(SqlExpr::Function {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|arg| Self::resolve_fts_score_expr(arg, default_query, score_maps))
+                    .collect::<io::Result<Vec<_>>>()?,
+            }),
+            SqlExpr::Cast { expr, data_type } => Ok(SqlExpr::Cast {
+                expr: Box::new(Self::resolve_fts_score_expr(*expr, default_query, score_maps)?),
+                data_type,
+            }),
+            other => Ok(other),
+        }
+    }
+
+    fn resolve_fts_scores_in_statement(
+        stmt: &mut SelectStatement,
+        base_dir: &Path,
+        table_name: &str,
+    ) -> io::Result<()> {
+        let mut matches = Vec::new();
+        let mut requested = Vec::new();
+        if let Some(expr) = &stmt.where_clause {
+            Self::collect_fts_queries(expr, &mut matches, &mut requested);
+        }
+        if let Some(expr) = &stmt.having {
+            Self::collect_fts_queries(expr, &mut matches, &mut requested);
+        }
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Expression { expr, .. } => {
+                    Self::collect_fts_queries(expr, &mut matches, &mut requested)
+                }
+                SelectColumn::AllReplace(replacements) => {
+                    for (expr, _) in replacements {
+                        Self::collect_fts_queries(expr, &mut matches, &mut requested);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for order in &stmt.order_by {
+            if let Some(expr) = &order.expr {
+                Self::collect_fts_queries(expr, &mut matches, &mut requested);
+            }
+        }
+        if requested.is_empty() {
+            return Ok(());
+        }
+
+        matches.sort_unstable();
+        matches.dedup();
+        let default_query = (matches.len() == 1).then(|| matches[0].as_str());
+        let mut queries = Vec::with_capacity(requested.len());
+        for query in requested {
+            let query = query
+                .or_else(|| default_query.map(str::to_owned))
+                .ok_or_else(|| err_input(
+                    "FTS_SCORE() requires exactly one MATCH() query or an explicit string argument",
+                ))?;
+            queries.push(query);
+        }
+        queries.sort_unstable();
+        queries.dedup();
+
+        let manager = crate::query::executor::get_fts_manager(base_dir).ok_or_else(|| {
+            err_data(format!(
+                "FTS not initialised for this database. Run CREATE FTS INDEX ON {} first.",
+                table_name
+            ))
+        })?;
+        crate::query::executor::wait_fts_backfill(base_dir, table_name);
+        let engine = manager
+            .get_engine(table_name)
+            .map_err(|error| err_data(error.to_string()))?;
+        let mut score_maps = AHashMap::with_capacity(queries.len());
+        for query in queries {
+            let hits = engine
+                .search_scored(&query)
+                .map_err(|error| err_data(error.to_string()))?;
+            let scores = hits
+                .into_iter()
+                .map(|hit| (hit.doc_id, hit.score))
+                .collect::<AHashMap<_, _>>();
+            score_maps.insert(query, Arc::new(scores));
+        }
+
+        for column in &mut stmt.columns {
+            match column {
+                SelectColumn::Expression { expr, .. } => {
+                    *expr = Self::resolve_fts_score_expr(expr.clone(), default_query, &score_maps)?;
+                }
+                SelectColumn::AllReplace(replacements) => {
+                    for (expr, _) in replacements {
+                        *expr = Self::resolve_fts_score_expr(expr.clone(), default_query, &score_maps)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for order in &mut stmt.order_by {
+            if let Some(expr) = &mut order.expr {
+                *expr = Self::resolve_fts_score_expr(expr.clone(), default_query, &score_maps)?;
+            }
+        }
+        if let Some(expr) = &mut stmt.having {
+            *expr = Self::resolve_fts_score_expr(expr.clone(), default_query, &score_maps)?;
+        }
+        if let Some(expr) = &mut stmt.where_clause {
+            *expr = Self::resolve_fts_score_expr(expr.clone(), default_query, &score_maps)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve every FTS node once and retain its compressed Roaring bitmap in the
+    /// runtime expression. This avoids allocating one `Value` per hit and lets Arrow
+    /// batches test `_id` membership directly.
     fn resolve_fts_in_expr(
         expr: SqlExpr,
         base_dir: &Path,
@@ -5839,32 +6023,18 @@ impl ApexExecutor {
                 let engine = mgr
                     .get_engine(table_name)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                let ids: Vec<u64> = if fuzzy {
+                let result = if fuzzy {
                     engine
                         .fuzzy_search(&query, 1)
-                        .map(|r| r.iter().map(|id| id as u64).collect())
-                        .unwrap_or_default()
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
                 } else {
-                    engine.search_ids(&query).unwrap_or_default()
+                    engine
+                        .search(&query)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
                 };
-                if ids.is_empty() {
-                    // _id < 0  — guaranteed empty (all valid _id are >= 1)
-                    Ok(SqlExpr::BinaryOp {
-                        left: Box::new(SqlExpr::Column("_id".to_string())),
-                        op: crate::query::sql_parser::BinaryOperator::Lt,
-                        right: Box::new(SqlExpr::Literal(crate::data::Value::Int64(0))),
-                    })
-                } else {
-                    let values: Vec<crate::data::Value> = ids
-                        .into_iter()
-                        .map(|id| crate::data::Value::Int64(id as i64))
-                        .collect();
-                    Ok(SqlExpr::In {
-                        column: "_id".to_string(),
-                        values,
-                        negated: false,
-                    })
-                }
+                Ok(SqlExpr::FtsResolved {
+                    doc_ids: result.shared_bitmap(),
+                })
             }
             SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
                 left: Box::new(Self::resolve_fts_in_expr(*left, base_dir, table_name)?),

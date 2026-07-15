@@ -540,7 +540,11 @@ impl ApexStorageImpl {
         backend: &TableStorageBackend,
     ) -> PyResult<Option<u64>> {
         let has_internal_id = row.get_item("_id")?.is_some();
-        if row.len().saturating_sub(if has_internal_id { 1 } else { 0 }) != schema.len() {
+        if row
+            .len()
+            .saturating_sub(if has_internal_id { 1 } else { 0 })
+            != schema.len()
+        {
             return Ok(None);
         }
 
@@ -1535,6 +1539,7 @@ impl ApexStorageImpl {
             let mgr = self.fts_manager.read();
             if mgr.is_some() {
                 let table_name = self.current_table.read().clone();
+                let base_dir = self.current_base_dir();
                 let index_fields = self.fts_index_fields.read().get(&table_name).cloned();
 
                 if let Some(m) = mgr.as_ref() {
@@ -1591,8 +1596,7 @@ impl ApexStorageImpl {
 
                             // 🥈 add_documents_arrow_str: zero-copy &str slices, ~3.3M docs/s
                             if !columns.is_empty() && !columns[0].1.is_empty() {
-                                let doc_ids_u32: Vec<u32> =
-                                    ids.iter().map(|&id| id as u32).collect();
+                                let doc_ids_u64: Vec<u64> = ids.clone();
                                 let columns_ref: Vec<(String, Vec<&str>)> = columns
                                     .iter()
                                     .map(|(name, vals)| {
@@ -1600,7 +1604,11 @@ impl ApexStorageImpl {
                                     })
                                     .collect();
                                 let _ = py.allow_threads(|| {
-                                    engine.add_documents_arrow_str(&doc_ids_u32, columns_ref)
+                                    crate::query::executor::wait_fts_backfill(
+                                        &base_dir,
+                                        &table_name,
+                                    );
+                                    engine.add_documents_arrow_str(&doc_ids_u64, columns_ref)
                                 });
                             }
                         }
@@ -2455,6 +2463,7 @@ impl ApexStorageImpl {
             let mgr = self.fts_manager.read();
             if mgr.is_some() {
                 let table_name = self.current_table.read().clone();
+                let base_dir = self.current_base_dir();
                 let index_fields = self.fts_index_fields.read().get(&table_name).cloned();
 
                 if let Some(m) = mgr.as_ref() {
@@ -2482,8 +2491,7 @@ impl ApexStorageImpl {
 
                             // 🥈 add_documents_arrow_str: zero-copy &str slices, ~3.3M docs/s
                             if !fts_columns.is_empty() {
-                                let doc_ids_u32: Vec<u32> =
-                                    ids.iter().map(|&id| id as u32).collect();
+                                let doc_ids_u64: Vec<u64> = ids.clone();
                                 let columns_ref: Vec<(String, Vec<&str>)> = fts_columns
                                     .iter()
                                     .map(|(name, vals)| {
@@ -2491,7 +2499,11 @@ impl ApexStorageImpl {
                                     })
                                     .collect();
                                 let _ = py.allow_threads(|| {
-                                    engine.add_documents_arrow_str(&doc_ids_u32, columns_ref)
+                                    crate::query::executor::wait_fts_backfill(
+                                        &base_dir,
+                                        &table_name,
+                                    );
+                                    engine.add_documents_arrow_str(&doc_ids_u64, columns_ref)
                                 });
                             }
                         }
@@ -2506,6 +2518,7 @@ impl ApexStorageImpl {
     /// Helper to index a document for FTS (single document - uses slower path)
     fn index_for_fts(&self, py: Python<'_>, id: i64, data: &Bound<'_, PyDict>) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
         let mgr = self.fts_manager.read().clone();
 
         if mgr.is_none() {
@@ -2543,8 +2556,9 @@ impl ApexStorageImpl {
         // Index the document via add_documents_arrow_texts (pre-joined text, zero-copy &str)
         if let Some(m) = mgr {
             let joined = fields.values().cloned().collect::<Vec<_>>().join(" ");
-            let doc_id = id as u32;
+            let doc_id = id as u64;
             py.allow_threads(|| {
+                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
                 if let Ok(engine) = m.get_engine(&table_name) {
                     let doc_ids = [doc_id];
                     let texts = [joined.as_str()];
@@ -3609,128 +3623,129 @@ impl ApexStorageImpl {
                                     // pre-parse shortcut can observe a stale mmap dictionary
                                     // view even though the generic filter path is correct.
                                 } else {
-                                // Build stat lookup: column name -> (count, sum, min, max, is_int)
-                                let mut stat_map: std::collections::HashMap<
-                                    &str,
-                                    (i64, f64, f64, f64, bool),
-                                > = std::collections::HashMap::new();
-                                for (i, col_name) in col_refs.iter().enumerate() {
-                                    if i < stats.len() {
-                                        stat_map.insert(col_name, stats[i]);
-                                    }
-                                }
-                                let match_count = stat_map.get("*").map(|s| s.0).unwrap_or(0);
-
-                                let out = PyDict::new_bound(py);
-                                let columns_dict = PyDict::new_bound(py);
-                                for (func, col, alias) in &agg_exprs {
-                                    let output_name = if let Some(a) = alias {
-                                        a.clone()
-                                    } else if let Some(c) = col {
-                                        format!("{}({})", func, c)
-                                    } else {
-                                        format!("{}(*)", func)
-                                    };
-                                    match func.as_str() {
-                                        "COUNT" => {
-                                            let count = if let Some(c) = col {
-                                                let is_count_star = c == "*"
-                                                    || c.chars()
-                                                        .next()
-                                                        .map(|ch| ch.is_ascii_digit())
-                                                        .unwrap_or(false);
-                                                if is_count_star {
-                                                    match_count
-                                                } else {
-                                                    stat_map
-                                                        .get(c.as_str())
-                                                        .map(|s| s.0)
-                                                        .unwrap_or(0)
-                                                }
-                                            } else {
-                                                match_count
-                                            };
-                                            columns_dict.set_item(
-                                                &output_name,
-                                                PyList::new_bound(py, &[count]),
-                                            )?;
+                                    // Build stat lookup: column name -> (count, sum, min, max, is_int)
+                                    let mut stat_map: std::collections::HashMap<
+                                        &str,
+                                        (i64, f64, f64, f64, bool),
+                                    > = std::collections::HashMap::new();
+                                    for (i, col_name) in col_refs.iter().enumerate() {
+                                        if i < stats.len() {
+                                            stat_map.insert(col_name, stats[i]);
                                         }
-                                        "SUM" | "AVG" | "MIN" | "MAX" => {
-                                            if let Some(c) = col {
-                                                let (count, sum, min_v, max_v, is_int) = stat_map
-                                                    .get(c.as_str())
-                                                    .copied()
-                                                    .unwrap_or((0, 0.0, 0.0, 0.0, false));
-                                                match func.as_str() {
-                                                    "SUM" => {
-                                                        if is_int {
+                                    }
+                                    let match_count = stat_map.get("*").map(|s| s.0).unwrap_or(0);
+
+                                    let out = PyDict::new_bound(py);
+                                    let columns_dict = PyDict::new_bound(py);
+                                    for (func, col, alias) in &agg_exprs {
+                                        let output_name = if let Some(a) = alias {
+                                            a.clone()
+                                        } else if let Some(c) = col {
+                                            format!("{}({})", func, c)
+                                        } else {
+                                            format!("{}(*)", func)
+                                        };
+                                        match func.as_str() {
+                                            "COUNT" => {
+                                                let count = if let Some(c) = col {
+                                                    let is_count_star = c == "*"
+                                                        || c.chars()
+                                                            .next()
+                                                            .map(|ch| ch.is_ascii_digit())
+                                                            .unwrap_or(false);
+                                                    if is_count_star {
+                                                        match_count
+                                                    } else {
+                                                        stat_map
+                                                            .get(c.as_str())
+                                                            .map(|s| s.0)
+                                                            .unwrap_or(0)
+                                                    }
+                                                } else {
+                                                    match_count
+                                                };
+                                                columns_dict.set_item(
+                                                    &output_name,
+                                                    PyList::new_bound(py, &[count]),
+                                                )?;
+                                            }
+                                            "SUM" | "AVG" | "MIN" | "MAX" => {
+                                                if let Some(c) = col {
+                                                    let (count, sum, min_v, max_v, is_int) =
+                                                        stat_map
+                                                            .get(c.as_str())
+                                                            .copied()
+                                                            .unwrap_or((0, 0.0, 0.0, 0.0, false));
+                                                    match func.as_str() {
+                                                        "SUM" => {
+                                                            if is_int {
+                                                                columns_dict.set_item(
+                                                                    &output_name,
+                                                                    PyList::new_bound(
+                                                                        py,
+                                                                        &[sum as i64],
+                                                                    ),
+                                                                )?;
+                                                            } else {
+                                                                columns_dict.set_item(
+                                                                    &output_name,
+                                                                    PyList::new_bound(py, &[sum]),
+                                                                )?;
+                                                            }
+                                                        }
+                                                        "AVG" => {
+                                                            let avg = if count > 0 {
+                                                                sum / count as f64
+                                                            } else {
+                                                                0.0
+                                                            };
                                                             columns_dict.set_item(
                                                                 &output_name,
-                                                                PyList::new_bound(
-                                                                    py,
-                                                                    &[sum as i64],
-                                                                ),
-                                                            )?;
-                                                        } else {
-                                                            columns_dict.set_item(
-                                                                &output_name,
-                                                                PyList::new_bound(py, &[sum]),
+                                                                PyList::new_bound(py, &[avg]),
                                                             )?;
                                                         }
-                                                    }
-                                                    "AVG" => {
-                                                        let avg = if count > 0 {
-                                                            sum / count as f64
-                                                        } else {
-                                                            0.0
-                                                        };
-                                                        columns_dict.set_item(
-                                                            &output_name,
-                                                            PyList::new_bound(py, &[avg]),
-                                                        )?;
-                                                    }
-                                                    "MIN" => {
-                                                        if is_int {
-                                                            columns_dict.set_item(
-                                                                &output_name,
-                                                                PyList::new_bound(
-                                                                    py,
-                                                                    &[min_v as i64],
-                                                                ),
-                                                            )?;
-                                                        } else {
-                                                            columns_dict.set_item(
-                                                                &output_name,
-                                                                PyList::new_bound(py, &[min_v]),
-                                                            )?;
+                                                        "MIN" => {
+                                                            if is_int {
+                                                                columns_dict.set_item(
+                                                                    &output_name,
+                                                                    PyList::new_bound(
+                                                                        py,
+                                                                        &[min_v as i64],
+                                                                    ),
+                                                                )?;
+                                                            } else {
+                                                                columns_dict.set_item(
+                                                                    &output_name,
+                                                                    PyList::new_bound(py, &[min_v]),
+                                                                )?;
+                                                            }
                                                         }
-                                                    }
-                                                    "MAX" => {
-                                                        if is_int {
-                                                            columns_dict.set_item(
-                                                                &output_name,
-                                                                PyList::new_bound(
-                                                                    py,
-                                                                    &[max_v as i64],
-                                                                ),
-                                                            )?;
-                                                        } else {
-                                                            columns_dict.set_item(
-                                                                &output_name,
-                                                                PyList::new_bound(py, &[max_v]),
-                                                            )?;
+                                                        "MAX" => {
+                                                            if is_int {
+                                                                columns_dict.set_item(
+                                                                    &output_name,
+                                                                    PyList::new_bound(
+                                                                        py,
+                                                                        &[max_v as i64],
+                                                                    ),
+                                                                )?;
+                                                            } else {
+                                                                columns_dict.set_item(
+                                                                    &output_name,
+                                                                    PyList::new_bound(py, &[max_v]),
+                                                                )?;
+                                                            }
                                                         }
+                                                        _ => {}
                                                     }
-                                                    _ => {}
                                                 }
                                             }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
-                                }
-                                out.set_item("columns_dict", columns_dict)?;
-                                out.set_item("rows_affected", 0i64)?;
-                                return Ok(out.into());
+                                    out.set_item("columns_dict", columns_dict)?;
+                                    out.set_item("rows_affected", 0i64)?;
+                                    return Ok(out.into());
                                 }
                             }
                         }
@@ -6951,9 +6966,35 @@ impl ApexStorageImpl {
         // Touch/create engine for current table
         let mgr = self.fts_manager.read().clone();
         if let Some(m) = mgr {
-            py.allow_threads(|| {
-                let _ = m.get_engine(&table_name);
-            });
+            let config = FtsConfig {
+                lazy_load,
+                cache_size,
+                ..FtsConfig::default()
+            };
+            let needs_rebuild = py.allow_threads(|| -> PyResult<bool> {
+                m.configure_table(&table_name, config);
+                m.get_engine(&table_name)
+                    .map(|engine| engine.needs_rebuild())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })?;
+            if needs_rebuild {
+                let base_dir = self.current_base_dir();
+                let backfill_running = py.allow_threads(|| {
+                    crate::query::executor::has_fts_backfill(&base_dir, &table_name)
+                });
+                if !backfill_running {
+                    let fields = index_fields.clone();
+                    py.allow_threads(|| {
+                        crate::query::ApexExecutor::fts_backfill_table(
+                            &base_dir,
+                            &table_name,
+                            fields.as_deref(),
+                            m,
+                        )
+                        .map_err(|e| PyIOError::new_err(e.to_string()))
+                    })?;
+                }
+            }
         }
 
         Ok(())
@@ -6992,11 +7033,13 @@ impl ApexStorageImpl {
             let results = py.allow_threads(|| {
                 crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
                 engine
-                    .search_top_n(query, limit.unwrap_or(100))
+                    .search_ranked(query, limit.unwrap_or(100))
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })?;
-            // Return with score=1.0 for each result (nanofts doesn't return scores directly)
-            Ok(results.into_iter().map(|id| (id as i64, 1.0f32)).collect())
+            Ok(results
+                .into_iter()
+                .map(|hit| (hit.doc_id as i64, hit.score))
+                .collect())
         } else {
             Err(PyRuntimeError::new_err("FTS not initialized"))
         }
@@ -7026,15 +7069,17 @@ impl ApexStorageImpl {
     }
 
     /// FTS fuzzy search
-    #[pyo3(signature = (query, limit=None, _max_distance=None))]
+    #[pyo3(signature = (query, limit=None, min_results=1, max_distance=None))]
     fn fuzzy_search_text(
         &self,
         py: Python<'_>,
         query: &str,
         limit: Option<usize>,
-        _max_distance: Option<u8>,
+        min_results: usize,
+        max_distance: Option<usize>,
     ) -> PyResult<Vec<(i64, f32)>> {
         let table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
         let mgr = self.fts_manager.read();
 
         if let Some(m) = mgr.as_ref() {
@@ -7043,8 +7088,12 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during fuzzy search for better concurrency
             let ids: Vec<u64> = py.allow_threads(|| -> PyResult<Vec<u64>> {
+                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+                if let Some(max_distance) = max_distance {
+                    engine.set_fuzzy_config(0.7, max_distance, 20);
+                }
                 let result = engine
-                    .fuzzy_search(query, limit.unwrap_or(100))
+                    .fuzzy_search(query, min_results)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 // Convert result handle to Vec<u64>
                 Ok(result
@@ -7060,15 +7109,22 @@ impl ApexStorageImpl {
     }
 
     /// Search and retrieve records
-    #[pyo3(signature = (query, limit=None))]
+    #[pyo3(signature = (query, limit=None, offset=0))]
     fn search_and_retrieve(
         &self,
         py: Python<'_>,
         query: &str,
         limit: Option<usize>,
+        offset: usize,
     ) -> PyResult<PyObject> {
-        let results = self.search_text(py, query, limit)?;
-        let ids: Vec<i64> = results.into_iter().map(|(id, _)| id).collect();
+        let requested = limit.unwrap_or(100);
+        let results = self.search_text(py, query, Some(offset.saturating_add(requested)))?;
+        let ids: Vec<i64> = results
+            .into_iter()
+            .skip(offset)
+            .take(requested)
+            .map(|(id, _)| id)
+            .collect();
         self.retrieve_many(py, ids)
     }
 
@@ -7076,6 +7132,7 @@ impl ApexStorageImpl {
     #[pyo3(name = "_fts_index")]
     fn fts_index(&self, py: Python<'_>, id: i64, text: &str) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
         let mgr = self.fts_manager.read();
 
         if let Some(m) = mgr.as_ref() {
@@ -7086,6 +7143,7 @@ impl ApexStorageImpl {
             fields.insert("content".to_string(), text.to_string());
             // Release GIL during indexing operation
             py.allow_threads(|| {
+                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
                 engine
                     .add_document(id as u64, fields)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -7099,6 +7157,7 @@ impl ApexStorageImpl {
     #[pyo3(name = "_fts_remove")]
     fn fts_remove(&self, py: Python<'_>, id: i64) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
         let mgr = self.fts_manager.read();
 
         if let Some(m) = mgr.as_ref() {
@@ -7107,6 +7166,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during remove operation
             py.allow_threads(|| {
+                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
                 engine
                     .remove_document(id as u64)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -7114,6 +7174,51 @@ impl ApexStorageImpl {
         }
 
         Ok(())
+    }
+
+    #[pyo3(name = "_fts_set_fuzzy_config")]
+    fn fts_set_fuzzy_config(
+        &self,
+        threshold: f64,
+        max_distance: usize,
+        max_candidates: usize,
+    ) -> PyResult<()> {
+        let table_name = self.current_table.read().clone();
+        if let Some(manager) = self.fts_manager.read().as_ref() {
+            manager
+                .get_engine(&table_name)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .set_fuzzy_config(threshold, max_distance, max_candidates);
+        }
+        Ok(())
+    }
+
+    #[pyo3(name = "_fts_compact")]
+    fn fts_compact(&self, py: Python<'_>) -> PyResult<()> {
+        let table_name = self.current_table.read().clone();
+        if let Some(manager) = self.fts_manager.read().as_ref() {
+            let engine = manager
+                .get_engine(&table_name)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            py.allow_threads(|| {
+                engine
+                    .compact()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(name = "_fts_warmup")]
+    fn fts_warmup(&self, terms: Vec<String>) -> PyResult<usize> {
+        let table_name = self.current_table.read().clone();
+        if let Some(manager) = self.fts_manager.read().as_ref() {
+            return manager
+                .get_engine(&table_name)
+                .map(|engine| engine.warmup_terms(&terms))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+        }
+        Ok(0)
     }
 
     /// Flush FTS index
@@ -7155,7 +7260,7 @@ impl ApexStorageImpl {
         if let Some(m) = mgr.as_ref() {
             if let Ok(engine) = m.get_engine(&table_name) {
                 let count = ids.len();
-                let doc_ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+                let doc_ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
                 // Build owned Vec<String> columns then borrow as &str — zero extra copy
                 let owned: Vec<(String, Vec<String>)> = columns.into_iter().collect();
                 let columns_ref: Vec<(String, Vec<&str>)> = owned
@@ -7163,7 +7268,7 @@ impl ApexStorageImpl {
                     .map(|(name, vals)| (name.clone(), vals.iter().map(|s| s.as_str()).collect()))
                     .collect();
                 py.allow_threads(|| {
-                    let _ = engine.add_documents_arrow_str(&doc_ids_u32, columns_ref);
+                    let _ = engine.add_documents_arrow_str(&doc_ids_u64, columns_ref);
                 });
                 return Ok(count);
             }

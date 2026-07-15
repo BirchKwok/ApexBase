@@ -918,7 +918,8 @@ impl StorageEngine {
                                 let ids: Vec<u64> =
                                     (start_id..start_id + row_count as u64).collect();
 
-                                for (schema_idx, (col_name, col_type)) in schema.iter().enumerate() {
+                                for (schema_idx, (col_name, col_type)) in schema.iter().enumerate()
+                                {
                                     // Build null bitmap
                                     let null_bitmap =
                                         if let Some(null_vec) = null_positions.get(col_name) {
@@ -949,13 +950,13 @@ impl StorageEngine {
                                         | ColumnType::UInt64
                                         | ColumnType::Timestamp
                                         | ColumnType::Date => {
-                                            let vals = if let Some(vals) = int_columns.remove(col_name)
-                                            {
-                                                moved_int_columns.push(schema_idx);
-                                                vals
-                                            } else {
-                                                vec![0; row_count]
-                                            };
+                                            let vals =
+                                                if let Some(vals) = int_columns.remove(col_name) {
+                                                    moved_int_columns.push(schema_idx);
+                                                    vals
+                                                } else {
+                                                    vec![0; row_count]
+                                                };
                                             new_columns.push(ColumnData::Int64(vals));
                                         }
                                         ColumnType::Float64 | ColumnType::Float32 => {

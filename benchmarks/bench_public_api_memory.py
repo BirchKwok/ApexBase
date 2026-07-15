@@ -129,6 +129,7 @@ PUBLIC_API_CASES = (
     "ApexClient.rename_column",
     "ApexClient.get_column_dtype",
     "ApexClient.search_text",
+    "ApexClient.search_text_with_scores",
     "ApexClient.fuzzy_search_text",
     "ApexClient.search_and_retrieve",
     "ApexClient.search_and_retrieve_top",
@@ -364,7 +365,7 @@ class Fixture:
             c.store({"value": ROWS + 1, "score": 1.0, "category": "cat", "content": "buffered"})
         elif name in {"add_column", "drop_column", "rename_column", "get_column_dtype"}:
             self._fresh_table("columns", {"value": "int64", "extra": "string"})
-        elif name in {"search_text", "fuzzy_search_text", "search_and_retrieve", "search_and_retrieve_top", "get_fts_stats", "compact_fts_index", "warmup_fts_terms", "set_fts_fuzzy_config"}:
+        elif name in {"search_text", "search_text_with_scores", "fuzzy_search_text", "search_and_retrieve", "search_and_retrieve_top", "get_fts_stats", "compact_fts_index", "warmup_fts_terms", "set_fts_fuzzy_config"}:
             self._fts_ready()
 
     def result_view(self):
@@ -550,9 +551,11 @@ class Fixture:
             if name == "rename_column":
                 return c.rename_column("extra", "renamed")
             return c.get_column_dtype("value")
-        if name in {"search_text", "fuzzy_search_text", "search_and_retrieve", "search_and_retrieve_top", "get_fts_stats", "compact_fts_index", "warmup_fts_terms", "set_fts_fuzzy_config"}:
+        if name in {"search_text", "search_text_with_scores", "fuzzy_search_text", "search_and_retrieve", "search_and_retrieve_top", "get_fts_stats", "compact_fts_index", "warmup_fts_terms", "set_fts_fuzzy_config"}:
             if name == "search_text":
                 return c.search_text("apexbase")
+            if name == "search_text_with_scores":
+                return c.search_text_with_scores("apexbase")
             if name == "fuzzy_search_text":
                 return c.fuzzy_search_text("apexbas")
             if name == "search_and_retrieve":

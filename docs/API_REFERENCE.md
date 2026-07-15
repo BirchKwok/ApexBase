@@ -573,16 +573,18 @@ FTS is implemented natively in Rust and available through all interfaces (Python
 | `ALTER FTS INDEX ON table DISABLE` | Suspend indexing, keep files |
 | `ALTER FTS INDEX ON table ENABLE` | Resume indexing and back-fill any missed rows |
 | `SHOW FTS INDEXES` | List FTS-configured tables across all databases |
-| `WHERE MATCH('query')` | Exact / ranked full-text search |
+| `WHERE MATCH('query')` | Exact full-text search |
 | `WHERE FUZZY_MATCH('query')` | Fuzzy / typo-tolerant search |
+| `FTS_SCORE()` | BM25 score for the statement's unique `MATCH()` query |
+| `FTS_SCORE('query')` | BM25 score for an explicit query |
 
 **`CREATE FTS INDEX`**
 ```sql
 CREATE FTS INDEX ON table_name [(col1, col2, ...)] [WITH (lazy_load=bool, cache_size=N)]
 ```
 - `(col1, col2)` — optional column list; omit to index all string columns
-- `lazy_load` — defer loading index into RAM until first search (default `false`)
-- `cache_size` — LRU cache entries for the index (default `10000`)
+- `lazy_load` — mmap the v3 term directory and decode postings on demand (default `false`)
+- `cache_size` — maximum decoded postings retained in lazy mode (default `10000`)
 
 ```python
 client.execute("CREATE FTS INDEX ON articles (title, content)")
@@ -593,7 +595,7 @@ client.execute("CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)
 ```sql
 DROP FTS INDEX ON table_name
 ```
-Removes the index entry and deletes the `.nfts` index files from disk.
+Removes the index entry and deletes the ApexFTS `.afts` snapshot and WAL from disk.
 
 **`ALTER FTS INDEX ... DISABLE`**
 ```sql
@@ -638,6 +640,19 @@ client.execute("""
 
 # Aggregations
 client.execute("SELECT COUNT(*) FROM articles WHERE MATCH('rust')")
+```
+
+**`FTS_SCORE([query])`**
+
+Projects or orders by BM25 relevance. With no argument it binds to the unique `MATCH()` query in the statement; otherwise pass one string literal explicitly.
+
+```python
+client.execute("""
+    SELECT title, FTS_SCORE() AS relevance
+    FROM articles
+    WHERE MATCH('database')
+    ORDER BY relevance DESC
+""")
 ```
 
 **`FUZZY_MATCH('query')`**
@@ -688,6 +703,26 @@ Search for documents containing query terms. Returns array of _ids.
 ```python
 ids = client.search_text("database")
 print(ids)  # array([0, 5, 10])
+```
+
+IDs are ordered by BM25 relevance. A query wrapped in double quotes performs an exact phrase search:
+
+```python
+ids = client.search_text('"distributed database"')
+```
+
+#### search_text_with_scores
+```python
+search_text_with_scores(
+    query: str,
+    table_name: str = None,
+    limit: int = 1000
+) -> List[Tuple[int, float]]
+```
+Return BM25-ranked document IDs together with their scores.
+
+```python
+hits = client.search_text_with_scores("database", limit=20)
 ```
 
 #### fuzzy_search_text

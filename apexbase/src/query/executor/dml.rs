@@ -1521,32 +1521,37 @@ impl ApexExecutor {
                     .collect()
             });
 
+        let lazy_load = table_cfg
+            .and_then(|e| e.get("config"))
+            .and_then(|c| c.get("lazy_load"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let cache_size = table_cfg
+            .and_then(|e| e.get("config"))
+            .and_then(|c| c.get("cache_size"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10000) as usize;
+        let fts_cfg = crate::fts::FtsConfig {
+            lazy_load,
+            cache_size,
+            ..crate::fts::FtsConfig::default()
+        };
+
         // Get or create FTS manager for this database
         let mgr_arc = {
             if let Some(m) = get_fts_manager(&base_dir) {
                 m
             } else {
-                let lazy_load = table_cfg
-                    .and_then(|e| e.get("config"))
-                    .and_then(|c| c.get("lazy_load"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let cache_size = table_cfg
-                    .and_then(|e| e.get("config"))
-                    .and_then(|c| c.get("cache_size"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10000) as usize;
                 let fts_dir = base_dir.join("fts_indexes");
-                let fts_cfg = crate::fts::FtsConfig {
-                    lazy_load,
-                    cache_size,
-                    ..crate::fts::FtsConfig::default()
-                };
-                let m = std::sync::Arc::new(crate::fts::FtsManager::new(&fts_dir, fts_cfg));
+                let m = std::sync::Arc::new(crate::fts::FtsManager::new(
+                    &fts_dir,
+                    fts_cfg.clone(),
+                ));
                 crate::query::executor::register_fts_manager(&base_dir, m.clone());
                 m
             }
         };
+        mgr_arc.configure_table(&table_name, fts_cfg);
 
         let engine = match mgr_arc.get_engine(&table_name) {
             Ok(e) => e,
@@ -1666,6 +1671,56 @@ impl ApexExecutor {
         let ids: Vec<u64> = deleted_entries.iter().map(|(id, _)| *id).collect();
         let _ = engine.remove_documents(&ids);
         let _ = engine.flush();
+    }
+
+    /// Apply complete post-update string documents to ApexFTS.
+    fn notify_fts_update(
+        storage_path: &Path,
+        documents: Vec<(u64, std::collections::HashMap<String, String>)>,
+    ) {
+        if documents.is_empty() {
+            return;
+        }
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+        let cfg = Self::read_fts_config(&base_dir);
+        let table_cfg = cfg.as_object().and_then(|o| o.get(&table_name));
+        if !table_cfg
+            .and_then(|e| e.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let lazy_load = table_cfg
+            .and_then(|e| e.get("config"))
+            .and_then(|c| c.get("lazy_load"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let cache_size = table_cfg
+            .and_then(|e| e.get("config"))
+            .and_then(|c| c.get("cache_size"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10_000) as usize;
+        let fts_config = crate::fts::FtsConfig {
+            lazy_load,
+            cache_size,
+            ..crate::fts::FtsConfig::default()
+        };
+        let manager = get_fts_manager(&base_dir).unwrap_or_else(|| {
+            let manager = std::sync::Arc::new(crate::fts::FtsManager::new(
+                base_dir.join("fts_indexes"),
+                fts_config.clone(),
+            ));
+            crate::query::executor::register_fts_manager(&base_dir, manager.clone());
+            manager
+        });
+        manager.configure_table(&table_name, fts_config);
+        crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+        if let Ok(engine) = manager.get_engine(&table_name) {
+            if engine.add_documents(documents).is_ok() {
+                let _ = engine.flush();
+            }
+        }
     }
 
     // ========== DML Execution Methods ==========
@@ -3454,6 +3509,7 @@ impl ApexExecutor {
         // String:  scan_string_filter_mmap → get_ids → delete_batch + save_delete_only.
         if fk_children.is_empty()
             && indexed_cols.is_empty()
+            && !Self::table_fts_enabled(&base_dir, &this_table_name)
             && storage.pending_v4_in_memory_rows() == 0
         {
             if let Some((col, low, high)) =
@@ -3664,11 +3720,45 @@ impl ApexExecutor {
         // open_for_write (e.g., DELETE), which is safe because of Fix B.
         let storage = TableStorageBackend::open(storage_path)?;
 
+        let (fts_base_dir, fts_table_name) = base_dir_and_table(storage_path);
+        let fts_cfg = Self::read_fts_config(&fts_base_dir);
+        let fts_entry = fts_cfg
+            .as_object()
+            .and_then(|object| object.get(&fts_table_name));
+        let fts_enabled = fts_entry
+            .and_then(|entry| entry.get("enabled"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let fts_fields: Vec<String> = if fts_enabled {
+            fts_entry
+                .and_then(|entry| entry.get("index_fields"))
+                .and_then(|value| value.as_array())
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(|field| field.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    storage
+                        .get_schema()
+                        .into_iter()
+                        .filter(|(_, data_type)| {
+                            matches!(data_type, crate::data::DataType::String)
+                        })
+                        .map(|(name, _)| name)
+                        .collect()
+                })
+        } else {
+            Vec::new()
+        };
+
         // ── Mmap super-fast path ─────────────────────────────────────────────────
         // For: all-literal SET + simple numeric WHERE + no constraints + no indexes.
         // Uses scan_and_update_inplace: single pass per SET column, writes directly to
         // the base .apex file — no DeltaStore serialization, no Arrow batch, no bincode.
         if indexed_cols.is_empty()
+            && !fts_enabled
             && !storage.storage.has_constraints()
             && storage.pending_v4_in_memory_rows() == 0
         {
@@ -3842,6 +3932,11 @@ impl ApexExecutor {
                 needed_cols.push(c.clone());
             }
         }
+        for c in &fts_fields {
+            if !needed_cols.iter().any(|x| x == c) {
+                needed_cols.push(c.clone());
+            }
+        }
         for c in &unique_pk_cols {
             if !needed_cols.iter().any(|x| x == c) {
                 needed_cols.push(c.clone());
@@ -3865,6 +3960,7 @@ impl ApexExecutor {
         let mut updates: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
         let mut old_index_entries: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
         let mut new_index_entries: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
+        let mut fts_updates: Vec<(u64, StdHashMap<String, String>)> = Vec::new();
 
         // Pre-extract _id array once (avoids column_by_name + downcast inside hot loop)
         enum IdArray<'a> {
@@ -3918,7 +4014,10 @@ impl ApexExecutor {
         // ── Fast path: all-literal SET + no constraints + no indexes ───────────
         // Avoids building per-row HashMap for each matched row.
         if let Some(ref lit) = literal_update {
-            if indexed_col_arrays.is_empty() && !storage.storage.has_constraints() {
+            if indexed_col_arrays.is_empty()
+                && !fts_enabled
+                && !storage.storage.has_constraints()
+            {
                 // Collect matching row IDs (no HashMap allocation per row)
                 let mut matched_ids: Vec<u64> = Vec::new();
                 for i in 0..filter_mask.len() {
@@ -3987,6 +4086,21 @@ impl ApexExecutor {
                 }
                 old_index_entries.push((id, old_vals));
                 new_index_entries.push((id, new_vals));
+            }
+
+            if fts_enabled {
+                let mut fields = StdHashMap::with_capacity(fts_fields.len());
+                for field in &fts_fields {
+                    let value = update_data.get(field).cloned().or_else(|| {
+                        batch
+                            .column_by_name(field)
+                            .map(|column| Self::arrow_value_at_col(column, i))
+                    });
+                    if let Some(Value::String(value)) = value {
+                        fields.insert(field.clone(), value);
+                    }
+                }
+                fts_updates.push((id, fields));
             }
 
             updates.push((id, update_data));
@@ -4314,6 +4428,7 @@ impl ApexExecutor {
                     let _ = idx_mgr.save();
                 }
             }
+            Self::notify_fts_update(storage_path, fts_updates);
         }
 
         // Invalidate cache after write

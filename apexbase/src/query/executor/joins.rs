@@ -458,6 +458,9 @@ impl ApexExecutor {
         match expr {
             SqlExpr::Column(name) => column_is_local(batch, name, source_names),
             SqlExpr::Literal(_) | SqlExpr::Variable(_) | SqlExpr::FtsMatch { .. } => true,
+            SqlExpr::FtsResolved { .. }
+            | SqlExpr::FtsScore { .. }
+            | SqlExpr::FtsScoreResolved { .. } => column_is_local(batch, "_id", source_names),
             SqlExpr::BinaryOp { left, right, .. } => {
                 Self::predicate_is_local(batch, left, source_names)
                     && Self::predicate_is_local(batch, right, source_names)

@@ -556,6 +556,12 @@ pub fn wait_fts_backfill(base_dir: &Path, table_name: &str) {
     }
 }
 
+pub fn has_fts_backfill(base_dir: &Path, table_name: &str) -> bool {
+    FTS_BACKFILL_TASKS
+        .read()
+        .contains_key(&(base_dir.to_path_buf(), table_name.to_string()))
+}
+
 pub fn wait_fts_backfills_for_dir(base_dir: &Path) {
     let handles: Vec<_> = {
         let mut tasks = FTS_BACKFILL_TASKS.write();
