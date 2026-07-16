@@ -3,9 +3,10 @@
 use super::{Row, Value};
 use crate::table::column_table::{BitVec, TypedColumn};
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
-    Int64Array, Int64Builder, LargeBinaryArray, StringArray, StringBuilder, UInt64Array,
-    UInt64Builder,
+    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, BooleanBuilder, Float32Array,
+    Float64Array, Float64Builder, Int16Array, Int32Array, Int64Array, Int64Builder, Int8Array,
+    LargeBinaryArray, LargeStringArray, StringArray, StringBuilder, UInt16Array, UInt32Array,
+    UInt64Array, UInt64Builder, UInt8Array,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
@@ -15,6 +16,177 @@ use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+
+pub(crate) struct TypedArrowColumns {
+    pub(crate) ints: HashMap<String, Vec<i64>>,
+    pub(crate) floats: HashMap<String, Vec<f64>>,
+    pub(crate) strings: HashMap<String, Vec<String>>,
+    pub(crate) binaries: HashMap<String, Vec<Vec<u8>>>,
+    pub(crate) bools: HashMap<String, Vec<bool>>,
+    pub(crate) nulls: HashMap<String, Vec<bool>>,
+}
+
+/// Convert Arrow primitive columns directly to the storage engine's columnar input.
+///
+/// Returning `None` keeps compatibility fallbacks available for extension and nested
+/// Arrow types. The conversion is deliberately shared by embedded Arrow inserts and
+/// streaming file import so both paths preserve identical null and type semantics.
+pub(crate) fn record_batch_to_typed_columns(batch: &RecordBatch) -> Option<TypedArrowColumns> {
+    let mut out = TypedArrowColumns {
+        ints: HashMap::new(),
+        floats: HashMap::new(),
+        strings: HashMap::new(),
+        binaries: HashMap::new(),
+        bools: HashMap::new(),
+        nulls: HashMap::new(),
+    };
+    let schema = batch.schema();
+
+    macro_rules! integer_column {
+        ($array:ty, $col:expr, $convert:expr) => {{
+            let array = $col.as_any().downcast_ref::<$array>()?;
+            (0..array.len())
+                .map(|row| $convert(array.value(row)))
+                .collect()
+        }};
+    }
+
+    for (index, field) in schema.fields().iter().enumerate() {
+        let name = field.name();
+        if name == "_id" {
+            continue;
+        }
+        let column = batch.column(index);
+        if column.null_count() > 0 {
+            out.nulls.insert(
+                name.clone(),
+                (0..column.len()).map(|row| column.is_null(row)).collect(),
+            );
+        }
+
+        match column.data_type() {
+            ArrowDataType::Int64 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(Int64Array, column, |value| value),
+                );
+            }
+            ArrowDataType::Int32 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(Int32Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::Int16 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(Int16Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::Int8 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(Int8Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::UInt64 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(UInt64Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::UInt32 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(UInt32Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::UInt16 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(UInt16Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::UInt8 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(UInt8Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::Float64 => {
+                let array = column.as_any().downcast_ref::<Float64Array>()?;
+                out.floats.insert(name.clone(), array.values().to_vec());
+            }
+            ArrowDataType::Float32 => {
+                let array = column.as_any().downcast_ref::<Float32Array>()?;
+                out.floats.insert(
+                    name.clone(),
+                    array.values().iter().map(|value| *value as f64).collect(),
+                );
+            }
+            ArrowDataType::Boolean => {
+                let array = column.as_any().downcast_ref::<BooleanArray>()?;
+                out.bools.insert(
+                    name.clone(),
+                    (0..array.len()).map(|row| array.value(row)).collect(),
+                );
+            }
+            ArrowDataType::Utf8 => {
+                let array = column.as_any().downcast_ref::<StringArray>()?;
+                out.strings.insert(
+                    name.clone(),
+                    (0..array.len())
+                        .map(|row| {
+                            if array.is_null(row) {
+                                String::new()
+                            } else {
+                                array.value(row).to_owned()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            ArrowDataType::LargeUtf8 => {
+                let array = column.as_any().downcast_ref::<LargeStringArray>()?;
+                out.strings.insert(
+                    name.clone(),
+                    (0..array.len())
+                        .map(|row| {
+                            if array.is_null(row) {
+                                String::new()
+                            } else {
+                                array.value(row).to_owned()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            ArrowDataType::Binary => {
+                let array = column.as_any().downcast_ref::<BinaryArray>()?;
+                out.binaries.insert(
+                    name.clone(),
+                    (0..array.len())
+                        .map(|row| {
+                            if array.is_null(row) {
+                                Vec::new()
+                            } else {
+                                array.value(row).to_vec()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            _ => return None,
+        }
+    }
+
+    let has_user_columns = !out.ints.is_empty()
+        || !out.floats.is_empty()
+        || !out.strings.is_empty()
+        || !out.binaries.is_empty()
+        || !out.bools.is_empty();
+    has_user_columns.then_some(out)
+}
 
 // SAFETY: These wrapper types allow raw pointers to be sent across threads
 // The caller must ensure the pointers remain valid for the duration of parallel execution

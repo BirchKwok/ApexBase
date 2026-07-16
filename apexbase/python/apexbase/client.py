@@ -1543,7 +1543,7 @@ class ApexClient:
     @staticmethod
     def _should_use_columnar_materialization(sql_upper: str, sig: str) -> bool:
         """Prefer Rust-side columnar Python conversion for to_dict-friendly result sets."""
-        if sig not in ('like', 'complex', 'projected_full_scan'):
+        if sig not in ('like', 'complex', 'projected_full_scan', 'table_func'):
             return False
         is_cte_query = sql_upper.startswith('WITH ')
         if not (sql_upper.startswith('SELECT') or is_cte_query):

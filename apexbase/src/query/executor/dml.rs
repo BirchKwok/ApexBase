@@ -1,11 +1,27 @@
 // Transaction, DML (INSERT/DELETE/UPDATE), Index management, COPY, PRAGMA
 
 /// Parsed pushdown filter: column index, op, and comparison value
+#[derive(Clone, Copy)]
 struct PushdownFilter {
     col_idx: usize,
     op: u8,
     op_eq: bool,
     val_f64: f64,
+}
+
+impl PushdownFilter {
+    #[inline]
+    fn matches(self, value: f64) -> bool {
+        match self.op {
+            b'>' if self.op_eq => value >= self.val_f64,
+            b'<' if self.op_eq => value <= self.val_f64,
+            b'>' => value > self.val_f64,
+            b'<' => value < self.val_f64,
+            b'=' => (value - self.val_f64).abs() < 1e-12,
+            b'!' => (value - self.val_f64).abs() >= 1e-12,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -52,18 +68,7 @@ fn parse_pushdown_filter(
 fn csv_filter_match(field: &[u8], filter: &PushdownFilter) -> bool {
     if field.is_empty() { return false; }
     let val: Option<f64> = std::str::from_utf8(field).ok().and_then(|s| s.parse().ok());
-    match val {
-        Some(v) => match filter.op {
-            b'>' if filter.op_eq => v >= filter.val_f64,
-            b'<' if filter.op_eq => v <= filter.val_f64,
-            b'>' => v > filter.val_f64,
-            b'<' => v < filter.val_f64,
-            b'=' => (v - filter.val_f64).abs() < 1e-12,
-            b'!' => (v - filter.val_f64).abs() >= 1e-12,
-            _ => true,
-        },
-        None => false,
-    }
+    val.map(|value| filter.matches(value)).unwrap_or(false)
 }
 
 impl ApexExecutor {
@@ -4649,7 +4654,7 @@ impl ApexExecutor {
         match func.to_uppercase().as_str() {
             "READ_CSV" => Self::read_csv_to_batch(file, options),
             "READ_JSON" => Self::read_json_to_batch(file, options),
-            "READ_PARQUET" => Self::read_parquet_to_batch(file),
+            "READ_PARQUET" => Self::read_parquet_to_batch(file, options),
             other => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unknown table function: {}", other),
@@ -4680,7 +4685,7 @@ impl ApexExecutor {
             return Self::read_json_to_batch(file, &[]);
         }
         if lower.ends_with(".parquet") {
-            return Self::read_parquet_to_batch(file);
+            return Self::read_parquet_to_batch(file, &[]);
         }
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -6226,8 +6231,16 @@ impl ApexExecutor {
     }
 
     /// Read a Parquet file into an Arrow RecordBatch — parallel row-group reader.
-    fn read_parquet_to_batch(path: &str) -> io::Result<RecordBatch> {
-        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+    fn read_parquet_to_batch(
+        path: &str,
+        options: &[(String, String)],
+    ) -> io::Result<RecordBatch> {
+        use parquet::arrow::arrow_reader::{
+            ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions,
+            ParquetRecordBatchReaderBuilder, RowFilter,
+        };
+        use parquet::arrow::ProjectionMask;
+        use parquet::file::metadata::PageIndexPolicy;
         use rayon::prelude::*;
 
         let file = std::fs::File::open(path).map_err(|e| {
@@ -6246,8 +6259,133 @@ impl ApexExecutor {
 
         // Parse metadata ONCE; all parallel readers share it via clone() (cheap Arc increments).
         // Bytes implements ChunkReader; clone() is O(1) (just increments the Arc refcount).
-        let arrow_meta = ArrowReaderMetadata::load(&(*shared).clone(), Default::default())
+        let has_filter = options.iter().any(|(key, _)| key == "filter");
+        let reader_options = ArrowReaderOptions::new()
+            .with_page_index_policy(PageIndexPolicy::from(has_filter));
+        let arrow_meta = ArrowReaderMetadata::load(&(*shared).clone(), reader_options)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let filter_info = options
+            .iter()
+            .find(|(key, _)| key == "filter")
+            .and_then(|(_, value)| parse_pushdown_filter(value, arrow_meta.schema()))
+            .filter(|filter| {
+                Self::parquet_filter_type_supported(
+                    arrow_meta.schema().field(filter.col_idx).data_type(),
+                )
+            });
+        let projection_names = options
+            .iter()
+            .find(|(key, _)| key == "columns")
+            .map(|(_, value)| {
+                value
+                    .split('\u{1f}')
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|names| {
+                !names.is_empty()
+                    && names
+                        .iter()
+                        .all(|name| arrow_meta.schema().index_of(name).is_ok())
+            });
+
+        // Query-aware path: decode only referenced columns and evaluate simple numeric
+        // predicates inside the Parquet reader. The predicate column is cached by the
+        // reader when it is also part of the output projection.
+        if filter_info.is_some() || projection_names.is_some() {
+            let parquet_schema = arrow_meta.parquet_schema().clone();
+            let projection = projection_names.as_ref().map(|names| {
+                ProjectionMask::columns(&parquet_schema, names.iter().map(String::as_str))
+            });
+            let filter_projection = filter_info.map(|filter| {
+                let filter_name = arrow_meta.schema().field(filter.col_idx).name();
+                (
+                    ProjectionMask::columns(&parquet_schema, [filter_name.as_str()]),
+                    filter,
+                )
+            });
+            let n_groups = arrow_meta.metadata().num_row_groups();
+
+            if n_groups > 1 {
+                let row_groups: Vec<usize> = (0..n_groups).collect();
+                let group_chunk =
+                    ((n_groups + rayon::current_num_threads() - 1) / rayon::current_num_threads())
+                        .max(1);
+                let row_group_chunks: Vec<Vec<usize>> = row_groups
+                    .chunks(group_chunk)
+                    .map(<[usize]>::to_vec)
+                    .collect();
+                let batches: Vec<io::Result<RecordBatch>> = row_group_chunks
+                    .into_par_iter()
+                    .map(|row_groups| {
+                        let rows = row_groups
+                            .iter()
+                            .map(|row_group| {
+                                arrow_meta.metadata().row_group(*row_group).num_rows() as usize
+                            })
+                            .sum::<usize>();
+                        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                            (*shared).clone(),
+                            arrow_meta.clone(),
+                        )
+                        .with_row_groups(row_groups)
+                        .with_batch_size(rows.max(1));
+                        if let Some(mask) = projection.as_ref() {
+                            builder = builder.with_projection(mask.clone());
+                        }
+                        if let Some((mask, filter)) = filter_projection.as_ref() {
+                            let filter = *filter;
+                            let predicate = ArrowPredicateFn::new(
+                                mask.clone(),
+                                move |batch: RecordBatch| {
+                                    Self::parquet_numeric_filter(batch.column(0), filter)
+                                },
+                            );
+                            builder = builder
+                                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
+                        }
+                        let reader = builder.build().map_err(|error| {
+                            io::Error::new(io::ErrorKind::Other, error.to_string())
+                        })?;
+                        let batches = reader
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| {
+                                io::Error::new(io::ErrorKind::Other, error.to_string())
+                            })?;
+                        Self::merge_record_batches(batches)
+                    })
+                    .collect();
+                return Self::merge_record_batches(
+                    batches.into_iter().collect::<io::Result<Vec<_>>>()?,
+                );
+            }
+
+            let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                (*shared).clone(),
+                arrow_meta,
+            )
+            .with_batch_size(65_536);
+
+            if let Some(mask) = projection {
+                builder = builder.with_projection(mask);
+            }
+            if let Some((mask, filter)) = filter_projection {
+                let predicate = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
+                    Self::parquet_numeric_filter(batch.column(0), filter)
+                });
+                builder = builder.with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
+            }
+
+            let reader = builder
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let batches = reader
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            return Self::merge_record_batches(batches);
+        }
 
         let n_groups = arrow_meta.metadata().num_row_groups();
         let total_rows = arrow_meta.metadata().file_metadata().num_rows() as usize;
@@ -6289,7 +6427,6 @@ impl ApexExecutor {
             let bucket_results: Vec<io::Result<RecordBatch>> = col_buckets
                 .into_par_iter()
                 .map(|col_idxs| {
-                    use parquet::arrow::ProjectionMask;
                     // new_with_metadata: reuses pre-parsed metadata (cheap clone — all Arc internals).
                     let b = ParquetRecordBatchReaderBuilder::new_with_metadata(
                         (*shared).clone(),
@@ -6354,6 +6491,131 @@ impl ApexExecutor {
         Self::merge_record_batches(all)
     }
 
+    fn try_fast_parquet_count(path: &str, filter: Option<&str>) -> io::Result<Option<i64>> {
+        use parquet::arrow::arrow_reader::{
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+        };
+        use parquet::arrow::ProjectionMask;
+        use rayon::prelude::*;
+
+        let file = std::fs::File::open(path).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Cannot open Parquet file '{}': {}", path, error),
+            )
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        let input = bytes::Bytes::from_owner(mmap);
+        let options = ArrowReaderOptions::new();
+        let metadata = ArrowReaderMetadata::load(&input, options)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+
+        let Some(filter_text) = filter else {
+            return Ok(Some(
+                metadata.metadata().file_metadata().num_rows() as i64
+            ));
+        };
+        let Some(filter) = parse_pushdown_filter(filter_text, metadata.schema()) else {
+            return Ok(None);
+        };
+        if !Self::parquet_filter_type_supported(
+            metadata.schema().field(filter.col_idx).data_type(),
+        ) {
+            return Ok(None);
+        }
+        let filter_name = metadata.schema().field(filter.col_idx).name().clone();
+        let parquet_schema = metadata.parquet_schema().clone();
+        let mask = ProjectionMask::columns(&parquet_schema, [filter_name.as_str()]);
+        let row_groups = metadata.metadata().num_row_groups();
+        let counts: io::Result<Vec<i64>> = (0..row_groups)
+            .into_par_iter()
+            .map(|row_group| {
+                let rows = metadata.metadata().row_group(row_group).num_rows() as usize;
+                let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    input.clone(),
+                    metadata.clone(),
+                )
+                .with_row_groups(vec![row_group])
+                .with_batch_size(rows.max(1))
+                .with_projection(mask.clone())
+                .build()
+                .map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                })?;
+
+                let mut count = 0i64;
+                for batch in reader {
+                    let batch = batch.map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    count += Self::parquet_numeric_filter(batch.column(0), filter)
+                        .map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })?
+                        .true_count() as i64;
+                }
+                Ok(count)
+            })
+            .collect();
+        Ok(Some(counts?.into_iter().sum()))
+    }
+
+    #[inline]
+    fn parquet_filter_type_supported(data_type: &arrow::datatypes::DataType) -> bool {
+        matches!(
+            data_type,
+            arrow::datatypes::DataType::Float32 | arrow::datatypes::DataType::Float64
+        )
+    }
+
+    fn parquet_numeric_filter(
+        array: &ArrayRef,
+        filter: PushdownFilter,
+    ) -> arrow::error::Result<BooleanArray> {
+        if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+            let scalar = Float64Array::new_scalar(filter.val_f64);
+            return match filter.op {
+                b'>' if filter.op_eq => cmp::gt_eq(values, &scalar),
+                b'<' if filter.op_eq => cmp::lt_eq(values, &scalar),
+                b'>' => cmp::gt(values, &scalar),
+                b'<' => cmp::lt(values, &scalar),
+                b'=' => cmp::eq(values, &scalar),
+                b'!' => cmp::neq(values, &scalar),
+                _ => Ok(BooleanArray::from_iter(std::iter::repeat_n(
+                    Some(true),
+                    array.len(),
+                ))),
+            };
+        }
+
+        macro_rules! primitive_mask {
+            ($array_type:ty) => {
+                if let Some(values) = array.as_any().downcast_ref::<$array_type>() {
+                    return Ok(BooleanArray::from_iter((0..values.len()).map(|index| {
+                        Some(!values.is_null(index) && filter.matches(values.value(index) as f64))
+                    })));
+                }
+            };
+        }
+
+        primitive_mask!(arrow::array::Int8Array);
+        primitive_mask!(arrow::array::Int16Array);
+        primitive_mask!(arrow::array::Int32Array);
+        primitive_mask!(arrow::array::Int64Array);
+        primitive_mask!(arrow::array::UInt8Array);
+        primitive_mask!(arrow::array::UInt16Array);
+        primitive_mask!(arrow::array::UInt32Array);
+        primitive_mask!(arrow::array::UInt64Array);
+        primitive_mask!(arrow::array::Float32Array);
+
+        // Unsupported physical types must remain in the generic SQL filter path.
+        Ok(BooleanArray::from_iter(std::iter::repeat_n(
+            Some(true),
+            array.len(),
+        )))
+    }
+
     /// Concatenate multiple RecordBatches into one (or return empty if none).
     fn merge_record_batches(batches: Vec<RecordBatch>) -> io::Result<RecordBatch> {
         if batches.is_empty() {
@@ -6371,6 +6633,224 @@ impl ApexExecutor {
         })
     }
 
+    const IMPORT_BATCH_ROWS: usize = 65_536;
+
+    fn for_each_import_batch<F>(
+        file_path: &str,
+        format: &str,
+        options: &[(String, String)],
+        mut visit: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(RecordBatch) -> io::Result<()>,
+    {
+        match format.to_uppercase().as_str() {
+            "CSV" | "TSV" => {
+                let has_header = options
+                    .iter()
+                    .find(|(key, _)| key == "header")
+                    .map(|(_, value)| !matches!(value.to_lowercase().as_str(), "false" | "0"))
+                    .unwrap_or(true);
+                let delimiter = options
+                    .iter()
+                    .find(|(key, _)| key == "delimiter" || key == "delim" || key == "sep")
+                    .and_then(|(_, value)| value.as_bytes().first().copied())
+                    .unwrap_or(if format.eq_ignore_ascii_case("TSV") {
+                        b'\t'
+                    } else {
+                        b','
+                    });
+
+                let file = std::fs::File::open(file_path).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("Cannot open CSV file '{}': {}", file_path, error),
+                    )
+                })?;
+                let mmap = unsafe { memmap2::Mmap::map(&file) }
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                let schema = Arc::new(Self::infer_csv_schema_fast(
+                    &mmap,
+                    has_header,
+                    delimiter,
+                    100,
+                )?);
+                drop(mmap);
+                drop(file);
+
+                let input = std::io::BufReader::with_capacity(
+                    1024 * 1024,
+                    std::fs::File::open(file_path)?,
+                );
+                let reader = arrow::csv::ReaderBuilder::new(schema)
+                    .with_header(has_header)
+                    .with_delimiter(delimiter)
+                    .with_batch_size(Self::IMPORT_BATCH_ROWS)
+                    .build(input)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+                for batch in reader {
+                    visit(batch.map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?)?;
+                }
+            }
+            "JSON" | "NDJSON" | "JSONL" => {
+                let file = std::fs::File::open(file_path).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("Cannot open JSON file '{}': {}", file_path, error),
+                    )
+                })?;
+                let mmap = unsafe { memmap2::Mmap::map(&file) }
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                let start = mmap
+                    .iter()
+                    .position(|byte| !byte.is_ascii_whitespace())
+                    .unwrap_or(mmap.len());
+                let is_ndjson = start < mmap.len() && Self::looks_like_ndjson(&mmap[start..]);
+                drop(mmap);
+                drop(file);
+
+                if !is_ndjson {
+                    let batch = Self::read_json_to_batch(file_path, options)?;
+                    if batch.num_rows() > 0 {
+                        visit(batch)?;
+                    }
+                    return Ok(());
+                }
+
+                let schema = {
+                    use arrow::json::reader::infer_json_schema_from_seekable;
+                    let mut input = std::io::BufReader::new(std::fs::File::open(file_path)?);
+                    let (schema, _) = infer_json_schema_from_seekable(&mut input, Some(100))
+                        .map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })?;
+                    Arc::new(schema)
+                };
+                let input = std::io::BufReader::with_capacity(
+                    1024 * 1024,
+                    std::fs::File::open(file_path)?,
+                );
+                let reader = arrow::json::ReaderBuilder::new(schema)
+                    .with_batch_size(Self::IMPORT_BATCH_ROWS)
+                    .build(input)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+                for batch in reader {
+                    visit(batch.map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?)?;
+                }
+            }
+            _ => {
+                use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+                let file = std::fs::File::open(file_path).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("Cannot open Parquet file '{}': {}", file_path, error),
+                    )
+                })?;
+                let mmap = unsafe { memmap2::Mmap::map(&file) }
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                let input = bytes::Bytes::from_owner(mmap);
+                let reader = ParquetRecordBatchReaderBuilder::try_new(input)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+                    .with_batch_size(Self::IMPORT_BATCH_ROWS)
+                    .build()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+                for batch in reader {
+                    visit(batch.map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_import_table(
+        storage_path: &Path,
+        table_name: &str,
+        schema: &arrow::datatypes::Schema,
+    ) -> io::Result<()> {
+        if storage_path.exists() {
+            return Ok(());
+        }
+
+        use crate::data::DataType as ApexDataType;
+        use crate::query::sql_parser::ColumnDef;
+        let columns: Vec<ColumnDef> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let apex_type = match field.data_type() {
+                    arrow::datatypes::DataType::Int64
+                    | arrow::datatypes::DataType::Int32
+                    | arrow::datatypes::DataType::Int16
+                    | arrow::datatypes::DataType::Int8
+                    | arrow::datatypes::DataType::UInt64
+                    | arrow::datatypes::DataType::UInt32
+                    | arrow::datatypes::DataType::UInt16
+                    | arrow::datatypes::DataType::UInt8 => ApexDataType::Int64,
+                    arrow::datatypes::DataType::Float64
+                    | arrow::datatypes::DataType::Float32 => ApexDataType::Float64,
+                    arrow::datatypes::DataType::Boolean => ApexDataType::Bool,
+                    arrow::datatypes::DataType::Binary => ApexDataType::Binary,
+                    _ => ApexDataType::String,
+                };
+                ColumnDef {
+                    name: field.name().clone(),
+                    data_type: apex_type,
+                    constraints: vec![],
+                }
+            })
+            .collect();
+        Self::execute_create_table(storage_path, table_name, &columns, true)?;
+        Ok(())
+    }
+
+    fn append_import_batch(
+        storage_path: &Path,
+        table_name: &str,
+        batch: &RecordBatch,
+    ) -> io::Result<usize> {
+        if batch.num_rows() == 0 {
+            return Ok(0);
+        }
+        Self::ensure_import_table(storage_path, table_name, batch.schema().as_ref())?;
+
+        if let Some(columns) =
+            crate::data::arrow_convert::record_batch_to_typed_columns(batch)
+        {
+            crate::storage::engine::engine().write_typed(
+                storage_path,
+                columns.ints,
+                columns.floats,
+                columns.strings,
+                columns.binaries,
+                HashMap::new(),
+                columns.bools,
+                columns.nulls,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+            return Ok(batch.num_rows());
+        }
+
+        let schema = batch.schema();
+        let col_names: Vec<String> = schema.fields().iter().map(|field| field.name().clone()).collect();
+        let mut values = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for column in batch.columns() {
+                row.push(Self::arrow_value_at_col(column, row_idx));
+            }
+            values.push(row);
+        }
+        Self::execute_insert(storage_path, Some(&col_names), &values)?;
+        Ok(batch.num_rows())
+    }
+
     /// Execute COPY table FROM 'file' — auto-detect format (CSV, JSON, PARQUET).
     pub(crate) fn execute_copy_import(
         storage_path: &Path,
@@ -6378,68 +6858,14 @@ impl ApexExecutor {
         file_path: &str,
         format: &str,
         options: &[(String, String)],
-        base_dir: &Path,
-        default_table_path: &Path,
+        _base_dir: &Path,
+        _default_table_path: &Path,
     ) -> io::Result<ApexResult> {
-        let batch = match format.to_uppercase().as_str() {
-            "CSV" | "TSV" => Self::read_csv_to_batch(file_path, options)?,
-            "JSON" | "NDJSON" | "JSONL" => Self::read_json_to_batch(file_path, options)?,
-            _ => Self::read_parquet_to_batch(file_path)?,
-        };
-
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
-            return Ok(ApexResult::Scalar(0));
-        }
-
-        let schema = batch.schema();
-        let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-
-        // Ensure table exists — auto-create from schema if needed.
-        // NOTE: we call execute_create_table directly (NOT via execute_parsed_multi) because
-        // we are already inside a with_table_write_lock; going through execute_parsed_multi
-        // would attempt to re-acquire the same lock and deadlock.
-        if !storage_path.exists() {
-            use crate::data::DataType as ApexDataType;
-            use crate::query::sql_parser::ColumnDef;
-            let columns: Vec<ColumnDef> = schema
-                .fields()
-                .iter()
-                .map(|field| {
-                    let apex_type = match field.data_type() {
-                        arrow::datatypes::DataType::Int64
-                        | arrow::datatypes::DataType::Int32
-                        | arrow::datatypes::DataType::Int16
-                        | arrow::datatypes::DataType::Int8
-                        | arrow::datatypes::DataType::UInt64
-                        | arrow::datatypes::DataType::UInt32 => ApexDataType::Int64,
-                        arrow::datatypes::DataType::Float64
-                        | arrow::datatypes::DataType::Float32 => ApexDataType::Float64,
-                        arrow::datatypes::DataType::Boolean => ApexDataType::Bool,
-                        _ => ApexDataType::String,
-                    };
-                    ColumnDef {
-                        name: field.name().clone(),
-                        data_type: apex_type,
-                        constraints: vec![],
-                    }
-                })
-                .collect();
-            Self::execute_create_table(storage_path, table_name, &columns, true)?;
-        }
-
-        // Insert row-by-row via execute_insert
-        let mut values: Vec<Vec<Value>> = Vec::with_capacity(num_rows);
-        for row_idx in 0..num_rows {
-            let mut row: Vec<Value> = Vec::with_capacity(col_names.len());
-            for col_idx in 0..col_names.len() {
-                let col = batch.column(col_idx);
-                row.push(Self::arrow_value_at_col(col, row_idx));
-            }
-            values.push(row);
-        }
-
-        Self::execute_insert(storage_path, Some(&col_names), &values)?;
+        let mut num_rows = 0usize;
+        Self::for_each_import_batch(file_path, format, options, |batch| {
+            num_rows += Self::append_import_batch(storage_path, table_name, &batch)?;
+            Ok(())
+        })?;
         Ok(ApexResult::Scalar(num_rows as i64))
     }
 }

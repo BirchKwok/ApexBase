@@ -117,6 +117,44 @@ python benchmarks/bench_vs_sqlite_duckdb.py --rows 200000 --warmup 2 --iteration
 Add `--skip-vector` if you want a tabular-only rerun without the separate vector module.
 Run `python benchmarks/bench_vs_sqlite_duckdb_extended.py --rows 200000 --warmup 2 --iterations 3` for the file-format, materialization, Q/s, microbenchmark, durable, transaction, buffered/memtable, and full vector diagnostics.
 
+### Out-of-core file comparison
+
+Use the focused harness to compare ApexBase and DuckDB against the exact same
+generated CSV or Parquet source:
+
+```bash
+python benchmarks/bench_out_of_core_import.py --rows 1000000 --format csv
+python benchmarks/bench_out_of_core_import.py --rows 1000000 --format parquet
+```
+
+Each engine runs in an isolated process. The report separates direct file query
+time, disk-backed table materialization time, repeated native-table query time,
+incremental peak RSS, and storage size. Results and filtered row counts are
+cross-checked before ratios are printed. DuckDB defaults to a `1GB` memory limit
+and an explicit spill directory; change it with `--memory-limit 512MB`. Increase
+`--rows` until the generated source exceeds physical memory for a true
+out-of-core stress run. Ratios are reported as ApexBase divided by DuckDB, so a
+value below `1.0x` is better for ApexBase.
+
+On the same Apple Silicon development machine, the focused 1,000,000-row
+Parquet run (9 measured queries after 3 warmups) produced this verification
+snapshot:
+
+| Metric | ApexBase | DuckDB | ApexBase / DuckDB |
+| --- | ---: | ---: | ---: |
+| Direct filtered Parquet count | 1.49 ms | 9.49 ms | 0.157x |
+| Disk-backed materialization | 0.126 s | 0.279 s | 0.451x |
+| Filter + GROUP BY + COUNT/AVG | 1.485 ms | 3.422 ms | 0.434x |
+| Incremental peak RSS | 90.3 MB | 119.0 MB | 0.759x |
+| Native storage size | 33.9 MiB | 6.8 MiB | 5.012x |
+
+The native query uses a single fused storage scan for a numeric range filter,
+one string grouping column, `COUNT(*)`, and `SUM`/`AVG` over one shared numeric
+column. Nullable inputs and more complex SQL shapes deliberately fall back to
+the general executor. The storage-size result is included because it remains a
+clear optimization target even though latency and peak memory are ahead in this
+workload.
+
 Blob storage has a focused Lance comparison harness:
 
 ```bash

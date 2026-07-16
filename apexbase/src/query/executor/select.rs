@@ -105,6 +105,11 @@ impl ApexExecutor {
                     ..
                 }) => {
                     if let Some(count_batch) =
+                        Self::try_fast_parquet_count_table_function(&stmt, func, file)?
+                    {
+                        return Ok(ApexResult::Data(count_batch));
+                    }
+                    if let Some(count_batch) =
                         Self::try_fast_json_count_table_function(&stmt, func, file)?
                     {
                         return Ok(ApexResult::Data(count_batch));
@@ -114,6 +119,9 @@ impl ApexExecutor {
                         if let Some(pushdown) = Self::try_extract_filter_for_pushdown(wc) {
                             opts.push(("filter".to_string(), pushdown));
                         }
+                    }
+                    if let Some(columns) = Self::get_col_refs(&stmt) {
+                        opts.push(("columns".to_string(), columns.join("\u{1f}")));
                     }
                     Self::read_table_function(func, file, &opts)?
                 }
@@ -286,6 +294,23 @@ impl ApexExecutor {
                                 }
                                 if let Some(result) =
                                     Self::try_fast_filtered_numeric_agg(&backend, &stmt)?
+                                {
+                                    return Ok(result);
+                                }
+                            }
+
+                            // FAST PATH: fuse a numeric range filter with string GROUP BY and
+                            // COUNT(*) / SUM / AVG over one numeric column in a single scan.
+                            if has_aggregation_check
+                                && stmt.where_clause.is_some()
+                                && !stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && stmt.having.is_none()
+                                && !backend.has_pending_deltas()
+                                && !backend.has_delta()
+                            {
+                                if let Some(result) =
+                                    Self::try_fast_numeric_filter_group_by(&backend, &stmt)?
                                 {
                                     return Ok(result);
                                 }
@@ -2326,9 +2351,201 @@ impl ApexExecutor {
         Ok(Some(result))
     }
 
-    /// FAST PATH for Complex (Filter+Group+Order) queries
-    /// Optimized for: SELECT group_col, AGG(agg_col) FROM table WHERE filter_col = 'value' GROUP BY group_col ORDER BY agg DESC LIMIT n
-    /// Uses single-pass execution with direct dictionary indexing for maximum performance
+    /// Fuse one numeric range filter, one string GROUP BY key, and compatible
+    /// COUNT/SUM/AVG projections into a single storage scan.
+    fn try_fast_numeric_filter_group_by(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
+            || stmt.distinct
+            || stmt.distinct_on.is_some()
+            || stmt.group_by.len() != 1
+            || stmt.having.is_some()
+            || stmt.group_by_exprs.iter().any(Option::is_some)
+            || stmt.order_by.iter().any(|clause| clause.expr.is_some())
+        {
+            return Ok(None);
+        }
+
+        let where_clause = match &stmt.where_clause {
+            Some(expr) => expr,
+            None => return Ok(None),
+        };
+        let (filter_col, low, high) = match Self::extract_any_numeric_range(where_clause) {
+            Some(range) => range,
+            None => return Ok(None),
+        };
+        let group_col = stmt.group_by[0].trim_matches('"');
+
+        let mut aggregate_col: Option<String> = None;
+        let mut has_aggregate = false;
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(name) if name.trim_matches('"') == group_col => {}
+                SelectColumn::ColumnAlias { column, .. }
+                    if column.trim_matches('"') == group_col => {}
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    distinct,
+                    ..
+                } => {
+                    if *distinct {
+                        return Ok(None);
+                    }
+                    has_aggregate = true;
+                    match func {
+                        AggregateFunc::Count => {
+                            let is_count_star = column.as_ref().map_or(true, |name| {
+                                name == "*"
+                                    || name
+                                        .chars()
+                                        .next()
+                                        .map(|ch| ch.is_ascii_digit())
+                                        .unwrap_or(false)
+                            });
+                            if !is_count_star {
+                                return Ok(None);
+                            }
+                        }
+                        AggregateFunc::Sum | AggregateFunc::Avg => {
+                            let name = match column {
+                                Some(name) if name != "*" => name.trim_matches('"'),
+                                _ => return Ok(None),
+                            };
+                            if aggregate_col.as_deref().is_some_and(|current| current != name) {
+                                return Ok(None);
+                            }
+                            aggregate_col = Some(name.to_string());
+                        }
+                        AggregateFunc::Min | AggregateFunc::Max => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        if !has_aggregate {
+            return Ok(None);
+        }
+
+        // The storage aggregation intentionally omits null checks in its inner loop.
+        // Keep nullable inputs on the generic Arrow path to preserve SQL semantics.
+        if backend.column_has_nulls(&filter_col)
+            || backend.column_has_nulls(group_col)
+            || aggregate_col
+                .as_deref()
+                .is_some_and(|name| backend.column_has_nulls(name))
+        {
+            return Ok(None);
+        }
+
+        let raw = if let Some(dict_arc) = crate::storage::backend::get_global_dict_cache(
+            backend.path(),
+            group_col,
+            &backend.storage,
+        )? {
+            backend.execute_between_group_agg_cached(
+                &filter_col,
+                low,
+                high,
+                &dict_arc.0,
+                &dict_arc.1,
+                aggregate_col.as_deref(),
+            )?
+        } else {
+            backend.execute_between_group_agg(
+                &filter_col,
+                low,
+                high,
+                group_col,
+                aggregate_col.as_deref(),
+            )?
+        };
+        let raw = match raw {
+            Some(raw) => raw,
+            None => return Ok(None),
+        };
+
+        let mut fields = Vec::with_capacity(stmt.columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(_) => {
+                    let values: Vec<&str> = raw.iter().map(|(group, _, _)| group.as_str()).collect();
+                    fields.push(Field::new(
+                        Self::group_output_name(stmt, group_col),
+                        ArrowDataType::Utf8,
+                        false,
+                    ));
+                    arrays.push(Arc::new(StringArray::from(values)));
+                }
+                SelectColumn::ColumnAlias { alias, .. } => {
+                    let values: Vec<&str> = raw.iter().map(|(group, _, _)| group.as_str()).collect();
+                    fields.push(Field::new(alias, ArrowDataType::Utf8, false));
+                    arrays.push(Arc::new(StringArray::from(values)));
+                }
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    alias,
+                    ..
+                } => {
+                    let source = column.as_deref().unwrap_or("*");
+                    let output_name = alias.clone().unwrap_or_else(|| format!("{}({})", func, source));
+                    if matches!(func, AggregateFunc::Count) {
+                        fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                        arrays.push(Arc::new(Int64Array::from(
+                            raw.iter().map(|(_, _, count)| *count).collect::<Vec<_>>(),
+                        )));
+                    } else {
+                        fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
+                        arrays.push(Arc::new(Float64Array::from(
+                            raw.iter()
+                                .map(|(_, sum, count)| match func {
+                                    AggregateFunc::Avg if *count > 0 => *sum / *count as f64,
+                                    AggregateFunc::Avg => 0.0,
+                                    _ => *sum,
+                                })
+                                .collect::<Vec<_>>(),
+                        )));
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let mut result =
+            RecordBatch::try_new(schema, arrays).map_err(|error| err_data(error.to_string()))?;
+        if !stmt.order_by.is_empty() {
+            let resolved = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            if resolved
+                .iter()
+                .any(|clause| result.schema().field_with_name(&clause.column).is_err())
+            {
+                return Ok(None);
+            }
+            let top_k = stmt.limit.map(|limit| limit + stmt.offset.unwrap_or(0));
+            result = Self::apply_order_by_topk(&result, &resolved, top_k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result = Self::apply_limit_offset(&result, stmt.limit, stmt.offset)?;
+        }
+
+        if result.num_rows() == 0 {
+            Ok(Some(ApexResult::Empty(result.schema())))
+        } else {
+            Ok(Some(ApexResult::Data(result)))
+        }
+    }
+
+    /// FAST PATH for Complex (Filter+Group+Order) queries.
+    /// Uses single-pass execution with direct dictionary indexing.
     fn try_fast_filter_group_order(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
@@ -2785,6 +3002,39 @@ impl ApexExecutor {
             return Ok(None);
         };
         let Some(count) = Self::try_fast_json_count(file, stmt.where_clause.as_ref())? else {
+            return Ok(None);
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            &output_name,
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+        RecordBatch::try_new(schema, vec![array])
+            .map(Some)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    fn try_fast_parquet_count_table_function(
+        stmt: &SelectStatement,
+        func: &str,
+        file: &str,
+    ) -> io::Result<Option<RecordBatch>> {
+        if !func.eq_ignore_ascii_case("READ_PARQUET") {
+            return Ok(None);
+        }
+        let Some(output_name) = Self::count_star_output_name_for_table_fn(stmt) else {
+            return Ok(None);
+        };
+        let filter = match stmt.where_clause.as_ref() {
+            Some(expr) => match Self::try_extract_filter_for_pushdown(expr) {
+                Some(filter) => Some(filter),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        let Some(count) = Self::try_fast_parquet_count(file, filter.as_deref())? else {
             return Ok(None);
         };
 

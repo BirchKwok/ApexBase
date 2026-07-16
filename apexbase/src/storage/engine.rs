@@ -881,7 +881,10 @@ impl StorageEngine {
                         let header = storage.header_info();
                         let is_v4 = header.0 > 0; // footer_offset > 0 means V4
 
-                        if is_v4 && !schema.is_empty() {
+                        // A schema-only V4 file may contain an empty bootstrap row group.
+                        // The first write must go through save_v4() so that bootstrap metadata
+                        // is replaced instead of retained ahead of appended data row groups.
+                        if is_v4 && !schema.is_empty() && storage.row_count() > 0 {
                             // Check column match
                             let schema_cols: std::collections::HashSet<String> =
                                 schema.iter().map(|(name, _)| name.clone()).collect();
@@ -1209,5 +1212,64 @@ mod tests {
         assert!(engine.exists(&table_path, ids[0]).unwrap());
         assert!(engine.exists(&table_path, ids[1]).unwrap());
         assert!(!engine.exists(&table_path, 999).unwrap());
+    }
+
+    #[test]
+    fn test_typed_write_replaces_schema_only_bootstrap_before_append() {
+        use arrow::array::{Int64Array, StringArray};
+
+        let dir = tempdir().unwrap();
+        let table_path = dir.path().join("streamed.apex");
+        let engine = StorageEngine::global();
+        engine
+            .create_table_with_schema(
+                &table_path,
+                DurabilityLevel::Fast,
+                &[
+                    ("value".to_string(), ColumnType::Int64),
+                    ("category".to_string(), ColumnType::String),
+                ],
+            )
+            .unwrap();
+
+        for (values, categories) in [
+            (vec![1, 2, 3], vec!["a", "b", "c"]),
+            (vec![4, 5], vec!["d", "e"]),
+        ] {
+            engine
+                .write_typed(
+                    &table_path,
+                    HashMap::from([("value".to_string(), values)]),
+                    HashMap::new(),
+                    HashMap::from([(
+                        "category".to_string(),
+                        categories.into_iter().map(str::to_string).collect(),
+                    )]),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    DurabilityLevel::Fast,
+                )
+                .unwrap();
+        }
+
+        let backend = TableStorageBackend::open(&table_path).unwrap();
+        let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
+        assert_eq!(batch.num_rows(), 5);
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let categories = batch
+            .column_by_name("category")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.values(), &[1, 2, 3, 4, 5]);
+        assert_eq!(categories.value(4), "e");
     }
 }

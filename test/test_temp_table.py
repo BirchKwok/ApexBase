@@ -161,3 +161,78 @@ def test_temp_table_multiple_queries_fast(temp_dir):
     assert avg_time < 50, f"Temp table queries too slow: {avg_time:.2f}ms avg"
 
     client.close()
+
+
+def test_temp_table_csv_import_crosses_stream_batch_boundary(temp_dir):
+    """Large imports append multiple V4 row groups without losing IDs or NULLs."""
+    client = ApexClient(temp_dir, drop_if_exists=True)
+    client.create_table("_dummy")
+    client.use_table("_dummy")
+
+    csv_path = os.path.join(temp_dir, "streamed.csv")
+    rows = 70_000
+    with open(csv_path, "w") as f:
+        f.write("value,category\n")
+        for i in range(rows):
+            value = "" if i == 65_536 else str(i)
+            f.write(f"{value},group_{i % 8}\n")
+
+    client.register_temp_table("streamed", csv_path)
+
+    assert client.execute("SELECT COUNT(*) FROM streamed").scalar() == rows
+    assert client.execute("SELECT COUNT(*) FROM streamed WHERE value IS NULL").scalar() == 1
+    boundary = client.execute("SELECT category FROM streamed WHERE _id = 65537").first()
+    assert boundary["category"] == "group_0"
+    tail = client.execute("SELECT value FROM streamed WHERE _id = 70000").first()
+    assert tail["value"] == rows - 1
+
+    client.close()
+
+
+def test_temp_table_parquet_import_crosses_stream_batch_boundary(temp_dir):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    client = ApexClient(temp_dir, drop_if_exists=True)
+    client.create_table("_dummy")
+    client.use_table("_dummy")
+
+    rows = 70_000
+    parquet_path = os.path.join(temp_dir, "streamed.parquet")
+    table = pa.table(
+        {
+            "value": pa.array(range(rows), type=pa.int64()),
+            "score": pa.array((i % 1000 / 10.0 for i in range(rows)), type=pa.float64()),
+            "category": pa.array([f"group_{i % 8}" for i in range(rows)]),
+        }
+    )
+    pq.write_table(table, parquet_path, row_group_size=10_000)
+
+    client.register_temp_table("streamed_parquet", parquet_path)
+
+    assert client.execute("SELECT COUNT(*) FROM streamed_parquet").scalar() == rows
+    result = client.execute(
+        "SELECT category, COUNT(*) AS n FROM streamed_parquet "
+        "GROUP BY category ORDER BY category"
+    ).to_dict()
+    assert len(result) == 8
+    assert sum(row["n"] for row in result) == rows
+
+    filtered = client.execute(
+        "SELECT category, COUNT(*) AS n, AVG(score) AS avg_score "
+        "FROM streamed_parquet WHERE score >= 50 "
+        "GROUP BY category ORDER BY category"
+    ).to_dict()
+    expected = {}
+    for i in range(rows):
+        score = i % 1000 / 10.0
+        if score >= 50:
+            count, total = expected.get(f"group_{i % 8}", (0, 0.0))
+            expected[f"group_{i % 8}"] = (count + 1, total + score)
+    assert [row["category"] for row in filtered] == sorted(expected)
+    for row in filtered:
+        count, total = expected[row["category"]]
+        assert row["n"] == count
+        assert row["avg_score"] == pytest.approx(total / count)
+
+    client.close()

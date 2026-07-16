@@ -224,6 +224,83 @@ class TestReadParquet:
         with pytest.raises(Exception):
             self.c.execute(f"SELECT * FROM read_parquet('{self.d}/no_such.parquet')")
 
+    def test_numeric_filter_projection_pushdown_crosses_batches(self):
+        pa = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+
+        rows = 70_000
+        values = list(range(rows))
+        scores = [
+            None if i in (0, 65_536) else (i % 1_000) / 10 for i in range(rows)
+        ]
+        path = os.path.join(self.d, "pushdown.parquet")
+        pq.write_table(
+            pa.table(
+                {
+                    "value": pa.array(values, type=pa.int64()),
+                    "score": pa.array(scores, type=pa.float64()),
+                    "category": pa.array([f"group_{i % 8}" for i in values]),
+                    "unused_payload": pa.array([f"payload_{i:08d}" for i in values]),
+                }
+            ),
+            path,
+            row_group_size=10_000,
+        )
+
+        expected = sum(score is not None and score >= 50 for score in scores)
+        count = self.c.execute(
+            f"SELECT COUNT(*) AS n FROM read_parquet('{path}') WHERE score >= 50"
+        ).scalar()
+        assert count == expected
+
+        grouped = self.c.execute(
+            f"SELECT category, COUNT(*) AS n, AVG(score) AS avg_score "
+            f"FROM read_parquet('{path}') WHERE score >= 50 "
+            "GROUP BY category ORDER BY category"
+        ).to_dict()
+        assert len(grouped) == 8
+        assert sum(row["n"] for row in grouped) == expected
+
+        projected = self.c.execute(
+            f"SELECT value FROM read_parquet('{path}') "
+            "WHERE score = 99.9 ORDER BY value LIMIT 5"
+        )
+        assert projected.columns == ["value"]
+        assert [row["value"] for row in projected] == [999, 1999, 2999, 3999, 4999]
+
+        value_base = 9_007_199_254_740_992
+        precision_path = os.path.join(self.d, "int64_precision.parquet")
+        pq.write_table(
+            pa.table(
+                {
+                    "value": pa.array(
+                        [value_base, value_base + 1, value_base + 2], type=pa.int64()
+                    )
+                }
+            ),
+            precision_path,
+        )
+        assert (
+            self.c.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{precision_path}') "
+                f"WHERE value = {value_base + 1}"
+            ).scalar()
+            == 1
+        )
+
+    def test_parquet_count_avoids_python_arrow_materialization(self, monkeypatch):
+        import apexbase.client as client_module
+
+        monkeypatch.setattr(
+            client_module,
+            "_ensure_pyarrow",
+            lambda: (_ for _ in ()).throw(AssertionError("unexpected PyArrow import")),
+        )
+
+        assert self.c.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{self.pq}') WHERE score >= 85"
+        ).scalar() == 2
+
 
 # ============================================================
 # read_json
