@@ -3189,7 +3189,7 @@ impl ApexStorageImpl {
                                 backend
                                     .storage
                                     .extract_rows_by_indices_mmap_columns(&final_indices, None)
-                            }
+                            },
                         );
 
                         if let Ok(Some(batch_cols)) = cols_result {

@@ -3279,18 +3279,22 @@ impl ApexExecutor {
                 &filter_val,
                 &col_refs,
             )? {
-                Some(r) if !(target_present && r.iter().all(|stat| stat.0 == 0)) => r,
+                Some(results)
+                    if !(target_present && results.iter().all(|stat| stat.0 == 0)) =>
+                {
+                    results
+                }
                 Some(_) => return Ok(None),
                 None => match backend
                     .execute_filtered_string_agg_mmap(&filter_col, &filter_val, &col_refs)?
                 {
-                    Some(r) => r,
+                    Some(results) => results,
                     None => return Ok(None),
                 },
             }
         } else {
             match backend.execute_filtered_string_agg_mmap(&filter_col, &filter_val, &col_refs)? {
-                Some(r) => r,
+                Some(results) => results,
                 None => return Ok(None),
             }
         };

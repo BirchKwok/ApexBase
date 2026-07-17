@@ -65,6 +65,7 @@ import struct
 # Null context manager for lock-free SELECT execution paths
 _NULL_CONTEXT = contextlib.nullcontext()
 _HOT_CACHE_MISS = object()
+_TABLE_RESULT_GENERATIONS = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto Scheduler - Initialize scheduler lazily for parallel query execution
@@ -426,6 +427,7 @@ class ApexClient:
         self._last_exact_numeric_update_result = None
         self._last_missing_delete_key = None
         self._simple_sql_cache = {}
+        self._numeric_range_rows_cache = {}
         self._buffered_writes_enabled = False
         self._buffered_write_rows = []
         self._buffered_write_table = None
@@ -554,6 +556,34 @@ class ApexClient:
         self._last_exact_numeric_update = None
         self._last_exact_numeric_update_result = None
         self._last_missing_delete_key = None
+        cache = getattr(self, '_numeric_range_rows_cache', None)
+        if cache is not None:
+            cache.clear()
+        table = getattr(self, '_current_table', None)
+        if table:
+            key = (
+                str(getattr(self, '_dirpath', '')),
+                getattr(self, '_current_database', 'default'),
+                table,
+            )
+            _TABLE_RESULT_GENERATIONS[key] = _TABLE_RESULT_GENERATIONS.get(key, 0) + 1
+
+    def _numeric_range_cache_token(self):
+        if (not self._enable_cache or not self._current_table
+                or getattr(self, '_in_txn', False)
+                or getattr(self, '_fast_txn_active', False)):
+            return None
+        try:
+            if self._storage.has_pending_overlay_writes():
+                return None
+            key = (
+                str(self._dirpath),
+                self._current_database,
+                self._current_table,
+            )
+            return _TABLE_RESULT_GENERATIONS.get(key, 0)
+        except (AttributeError, RuntimeError):
+            return None
 
     def _remember_exact_replace(self, id_: int, data: dict) -> None:
         self._last_exact_replace_key = (self._current_database, self._current_table, int(id_))
@@ -1493,13 +1523,37 @@ class ApexClient:
                                 return rv
                         if kind == 'numeric_range_limit':
                             _, _, filter_col, op, value, limit_val, offset_val = cached_simple
+                            cache_key = (
+                                self._current_database, current_table, sql, show_flag
+                            )
+                            token = (self._numeric_range_cache_token()
+                                     if limit_val <= 256 else None)
+                            cached_rows = self._numeric_range_rows_cache.get(cache_key)
+                            if (token is not None and cached_rows is not None
+                                    and cached_rows[0] == token):
+                                rv = ResultView(data=[row.copy() for row in cached_rows[1]])
+                                rv._show_internal_id = show_flag
+                                return rv
                             result = self._storage.retrieve_by_numeric_range_limit(
                                 filter_col, op, value, limit_val, offset_val
                             )
                             if isinstance(result, dict):
                                 columns_dict = result.get('columns_dict')
                                 if columns_dict is not None:
-                                    return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                                    rv = self._result_view_from_columns_dict(
+                                        sql, columns_dict, show_flag
+                                    )
+                                    if token is not None:
+                                        rows = rv.to_dict()
+                                        if len(self._numeric_range_rows_cache) >= 16:
+                                            self._numeric_range_rows_cache.pop(
+                                                next(iter(self._numeric_range_rows_cache))
+                                            )
+                                        self._numeric_range_rows_cache[cache_key] = (
+                                            token,
+                                            tuple(row.copy() for row in rows),
+                                        )
+                                    return rv
                 except Exception:
                     pass
             hot_result = self._execute_cached_simple_select(sql, cached_simple, show_internal_id)
@@ -2690,9 +2744,11 @@ class ApexClient:
                             table_name = _simple_from_table(sql)
                             if (table_name and self._current_table
                                     and table_name.lower() == self._current_table.lower()):
-                                if len(self._simple_sql_cache) >= 256:
-                                    self._simple_sql_cache.clear()
-                                self._simple_sql_cache[sql] = ('columnar_select', table_name)
+                                cached_shape = self._simple_sql_cache.get(sql)
+                                if not cached_shape or cached_shape[0] == 'columnar_select':
+                                    if len(self._simple_sql_cache) >= 256:
+                                        self._simple_sql_cache.clear()
+                                    self._simple_sql_cache[sql] = ('columnar_select', table_name)
                             row_count = len(next(iter(columns_dict.values()), []))
                             if row_count == 0:
                                 rv = ResultView(data=None)

@@ -715,6 +715,41 @@ class TestBasicSQLExecute:
 
             client.close()
 
+    def test_numeric_range_limit_cache_isolated_and_invalidated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.store([
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 35},
+                {"name": "Charlie", "age": 45},
+            ])
+            client.flush()
+
+            sql = "SELECT * FROM default WHERE age > 30 LIMIT 100"
+            assert [row["name"] for row in client.execute(sql).to_dict()] == [
+                "Bob", "Charlie"
+            ]
+            cached = client.execute(sql).to_dict()
+            cached[0]["name"] = "mutated by caller"
+            assert [row["name"] for row in client.execute(sql).to_dict()] == [
+                "Bob", "Charlie"
+            ]
+
+            assert client.replace(1, {"name": "Alice", "age": 40})
+            assert [row["name"] for row in client.execute(sql).to_dict()] == [
+                "Alice", "Bob", "Charlie"
+            ]
+
+            other = ApexClient(dirpath=temp_dir)
+            other.use_table("default")
+            assert other.replace(2, {"name": "Bob", "age": 20})
+            assert [row["name"] for row in client.execute(sql).to_dict()] == [
+                "Alice", "Charlie"
+            ]
+            other.close()
+            client.close()
+
     def test_execute_projected_id_in_lookup_respects_projection(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)

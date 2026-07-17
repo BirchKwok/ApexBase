@@ -66,10 +66,21 @@ def test_public_profile_matches_readme_scoreboard_shape():
     assert len(module.PUBLIC_OLAP_BENCHMARK_NAMES) == 45
     assert len(module.OLTP_FAIR_BENCHMARK_NAMES) == 27
     assert len(module.benchmark_specs_for_profile(module.PROFILE_PUBLIC)) == 72
-    assert module.module_metric_counts(module.PROFILE_PUBLIC) == (45, 27, 1)
-    assert module.vector_metric_sets(module.PROFILE_PUBLIC)[1] == [
-        ("Batch TopK Cosine (10 queries)", "cosine")
-    ]
+    assert module.module_metric_counts(module.PROFILE_PUBLIC) == (45, 27, 6)
+    assert module.vector_metric_sets(module.PROFILE_PUBLIC) == (
+        [
+            ("TopK L2", "l2"),
+            ("TopK Cosine", "cosine"),
+            ("TopK Dot", "dot"),
+        ],
+        [
+            ("Batch TopK L2 (10 queries)", "l2"),
+            ("Batch TopK Cosine (10 queries)", "cosine"),
+            ("Batch TopK Dot (10 queries)", "dot"),
+        ],
+        [],
+    )
+    assert module.vector_metric_count(module.PROFILE_PUBLIC) == 6
 
 
 def test_extended_profile_keeps_diagnostics_available():

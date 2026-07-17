@@ -416,6 +416,51 @@ const COL_ENCODING_PLAIN: u8 = 0;
 const COL_ENCODING_RLE: u8 = 1;
 const COL_ENCODING_BITPACK: u8 = 2;
 const COL_ENCODING_RLE_BOOL: u8 = 3;
+const COL_ENCODING_COMPACT_DICTIONARY: u8 = 4;
+const COL_ENCODING_FLOAT_DICTIONARY: u8 = 5;
+
+// Row-group header byte 30 controls the physical ID section. Sequential IDs
+// are already described by min_id/max_id and need no per-row u64 payload.
+const RG_IDS_PLAIN: u8 = 0;
+const RG_IDS_IMPLICIT_CONTIGUOUS: u8 = 1;
+
+#[inline(always)]
+fn rg_id_section_len(row_count: usize, id_encoding: u8) -> usize {
+    if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+        0
+    } else {
+        row_count * 8
+    }
+}
+
+#[inline]
+fn ids_are_contiguous(ids: &[u64]) -> bool {
+    ids.first().is_none_or(|&first| {
+        ids.iter()
+            .enumerate()
+            .all(|(offset, &id)| id == first.saturating_add(offset as u64))
+    })
+}
+
+#[inline(always)]
+fn rg_id_at(
+    body: &[u8],
+    row_count: usize,
+    min_id: u64,
+    id_encoding: u8,
+    row: usize,
+) -> Option<u64> {
+    if row >= row_count {
+        return None;
+    }
+    if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+        return min_id.checked_add(row as u64);
+    }
+    let offset = row.checked_mul(8)?;
+    Some(u64::from_le_bytes(
+        body.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
 
 // Extended encodings for compatibility with other systems (16-31):
 const COL_ENCODING_FORWARD: u8 = 16; // Forward encoding (delta)
@@ -428,6 +473,365 @@ const CHAR_ENCODING_UTF8: u8 = 1; // UTF-8 (common)
 const CHAR_ENCODING_ASCII: u8 = 0; // ASCII (7-bit)
 const CHAR_ENCODING_LATIN1: u8 = 208; // ISO-8859-1 (Latin-1)
 const CHAR_ENCODING_UTF16: u8 = 209; // UTF-16
+
+/// Borrowed view over both legacy u32 and compact StringDict column payloads.
+/// Compact format adds one byte after the two u64 counts for the index width.
+struct StringDictView<'a> {
+    row_count: usize,
+    dict_size: usize,
+    index_width: usize,
+    indices: &'a [u8],
+    dict_offsets: &'a [u8],
+    dict_data: &'a [u8],
+    consumed: usize,
+}
+
+impl<'a> StringDictView<'a> {
+    fn parse(data: &'a [u8], compact: bool) -> io::Result<Self> {
+        let header_len = if compact { 17 } else { 16 };
+        if data.len() < header_len {
+            return Err(err_data("StringDict: truncated header"));
+        }
+        let row_count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+        let dict_size = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+        let index_width = if compact { data[16] as usize } else { 4 };
+        if !matches!(index_width, 1 | 2 | 4) {
+            return Err(err_data("StringDict: invalid compact index width"));
+        }
+        let indices_len = row_count
+            .checked_mul(index_width)
+            .ok_or_else(|| err_data("StringDict: index size overflow"))?;
+        let dict_offsets_len = dict_size
+            .checked_mul(4)
+            .ok_or_else(|| err_data("StringDict: offset size overflow"))?;
+        let indices_start = header_len;
+        let dict_offsets_start = indices_start
+            .checked_add(indices_len)
+            .ok_or_else(|| err_data("StringDict: index offset overflow"))?;
+        let dict_data_len_offset = dict_offsets_start
+            .checked_add(dict_offsets_len)
+            .ok_or_else(|| err_data("StringDict: dictionary offset overflow"))?;
+        if dict_data_len_offset + 8 > data.len() {
+            return Err(err_data("StringDict: indices or offsets truncated"));
+        }
+        let dict_data_len = u64::from_le_bytes(
+            data[dict_data_len_offset..dict_data_len_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let dict_data_start = dict_data_len_offset + 8;
+        let consumed = dict_data_start
+            .checked_add(dict_data_len)
+            .ok_or_else(|| err_data("StringDict: data size overflow"))?;
+        if consumed > data.len() {
+            return Err(err_data("StringDict: data truncated"));
+        }
+        Ok(Self {
+            row_count,
+            dict_size,
+            index_width,
+            indices: &data[indices_start..dict_offsets_start],
+            dict_offsets: &data[dict_offsets_start..dict_data_len_offset],
+            dict_data: &data[dict_data_start..consumed],
+            consumed,
+        })
+    }
+
+    #[inline]
+    fn index(&self, row: usize) -> Option<u32> {
+        if row >= self.row_count {
+            return None;
+        }
+        let pos = row * self.index_width;
+        Some(match self.index_width {
+            1 => self.indices[pos] as u32,
+            2 => u16::from_le_bytes(self.indices[pos..pos + 2].try_into().unwrap()) as u32,
+            _ => u32::from_le_bytes(self.indices[pos..pos + 4].try_into().unwrap()),
+        })
+    }
+
+    #[inline]
+    fn offset(&self, index: usize) -> Option<usize> {
+        if index >= self.dict_size {
+            return None;
+        }
+        let pos = index * 4;
+        Some(u32::from_le_bytes(self.dict_offsets[pos..pos + 4].try_into().unwrap()) as usize)
+    }
+
+    #[inline]
+    fn value(&self, dict_index: u32) -> Option<&'a [u8]> {
+        let index = dict_index as usize;
+        if index == 0 || index >= self.dict_size {
+            return None;
+        }
+        let start = self.offset(index - 1)?;
+        let end = self.offset(index)?;
+        (start <= end && end <= self.dict_data.len()).then(|| &self.dict_data[start..end])
+    }
+
+    fn find_value(&self, target: &[u8]) -> Option<u32> {
+        if target.is_empty() {
+            return (1..self.dict_size)
+                .find(|&index| self.value(index as u32) == Some(target))
+                .map(|index| index as u32);
+        }
+        let mut search_from = 0usize;
+        while search_from < self.dict_data.len() {
+            let relative = memchr::memmem::find(&self.dict_data[search_from..], target)?;
+            let start = search_from + relative;
+            let mut low = 0usize;
+            let mut high = self.dict_size.saturating_sub(1);
+            while low < high {
+                let mid = (low + high) / 2;
+                match self.offset(mid).unwrap().cmp(&start) {
+                    std::cmp::Ordering::Less => low = mid + 1,
+                    std::cmp::Ordering::Greater => high = mid,
+                    std::cmp::Ordering::Equal => {
+                        let dict_index = (mid + 1) as u32;
+                        if self.value(dict_index) == Some(target) {
+                            return Some(dict_index);
+                        }
+                        low = high;
+                    }
+                }
+            }
+            if low < self.dict_size.saturating_sub(1) && self.offset(low) == Some(start) {
+                let dict_index = (low + 1) as u32;
+                if self.value(dict_index) == Some(target) {
+                    return Some(dict_index);
+                }
+            }
+            search_from = start + 1;
+        }
+        None
+    }
+
+    #[inline]
+    fn for_each_index_eq(&self, target: u32, limit: usize, mut matched: impl FnMut(usize) -> bool) {
+        let count = self.row_count.min(limit);
+        match self.index_width {
+            1 if target <= u8::MAX as u32 => {
+                let target = target as u8;
+                for row in memchr::memchr_iter(target, &self.indices[..count]) {
+                    if !matched(row) {
+                        break;
+                    }
+                }
+            }
+            2 if target <= u16::MAX as u32 => {
+                let target = target as u16;
+                for (row, index) in self.indices[..count * 2].chunks_exact(2).enumerate() {
+                    if u16::from_le_bytes(index.try_into().unwrap()) == target {
+                        if !matched(row) {
+                            break;
+                        }
+                    }
+                }
+            }
+            4 => {
+                for (row, index) in self.indices[..count * 4].chunks_exact(4).enumerate() {
+                    if u32::from_le_bytes(index.try_into().unwrap()) == target {
+                        if !matched(row) {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn decode(&self) -> ColumnData {
+        let mut indices = Vec::with_capacity(self.row_count);
+        if self.index_width == 4 {
+            indices.resize(self.row_count, 0);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.indices.as_ptr(),
+                    indices.as_mut_ptr() as *mut u8,
+                    self.indices.len(),
+                );
+            }
+        } else {
+            indices.extend((0..self.row_count).map(|row| self.index(row).unwrap()));
+        }
+        let mut dict_offsets = vec![0u32; self.dict_size];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.dict_offsets.as_ptr(),
+                dict_offsets.as_mut_ptr() as *mut u8,
+                self.dict_offsets.len(),
+            );
+        }
+        ColumnData::StringDict {
+            indices,
+            dict_offsets,
+            dict_data: self.dict_data.to_vec(),
+        }
+    }
+}
+
+struct FloatDictView<'a> {
+    row_count: usize,
+    dict_size: usize,
+    index_width: usize,
+    indices: &'a [u8],
+    values: &'a [u8],
+    consumed: usize,
+}
+
+impl<'a> FloatDictView<'a> {
+    fn parse(data: &'a [u8]) -> io::Result<Self> {
+        if data.len() < 13 {
+            return Err(err_data("FloatDict: truncated header"));
+        }
+        let row_count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+        let dict_size = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let index_width = data[12] as usize;
+        if dict_size == 0 || !matches!(index_width, 1 | 2) {
+            return Err(err_data("FloatDict: invalid dictionary"));
+        }
+        let indices_len = row_count
+            .checked_mul(index_width)
+            .ok_or_else(|| err_data("FloatDict: index size overflow"))?;
+        let values_len = dict_size
+            .checked_mul(8)
+            .ok_or_else(|| err_data("FloatDict: value size overflow"))?;
+        let consumed = 13usize
+            .checked_add(indices_len)
+            .and_then(|len| len.checked_add(values_len))
+            .ok_or_else(|| err_data("FloatDict: payload size overflow"))?;
+        if consumed > data.len() {
+            return Err(err_data("FloatDict: truncated payload"));
+        }
+        Ok(Self {
+            row_count,
+            dict_size,
+            index_width,
+            indices: &data[13..13 + indices_len],
+            values: &data[13 + indices_len..consumed],
+            consumed,
+        })
+    }
+
+    #[inline(always)]
+    fn index(&self, row: usize) -> Option<usize> {
+        if row >= self.row_count {
+            return None;
+        }
+        let pos = row * self.index_width;
+        Some(if self.index_width == 1 {
+            self.indices[pos] as usize
+        } else {
+            u16::from_le_bytes(self.indices[pos..pos + 2].try_into().unwrap()) as usize
+        })
+    }
+
+    #[inline(always)]
+    unsafe fn index_unchecked(&self, row: usize) -> usize {
+        debug_assert!(row < self.row_count);
+        let pos = row * self.index_width;
+        if self.index_width == 1 {
+            *self.indices.get_unchecked(pos) as usize
+        } else {
+            u16::from_le_bytes([
+                *self.indices.get_unchecked(pos),
+                *self.indices.get_unchecked(pos + 1),
+            ]) as usize
+        }
+    }
+
+    #[inline(always)]
+    fn dictionary_value(&self, index: usize) -> Option<f64> {
+        if index >= self.dict_size {
+            return None;
+        }
+        let pos = index * 8;
+        Some(f64::from_le_bytes(
+            self.values[pos..pos + 8].try_into().unwrap(),
+        ))
+    }
+
+    #[inline(always)]
+    fn value(&self, row: usize) -> Option<f64> {
+        let index = self.index(row)?;
+        self.dictionary_value(index)
+    }
+
+    fn decode(&self) -> ColumnData {
+        ColumnData::Float64(
+            (0..self.row_count)
+                .map(|row| self.value(row).unwrap_or(0.0))
+                .collect(),
+        )
+    }
+}
+
+fn dictionary_encode_f64(data: &[f64]) -> Option<Vec<u8>> {
+    use ahash::AHashMap;
+    use ahash::AHashSet;
+
+    // Keep OLTP/delta batches on their established plain representation.
+    // Temp-file materialization writes 64K row groups, where the dictionary
+    // build cost and compact scan path are both worthwhile.
+    if data.len() < 32_768 {
+        return None;
+    }
+    let sample_len = data.len().min(4_096);
+    let mut sample = AHashSet::with_capacity(sample_len);
+    for value in &data[..sample_len] {
+        sample.insert(value.to_bits());
+        if sample.len() > sample_len / 2 {
+            return None;
+        }
+    }
+
+    let mut map = AHashMap::with_capacity(sample.len().saturating_mul(2));
+    let mut values = Vec::with_capacity(sample.len());
+    let mut indices = Vec::with_capacity(data.len());
+    for value in data {
+        let bits = value.to_bits();
+        let index = match map.get(&bits) {
+            Some(&index) => index,
+            None => {
+                if values.len() >= u16::MAX as usize + 1 {
+                    return None;
+                }
+                let index = values.len() as u32;
+                values.push(bits);
+                map.insert(bits, index);
+                index
+            }
+        };
+        indices.push(index);
+    }
+
+    let index_width = if values.len() <= u8::MAX as usize + 1 {
+        1
+    } else {
+        2
+    };
+    let encoded_size = 13 + indices.len() * index_width + values.len() * 8;
+    if encoded_size >= (8 + data.len() * 8) * 7 / 10 {
+        return None;
+    }
+    let mut encoded = Vec::with_capacity(encoded_size);
+    encoded.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    encoded.push(index_width as u8);
+    if index_width == 1 {
+        encoded.extend(indices.iter().map(|&index| index as u8));
+    } else {
+        for index in indices {
+            encoded.extend_from_slice(&(index as u16).to_le_bytes());
+        }
+    }
+    for bits in values {
+        encoded.extend_from_slice(&bits.to_le_bytes());
+    }
+    Some(encoded)
+}
 
 /// Encode an Int64 column with RLE (Run-Length Encoding).
 /// Format: [count:u64][num_runs:u64][(value:i64, run_len:u32)...]
@@ -840,6 +1244,14 @@ fn write_column_encoded<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     match col {
+        ColumnData::Float64(data) => {
+            if let Some(encoded) = dictionary_encode_f64(data) {
+                writer.write_all(&[COL_ENCODING_FLOAT_DICTIONARY])?;
+                return writer.write_all(&encoded);
+            }
+            writer.write_all(&[COL_ENCODING_PLAIN])?;
+            col.write_to(writer)
+        }
         ColumnData::Int64(data) => {
             // Try RLE first (best for sorted/low-cardinality)
             if let Some(rle_bytes) = rle_encode_i64(data) {
@@ -875,6 +1287,44 @@ fn write_column_encoded<W: Write>(
             // FixedList: always plain — f32 data is already random (no benefit from RLE/bitpack)
             writer.write_all(&[COL_ENCODING_PLAIN])?;
             col.write_to(writer)
+        }
+        ColumnData::StringDict {
+            indices,
+            dict_offsets,
+            dict_data,
+        } => {
+            let max_index = indices.iter().copied().max().unwrap_or(0);
+            let index_width = if max_index <= u8::MAX as u32 {
+                1
+            } else if max_index <= u16::MAX as u32 {
+                2
+            } else {
+                writer.write_all(&[COL_ENCODING_PLAIN])?;
+                return col.write_to(writer);
+            };
+            writer.write_all(&[COL_ENCODING_COMPACT_DICTIONARY])?;
+            writer.write_all(&(indices.len() as u64).to_le_bytes())?;
+            writer.write_all(&(dict_offsets.len() as u64).to_le_bytes())?;
+            writer.write_all(&[index_width])?;
+            if index_width == 1 {
+                let compact: Vec<u8> = indices.iter().map(|&index| index as u8).collect();
+                writer.write_all(&compact)?;
+            } else {
+                let mut compact = Vec::with_capacity(indices.len() * 2);
+                for &index in indices {
+                    compact.extend_from_slice(&(index as u16).to_le_bytes());
+                }
+                writer.write_all(&compact)?;
+            }
+            let offsets = unsafe {
+                std::slice::from_raw_parts(
+                    dict_offsets.as_ptr() as *const u8,
+                    dict_offsets.len() * 4,
+                )
+            };
+            writer.write_all(offsets)?;
+            writer.write_all(&(dict_data.len() as u64).to_le_bytes())?;
+            writer.write_all(dict_data)
         }
         _ => {
             // Other types: always plain
@@ -1186,6 +1636,16 @@ fn read_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<(Column
             let (col, consumed) = rle_decode_bool(data_bytes)?;
             Ok((col, 1 + consumed))
         }
+        COL_ENCODING_COMPACT_DICTIONARY if col_type == ColumnType::StringDict => {
+            let view = StringDictView::parse(data_bytes, true)?;
+            Ok((view.decode(), 1 + view.consumed))
+        }
+        COL_ENCODING_FLOAT_DICTIONARY
+            if matches!(col_type, ColumnType::Float64 | ColumnType::Float32) =>
+        {
+            let view = FloatDictView::parse(data_bytes)?;
+            Ok((view.decode(), 1 + view.consumed))
+        }
         // Handle extended encodings - fallback to plain for compatibility
         COL_ENCODING_FORWARD | COL_ENCODING_DICTIONARY | COL_ENCODING_UNENCODED => {
             // Treat as plain encoding for backward compatibility
@@ -1252,6 +1712,14 @@ fn skip_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<usize> 
             }
             let num_runs = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
             Ok(1 + 16 + num_runs * 5)
+        }
+        COL_ENCODING_COMPACT_DICTIONARY if col_type == ColumnType::StringDict => {
+            Ok(1 + StringDictView::parse(data_bytes, true)?.consumed)
+        }
+        COL_ENCODING_FLOAT_DICTIONARY
+            if matches!(col_type, ColumnType::Float64 | ColumnType::Float32) =>
+        {
+            Ok(1 + FloatDictView::parse(data_bytes)?.consumed)
         }
         _ => {
             // For unknown encodings (shouldn't happen), fall back to plain skip

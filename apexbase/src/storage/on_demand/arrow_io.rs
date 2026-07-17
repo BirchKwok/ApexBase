@@ -1536,7 +1536,13 @@ impl OnDemandStorage {
                                             Err(_) => break,
                                         };
                                         let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
-                                        let mut pos: usize = rg_rows * 8; // skip IDs
+                                        let mut pos = rg_id_section_len(
+                                            rg_rows,
+                                            rg_bytes
+                                                .get(30)
+                                                .copied()
+                                                .unwrap_or(RG_IDS_PLAIN),
+                                        );
                                         let del_vec_len = (rg_rows + 7) / 8;
                                         pos += del_vec_len; // skip deletion vector
                                         let null_bitmap_len = (rg_rows + 7) / 8;

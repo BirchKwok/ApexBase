@@ -234,9 +234,15 @@ impl OnDemandStorage {
                         };
                         let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
                         let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
-                        let off = local * 8;
-                        if off + 8 <= body.len() {
-                            let id = u64::from_le_bytes(body[off..off + 8].try_into().unwrap());
+                        let id_encoding =
+                            rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
+                        if let Some(id) = rg_id_at(
+                            body,
+                            end - start,
+                            rg_meta.min_id,
+                            id_encoding,
+                            local,
+                        ) {
                             result.push(id);
                             found = true;
                         }
@@ -1231,11 +1237,20 @@ impl OnDemandStorage {
                     };
                     let dec = decompress_rg_body(cflag, &rg_bytes[32..])?;
                     let body = dec.as_deref().unwrap_or(&rg_bytes[32..]);
-                    if rg_rows * 8 > body.len() {
+                    let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
+                    let id_section_len = rg_id_section_len(rg_rows, id_encoding);
+                    if id_section_len > body.len() {
                         continue;
                     }
-                    let ids_cow = bytes_as_u64_slice(body, rg_rows);
-                    if let Ok(idx) = ids_cow.binary_search(&id) {
+                    let local_idx = if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+                        id.checked_sub(rg_meta.min_id)
+                            .and_then(|offset| (offset < rg_rows as u64).then_some(offset as usize))
+                    } else {
+                        bytes_as_u64_slice(&body[..id_section_len], rg_rows)
+                            .binary_search(&id)
+                            .ok()
+                    };
+                    if let Some(idx) = local_idx {
                         found_rg_i = Some(rg_i);
                         local_idx_found = idx;
                         break;
@@ -1325,6 +1340,92 @@ impl OnDemandStorage {
     /// Reads file bytes via cached heap pages (pread on miss), avoiding repeated macOS
     /// mmap soft page faults (~21µs each). After warmup, all accesses hit the heap cache
     /// (~50ns each) — no page table involvement.
+    fn read_compact_string_dict_value(
+        &self,
+        data_base: u64,
+        local_idx: usize,
+    ) -> io::Result<crate::data::Value> {
+        use crate::data::Value;
+
+        let mut header = [0u8; 17];
+        self.read_cached_bytes(data_base, &mut header)?;
+        let row_count = u64::from_le_bytes(header[0..8].try_into().unwrap()) as usize;
+        let dict_size = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
+        let index_width = header[16] as usize;
+        if local_idx >= row_count {
+            return Ok(Value::Null);
+        }
+        if !matches!(index_width, 1 | 2 | 4) {
+            return Err(err_data("StringDict: invalid compact index width"));
+        }
+        let mut index_bytes = [0u8; 4];
+        self.read_cached_bytes(
+            data_base + (17 + local_idx * index_width) as u64,
+            &mut index_bytes[..index_width],
+        )?;
+        let dict_index = match index_width {
+            1 => index_bytes[0] as usize,
+            2 => u16::from_le_bytes(index_bytes[..2].try_into().unwrap()) as usize,
+            _ => u32::from_le_bytes(index_bytes) as usize,
+        };
+        if dict_index == 0 || dict_index >= dict_size {
+            return Ok(Value::Null);
+        }
+        let dict_offsets_start = 17 + row_count * index_width;
+        let mut offsets = [0u8; 8];
+        self.read_cached_bytes(
+            data_base + (dict_offsets_start + (dict_index - 1) * 4) as u64,
+            &mut offsets,
+        )?;
+        let start = u32::from_le_bytes(offsets[..4].try_into().unwrap()) as usize;
+        let end = u32::from_le_bytes(offsets[4..].try_into().unwrap()) as usize;
+        if start > end {
+            return Ok(Value::Null);
+        }
+        let dict_data_start = dict_offsets_start + dict_size * 4 + 8;
+        let mut value = vec![0u8; end - start];
+        self.read_cached_bytes(data_base + (dict_data_start + start) as u64, &mut value)?;
+        Ok(Value::String(
+            std::str::from_utf8(&value).unwrap_or("").to_string(),
+        ))
+    }
+
+    fn read_float_dict_value(
+        &self,
+        data_base: u64,
+        local_idx: usize,
+    ) -> io::Result<crate::data::Value> {
+        use crate::data::Value;
+
+        let mut header = [0u8; 13];
+        self.read_cached_bytes(data_base, &mut header)?;
+        let row_count = u64::from_le_bytes(header[0..8].try_into().unwrap()) as usize;
+        let dict_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+        let index_width = header[12] as usize;
+        if local_idx >= row_count || !matches!(index_width, 1 | 2) {
+            return Ok(Value::Null);
+        }
+        let mut index_bytes = [0u8; 2];
+        self.read_cached_bytes(
+            data_base + (13 + local_idx * index_width) as u64,
+            &mut index_bytes[..index_width],
+        )?;
+        let index = if index_width == 1 {
+            index_bytes[0] as usize
+        } else {
+            u16::from_le_bytes(index_bytes) as usize
+        };
+        if index >= dict_size {
+            return Ok(Value::Null);
+        }
+        let mut value = [0u8; 8];
+        self.read_cached_bytes(
+            data_base + (13 + row_count * index_width + index * 8) as u64,
+            &mut value,
+        )?;
+        Ok(Value::Float64(f64::from_le_bytes(value)))
+    }
+
     pub(crate) fn retrieve_rcix(
         &self,
         id: u64,
@@ -1382,22 +1483,27 @@ impl OnDemandStorage {
 
         let body_base = rg_offset + 32;
         let null_bitmap_len = (rg_rows + 7) / 8;
+        let id_encoding = rg_hdr[30];
+        let id_section_len = rg_id_section_len(rg_rows, id_encoding);
 
         // O(1) local_idx: direct guess then verify
         let guess = (id.saturating_sub(rg_min_id)) as usize;
         let local_idx = if guess < rg_rows {
-            let mut id_buf = [0u8; 8];
-            self.read_cached_bytes(body_base + (guess * 8) as u64, &mut id_buf)?;
-            if u64::from_le_bytes(id_buf) == id {
+            if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
                 guess
             } else {
-                // Rare: non-contiguous IDs — binary search over full ID array
-                let mut ids_buf = vec![0u8; rg_rows * 8];
-                self.read_cached_bytes(body_base, &mut ids_buf)?;
-                let ids_cow = bytes_as_u64_slice(&ids_buf, rg_rows);
-                match ids_cow.binary_search(&id) {
-                    Ok(i) => i,
-                    Err(_) => return Ok(None),
+                let mut id_buf = [0u8; 8];
+                self.read_cached_bytes(body_base + (guess * 8) as u64, &mut id_buf)?;
+                if u64::from_le_bytes(id_buf) == id {
+                    guess
+                } else {
+                    let mut ids_buf = vec![0u8; id_section_len];
+                    self.read_cached_bytes(body_base, &mut ids_buf)?;
+                    let ids_cow = bytes_as_u64_slice(&ids_buf, rg_rows);
+                    match ids_cow.binary_search(&id) {
+                        Ok(i) => i,
+                        Err(_) => return Ok(None),
+                    }
                 }
             }
         } else {
@@ -1407,7 +1513,7 @@ impl OnDemandStorage {
         // Deletion check
         let mut del_buf = [0u8; 1];
         self.read_cached_bytes(
-            body_base + (rg_rows * 8 + local_idx / 8) as u64,
+            body_base + (id_section_len + local_idx / 8) as u64,
             &mut del_buf,
         )?;
         if (del_buf[0] >> (local_idx % 8)) & 1 == 1 {
@@ -1467,6 +1573,10 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (8 + local_idx * 8) as u64, &mut v)?;
                     Value::Float64(f64::from_le_bytes(v))
                 }
+                (
+                    COL_ENCODING_FLOAT_DICTIONARY,
+                    ColumnType::Float64 | ColumnType::Float32,
+                ) => self.read_float_dict_value(data_base, local_idx)?,
                 (COL_ENCODING_PLAIN, ColumnType::Bool) => {
                     let mut v = [0u8; 1];
                     self.read_cached_bytes(data_base + (8 + local_idx / 8) as u64, &mut v)?;
@@ -1517,6 +1627,9 @@ impl OnDemandStorage {
                     } else {
                         Value::Binary(bin_buf)
                     }
+                }
+                (COL_ENCODING_COMPACT_DICTIONARY, ColumnType::StringDict) => {
+                    self.read_compact_string_dict_value(data_base, local_idx)?
                 }
                 (COL_ENCODING_PLAIN, ColumnType::StringDict) => {
                     let mut hdr = [0u8; 16];
@@ -1737,20 +1850,26 @@ impl OnDemandStorage {
 
         let body_base = rg_offset + 32;
         let null_bitmap_len = (rg_rows + 7) / 8;
+        let id_encoding = rg_hdr[30];
+        let id_section_len = rg_id_section_len(rg_rows, id_encoding);
 
         let guess = (id.saturating_sub(rg_min_id)) as usize;
         let local_idx = if guess < rg_rows {
-            let mut id_buf = [0u8; 8];
-            self.read_cached_bytes(body_base + (guess * 8) as u64, &mut id_buf)?;
-            if u64::from_le_bytes(id_buf) == id {
+            if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
                 guess
             } else {
-                let mut ids_buf = vec![0u8; rg_rows * 8];
-                self.read_cached_bytes(body_base, &mut ids_buf)?;
-                let ids_cow = bytes_as_u64_slice(&ids_buf, rg_rows);
-                match ids_cow.binary_search(&id) {
-                    Ok(i) => i,
-                    Err(_) => return Ok(None),
+                let mut id_buf = [0u8; 8];
+                self.read_cached_bytes(body_base + (guess * 8) as u64, &mut id_buf)?;
+                if u64::from_le_bytes(id_buf) == id {
+                    guess
+                } else {
+                    let mut ids_buf = vec![0u8; id_section_len];
+                    self.read_cached_bytes(body_base, &mut ids_buf)?;
+                    let ids_cow = bytes_as_u64_slice(&ids_buf, rg_rows);
+                    match ids_cow.binary_search(&id) {
+                        Ok(i) => i,
+                        Err(_) => return Ok(None),
+                    }
                 }
             }
         } else {
@@ -1759,7 +1878,7 @@ impl OnDemandStorage {
 
         let mut del_buf = [0u8; 1];
         self.read_cached_bytes(
-            body_base + (rg_rows * 8 + local_idx / 8) as u64,
+            body_base + (id_section_len + local_idx / 8) as u64,
             &mut del_buf,
         )?;
         if (del_buf[0] >> (local_idx % 8)) & 1 == 1 {
@@ -1811,6 +1930,10 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (8 + local_idx * 8) as u64, &mut v)?;
                     Value::Float64(f64::from_le_bytes(v))
                 }
+                (
+                    COL_ENCODING_FLOAT_DICTIONARY,
+                    ColumnType::Float64 | ColumnType::Float32,
+                ) => self.read_float_dict_value(data_base, local_idx)?,
                 (COL_ENCODING_PLAIN, ColumnType::Bool) => {
                     let mut v = [0u8; 1];
                     self.read_cached_bytes(data_base + (8 + local_idx / 8) as u64, &mut v)?;
@@ -1861,6 +1984,9 @@ impl OnDemandStorage {
                     } else {
                         Value::Binary(bin_buf)
                     }
+                }
+                (COL_ENCODING_COMPACT_DICTIONARY, ColumnType::StringDict) => {
+                    self.read_compact_string_dict_value(data_base, local_idx)?
                 }
                 (COL_ENCODING_PLAIN, ColumnType::StringDict) => {
                     let mut hdr = [0u8; 16];
@@ -2570,6 +2696,8 @@ impl OnDemandStorage {
             }
             let compress_flag = rg_bytes[28];
             let encoding_version = rg_bytes[29];
+            let id_encoding = rg_bytes[30];
+            let id_section_len = rg_id_section_len(rg_rows, id_encoding);
 
             // Step 2: RCIX fast path — uncompressed, enc_ver ≥ 1, col_offsets present.
             let col_count = footer.schema.column_count();
@@ -2583,20 +2711,35 @@ impl OnDemandStorage {
 
                 // Step 3: O(1) local_idx — try direct id-based index, verify, else binary search.
                 let guess = (id.saturating_sub(rg_meta.min_id)) as usize;
-                let local_idx = if guess < rg_rows && guess * 8 + 8 <= body.len() {
-                    let id_at =
-                        u64::from_le_bytes(body[guess * 8..guess * 8 + 8].try_into().unwrap());
-                    if id_at == id {
+                let local_idx = if guess < rg_rows {
+                    if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
                         guess
                     } else {
-                        let ids_cow = bytes_as_u64_slice(body, rg_rows);
-                        match ids_cow.binary_search(&id) {
-                            Ok(i) => i,
-                            Err(_) => return Ok(None),
+                        let Some(id_at) = rg_id_at(
+                            body,
+                            rg_rows,
+                            rg_meta.min_id,
+                            id_encoding,
+                            guess,
+                        ) else {
+                            return Ok(None);
+                        };
+                        if id_at == id {
+                            guess
+                        } else {
+                            let ids_cow =
+                                bytes_as_u64_slice(&body[..id_section_len], rg_rows);
+                            match ids_cow.binary_search(&id) {
+                                Ok(i) => i,
+                                Err(_) => return Ok(None),
+                            }
                         }
                     }
                 } else {
-                    let ids_cow = bytes_as_u64_slice(body, rg_rows);
+                    if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+                        return Ok(None);
+                    }
+                    let ids_cow = bytes_as_u64_slice(&body[..id_section_len], rg_rows);
                     match ids_cow.binary_search(&id) {
                         Ok(i) => i,
                         Err(_) => return Ok(None),
@@ -2604,7 +2747,7 @@ impl OnDemandStorage {
                 };
 
                 // Step 4: Check deletion bit.
-                let del_start = rg_rows * 8;
+                let del_start = id_section_len;
                 let del_vec_len = (rg_rows + 7) / 8;
                 if del_start + local_idx / 8 >= body.len() {
                     return Ok(None);
@@ -2673,6 +2816,13 @@ impl OnDemandStorage {
                                 Value::Null
                             }
                         }
+                        (
+                            COL_ENCODING_FLOAT_DICTIONARY,
+                            ColumnType::Float64 | ColumnType::Float32,
+                        ) => FloatDictView::parse(data_bytes)?
+                            .value(local_idx)
+                            .map(Value::Float64)
+                            .unwrap_or(Value::Null),
                         (COL_ENCODING_PLAIN, ColumnType::Bool) => {
                             // Plain Bool: [len:u64][packed bits]
                             let byte_off = 8 + local_idx / 8;
@@ -2760,6 +2910,17 @@ impl OnDemandStorage {
                             } else {
                                 Value::Null
                             }
+                        }
+                        (COL_ENCODING_COMPACT_DICTIONARY, ColumnType::StringDict) => {
+                            let view = StringDictView::parse(data_bytes, true)?;
+                            view.index(local_idx)
+                                .and_then(|index| view.value(index))
+                                .map(|value| {
+                                    Value::String(
+                                        std::str::from_utf8(value).unwrap_or("").to_string(),
+                                    )
+                                })
+                                .unwrap_or(Value::Null)
                         }
                         (COL_ENCODING_PLAIN, ColumnType::StringDict) => {
                             // StringDict: [row_count:u64][dict_size:u64][indices:row_count*4][dict_offsets:dict_size*4][dict_data_len:u64][dict_data]
@@ -2925,15 +3086,23 @@ impl OnDemandStorage {
             // Fallback: compressed RG or no RCIX — decompress, binary search, sequential scan.
             let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
             let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
-            if rg_rows * 8 > body.len() {
+            if id_section_len > body.len() {
                 return Ok(None);
             }
-            let ids_cow = bytes_as_u64_slice(body, rg_rows);
-            let local_idx = match ids_cow.binary_search(&id) {
-                Ok(i) => i,
-                Err(_) => return Ok(None),
+            let local_idx = if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+                let offset = id.saturating_sub(rg_meta.min_id) as usize;
+                if offset >= rg_rows {
+                    return Ok(None);
+                }
+                offset
+            } else {
+                let ids_cow = bytes_as_u64_slice(&body[..id_section_len], rg_rows);
+                match ids_cow.binary_search(&id) {
+                    Ok(i) => i,
+                    Err(_) => return Ok(None),
+                }
             };
-            let del_start = rg_rows * 8;
+            let del_start = id_section_len;
             let del_vec_len = (rg_rows + 7) / 8;
             if del_start + del_vec_len > body.len() {
                 return Ok(None);
@@ -3006,6 +3175,13 @@ impl OnDemandStorage {
                             Value::Null
                         }
                     }
+                    (
+                        COL_ENCODING_FLOAT_DICTIONARY,
+                        ColumnType::Float64 | ColumnType::Float32,
+                    ) => FloatDictView::parse(data_bytes)?
+                        .value(local_idx)
+                        .map(Value::Float64)
+                        .unwrap_or(Value::Null),
                     (COL_ENCODING_PLAIN, ColumnType::Bool) => {
                         let byte_off = 8 + local_idx / 8;
                         if byte_off < data_bytes.len() {
@@ -3766,31 +3942,22 @@ impl OnDemandStorage {
     // Persistence
     // ========================================================================
 
-    /// Check if a string column should use dictionary encoding
-    /// Returns true if unique values < 20% of row count and row count > 1000
-    fn should_dict_encode(col: &ColumnData) -> bool {
-        if let ColumnData::String { offsets, data } = col {
-            let row_count = offsets.len().saturating_sub(1);
-            if row_count < 1000 {
-                return false;
-            }
-            // Estimate unique values by sampling
-            use ahash::AHashSet;
-            let sample_size = (row_count / 10).min(1000);
-            let mut unique: AHashSet<&[u8]> = AHashSet::with_capacity(sample_size);
-            for i in 0..sample_size {
-                let idx = i * 10; // Sample every 10th row
-                if idx < row_count {
-                    let start = offsets[idx] as usize;
-                    let end = offsets[idx + 1] as usize;
-                    unique.insert(&data[start..end]);
-                }
-            }
-            // Use dictionary if cardinality < 20% of sampled rows
-            unique.len() < sample_size / 5
-        } else {
-            false
+    /// Build a string dictionary only when its real serialized payload is at
+    /// least 10% smaller. Exact sizing avoids periodic samples aliasing with
+    /// repeated values and misclassifying medium-cardinality columns.
+    fn dict_encode_if_smaller(col: &ColumnData) -> Option<ColumnData> {
+        let row_count = match col {
+            ColumnData::String { offsets, .. } => offsets.len().saturating_sub(1),
+            _ => return None,
+        };
+        if row_count < 1000 {
+            return None;
         }
+
+        let encoded = col.to_dict_encoded()?;
+        let plain_bytes = col.estimate_memory_bytes();
+        let encoded_bytes = encoded.estimate_memory_bytes().saturating_add(8);
+        (encoded_bytes < plain_bytes.saturating_mul(9) / 10).then_some(encoded)
     }
 
     /// Save to file (full rewrite with V4 format)
@@ -4138,19 +4305,35 @@ impl OnDemandStorage {
             let chunk_ids = &active_ids[chunk_start..chunk_end];
             let min_id = chunk_ids.iter().copied().min().unwrap_or(0);
             let max_id = chunk_ids.iter().copied().max().unwrap_or(0);
+            let id_encoding = if self
+                .path
+                .components()
+                .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"))
+                && ids_are_contiguous(chunk_ids)
+            {
+                RG_IDS_IMPLICIT_CONTIGUOUS
+            } else {
+                RG_IDS_PLAIN
+            };
+            let id_section_len = rg_id_section_len(chunk_rows, id_encoding);
 
             // Serialize RG body to buffer (IDs + deletion vector + columns)
             let is_single_rg = chunk_start == 0 && chunk_end == active_count;
             let null_bitmap_len = (chunk_rows + 7) / 8;
-            let mut body_buf: Vec<u8> = Vec::with_capacity(chunk_rows * 8 + chunk_rows * col_count);
+            let mut body_buf: Vec<u8> =
+                Vec::with_capacity(id_section_len + chunk_rows * col_count);
             {
                 let mut body_writer = std::io::Cursor::new(&mut body_buf);
 
-                // IDs — bulk write via unsafe slice cast
-                let id_bytes = unsafe {
-                    std::slice::from_raw_parts(chunk_ids.as_ptr() as *const u8, chunk_ids.len() * 8)
-                };
-                body_writer.write_all(id_bytes)?;
+                if id_encoding == RG_IDS_PLAIN {
+                    let id_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            chunk_ids.as_ptr() as *const u8,
+                            chunk_ids.len() * 8,
+                        )
+                    };
+                    body_writer.write_all(id_bytes)?;
+                }
 
                 // Deletion vector (all zeros — fresh save, no deletes)
                 let del_vec_len = (chunk_rows + 7) / 8;
@@ -4169,20 +4352,15 @@ impl OnDemandStorage {
                     };
 
                     // Dict-encode low-cardinality string columns for disk
-                    let dict_encoded;
-                    let use_dictionary = if rg_metas.is_empty() {
-                        Self::should_dict_encode(chunk_col_ref)
+                    let dict_encoded = if rg_metas.is_empty() {
+                        Self::dict_encode_if_smaller(chunk_col_ref)
+                    } else if matches!(actual_col_types.get(col_idx), Some(ColumnType::StringDict))
+                    {
+                        chunk_col_ref.to_dict_encoded()
                     } else {
-                        matches!(actual_col_types.get(col_idx), Some(ColumnType::StringDict))
+                        None
                     };
-                    let processed: &ColumnData = if use_dictionary {
-                        dict_encoded = chunk_col_ref
-                            .to_dict_encoded()
-                            .unwrap_or_else(|| chunk_col_ref.clone());
-                        &dict_encoded
-                    } else {
-                        chunk_col_ref
-                    };
+                    let processed = dict_encoded.as_ref().unwrap_or(chunk_col_ref);
 
                     // Track actual type for footer schema
                     if rg_metas.is_empty() {
@@ -4222,7 +4400,7 @@ impl OnDemandStorage {
             writer.write_all(&(col_count as u32).to_le_bytes())?;
             writer.write_all(&min_id.to_le_bytes())?;
             writer.write_all(&max_id.to_le_bytes())?;
-            writer.write_all(&[compress_flag, 1, 0, 0])?; // encoding_version=1: per-column encoding prefix
+            writer.write_all(&[compress_flag, 1, id_encoding, 0])?;
 
             // RG body (possibly compressed)
             writer.write_all(&disk_body)?;
@@ -4556,6 +4734,7 @@ impl OnDemandStorage {
                 RG_COMPRESS_NONE
             };
             let encoding_version = if rg_buf.len() >= 32 { rg_buf[29] } else { 0 };
+            let id_encoding = rg_buf.get(30).copied().unwrap_or(RG_IDS_PLAIN);
 
             // Get the body bytes (after 32-byte RG header), decompressing if needed
             let decompressed_buf = decompress_rg_body(compress_flag, &rg_buf[32..])?;
@@ -4564,14 +4743,23 @@ impl OnDemandStorage {
 
             // Parse IDs — OPTIMIZATION: bulk memcpy instead of per-element loop
             let ids_before = all_ids.len();
-            let id_byte_len = rg_rows * 8;
+            let id_byte_len = rg_id_section_len(rg_rows, id_encoding);
             all_ids.resize(ids_before + rg_rows, 0);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    body[pos..].as_ptr(),
-                    all_ids[ids_before..].as_mut_ptr() as *mut u8,
-                    id_byte_len,
-                );
+            if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+                for (offset, id_slot) in all_ids[ids_before..].iter_mut().enumerate() {
+                    *id_slot = rg_meta.min_id + offset as u64;
+                }
+            } else {
+                if id_byte_len > body.len() {
+                    return Err(err_data("RG ID section truncated"));
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        body[pos..].as_ptr(),
+                        all_ids[ids_before..].as_mut_ptr() as *mut u8,
+                        id_byte_len,
+                    );
+                }
             }
             if rg_meta.max_id > max_id_seen {
                 max_id_seen = rg_meta.max_id;
@@ -4740,7 +4928,7 @@ impl OnDemandStorage {
         crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
 
         // Write updated footer at same offset (overwrite old footer)
-        let mut file = OpenOptions::new().write(true).open(&self.path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         let new_footer_bytes = footer.to_bytes();
         file.seek(SeekFrom::Start(footer_offset))?;
         file.write_all(&new_footer_bytes)?;
@@ -4845,7 +5033,7 @@ impl OnDemandStorage {
         crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
 
         let deleted = self.deleted.read();
-        let mut file = OpenOptions::new().write(true).open(&self.path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
 
         // For each RG, write the updated deletion vector at its known offset
         let mut flat_row_start: usize = 0;
@@ -4856,8 +5044,11 @@ impl OnDemandStorage {
                 continue;
             }
 
-            // Deletion vector starts after RG header (32 bytes) + IDs (rg_rows * 8)
-            let del_vec_offset = rg_meta.offset + 32 + (rg_rows as u64 * 8);
+            let mut rg_header = [0u8; 32];
+            file.seek(SeekFrom::Start(rg_meta.offset))?;
+            file.read_exact(&mut rg_header)?;
+            let id_section_len = rg_id_section_len(rg_rows, rg_header[30]);
+            let del_vec_offset = rg_meta.offset + 32 + id_section_len as u64;
             let del_vec_len = (rg_rows + 7) / 8;
 
             // Extract this RG's slice from the flat deleted bitmap
@@ -5118,7 +5309,11 @@ impl OnDemandStorage {
                 }
 
                 let body = &mmap_ref[(rg_meta.offset as usize + 32)..rg_end];
-                let id_section = rg_rows * 8;
+                let id_encoding = mmap_ref
+                    .get(rg_meta.offset as usize + 30)
+                    .copied()
+                    .unwrap_or(RG_IDS_PLAIN);
+                let id_section = rg_id_section_len(rg_rows, id_encoding);
                 if id_section + del_vec_len > body.len() {
                     can_fast_delete = false;
                     break 'rg_loop;
@@ -5496,19 +5691,26 @@ impl OnDemandStorage {
                 }
 
                 let body_start = rg_meta.offset as usize + 32;
-                let ids_size = rg_rows * 8;
+                let id_encoding = mmap_ref
+                    .get(rg_meta.offset as usize + 30)
+                    .copied()
+                    .unwrap_or(RG_IDS_PLAIN);
+                let ids_size = rg_id_section_len(rg_rows, id_encoding);
                 let del_vec_len = (rg_rows + 7) / 8;
                 if body_start + ids_size + del_vec_len > rg_end {
                     return Ok(None);
                 }
 
-                let rg_ids_cow =
-                    bytes_as_u64_slice(&mmap_ref[body_start..body_start + ids_size], rg_rows);
-                let rg_ids: &[u64] = &rg_ids_cow;
+                let rg_ids_cow = (id_encoding == RG_IDS_PLAIN).then(|| {
+                    bytes_as_u64_slice(
+                        &mmap_ref[body_start..body_start + ids_size],
+                        rg_rows,
+                    )
+                });
 
                 // Quick range check (IDs are monotonically increasing within each RG)
-                let lo = sorted_ids.partition_point(|&x| x < rg_ids[0]);
-                let hi = sorted_ids.partition_point(|&x| x <= rg_ids[rg_rows - 1]);
+                let lo = sorted_ids.partition_point(|&x| x < rg_meta.min_id);
+                let hi = sorted_ids.partition_point(|&x| x <= rg_meta.max_id);
                 if lo >= hi {
                     new_total_active += rg_meta.active_rows() as u64;
                     continue;
@@ -5520,7 +5722,18 @@ impl OnDemandStorage {
                 let mut rg_newly_deleted: i64 = 0;
 
                 for &target_id in &sorted_ids[lo..hi] {
-                    if let Ok(pos) = rg_ids.binary_search(&target_id) {
+                    let pos = if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+                        target_id
+                            .checked_sub(rg_meta.min_id)
+                            .and_then(|offset| {
+                                (offset < rg_rows as u64).then_some(offset as usize)
+                            })
+                    } else {
+                        rg_ids_cow
+                            .as_deref()
+                            .and_then(|rg_ids| rg_ids.binary_search(&target_id).ok())
+                    };
+                    if let Some(pos) = pos {
                         if (del_bytes[pos / 8] >> (pos % 8)) & 1 == 0 {
                             del_bytes[pos / 8] |= 1 << (pos % 8);
                             rg_newly_deleted += 1;
@@ -5653,6 +5866,17 @@ impl OnDemandStorage {
         let rg_offset = footer_offset;
         let min_id = new_ids.iter().copied().min().unwrap_or(0);
         let max_id = new_ids.iter().copied().max().unwrap_or(0);
+        let id_encoding = if self
+            .path
+            .components()
+            .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"))
+            && ids_are_contiguous(new_ids)
+        {
+            RG_IDS_IMPLICIT_CONTIGUOUS
+        } else {
+            RG_IDS_PLAIN
+        };
+        let id_section_len = rg_id_section_len(rg_rows, id_encoding);
 
         // Serialize RG body to buffer (IDs + deletion vector + columns)
         let null_bitmap_len = (rg_rows + 7) / 8;
@@ -5672,13 +5896,15 @@ impl OnDemandStorage {
                 .count() as u32;
             (bitmap, count)
         };
-        let mut body_buf: Vec<u8> = Vec::with_capacity(rg_rows * 8 + rg_rows * col_count);
+        let mut body_buf: Vec<u8> =
+            Vec::with_capacity(id_section_len + rg_rows * col_count);
         {
             let mut body_writer = std::io::Cursor::new(&mut body_buf);
 
-            // IDs
-            for &id in new_ids {
-                body_writer.write_all(&id.to_le_bytes())?;
+            if id_encoding == RG_IDS_PLAIN {
+                for &id in new_ids {
+                    body_writer.write_all(&id.to_le_bytes())?;
+                }
             }
 
             // Deletion vector for rows that were inserted and deleted before flush.
@@ -5735,7 +5961,7 @@ impl OnDemandStorage {
         writer.write_all(&(col_count as u32).to_le_bytes())?;
         writer.write_all(&min_id.to_le_bytes())?;
         writer.write_all(&max_id.to_le_bytes())?;
-        writer.write_all(&[compress_flag, 1, 0, 0])?; // encoding_version=1: per-column encoding prefix
+        writer.write_all(&[compress_flag, 1, id_encoding, 0])?;
 
         // RG body (possibly compressed)
         writer.write_all(&disk_body)?;

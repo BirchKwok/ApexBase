@@ -247,7 +247,10 @@ impl OnDemandStorage {
             let compress_flag = rg_bytes[28];
             let encoding_version = rg_bytes[29];
             let null_bitmap_len = (rg_rows + 7) / 8;
-            let del_start_body = rg_rows * 8;
+            let del_start_body = rg_id_section_len(
+                rg_rows,
+                rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+            );
             let del_vec_len = null_bitmap_len;
 
             let rcix = match footer.col_offsets.get(rg_i).filter(|v| !v.is_empty()) {
@@ -491,8 +494,6 @@ impl OnDemandStorage {
 
             let mmap_ptr = mmap_ref.as_ptr() as usize;
             let mmap_len = mmap_ref.len();
-            let target_len = target_bytes.len();
-
             let parts: Option<Vec<Part>> = footer
                 .row_groups
                 .par_iter()
@@ -526,7 +527,10 @@ impl OnDemandStorage {
 
                     let body = &rg_bytes[32..];
                     let null_bitmap_len = (rg_rows + 7) / 8;
-                    let del_start = rg_rows * 8;
+                    let del_start = rg_id_section_len(
+                        rg_rows,
+                        rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+                    );
                     let del_len = null_bitmap_len;
                     if del_start + del_len > body.len() {
                         return None;
@@ -540,77 +544,38 @@ impl OnDemandStorage {
                     }
                     let filter_nulls = &body[filter_col_off..filter_col_off + null_bitmap_len];
                     let filter_encoding = body[filter_col_off + null_bitmap_len];
-                    if filter_encoding != COL_ENCODING_PLAIN {
+                    if !matches!(
+                        filter_encoding,
+                        COL_ENCODING_PLAIN | COL_ENCODING_COMPACT_DICTIONARY
+                    ) {
                         return None;
                     }
                     let filter_payload = &body[filter_col_off + null_bitmap_len + 1..];
-                    if filter_payload.len() < 16 {
-                        return None;
-                    }
-
-                    let row_count =
-                        u64::from_le_bytes(filter_payload[0..8].try_into().ok()?) as usize;
-                    let dict_size =
-                        u64::from_le_bytes(filter_payload[8..16].try_into().ok()?) as usize;
-                    if dict_size == 0 {
+                    let view = StringDictView::parse(
+                        filter_payload,
+                        filter_encoding == COL_ENCODING_COMPACT_DICTIONARY,
+                    ).ok()?;
+                    if view.dict_size <= 1 {
                         return Some(part);
                     }
-                    let indices_start = 16usize;
-                    let indices_len = row_count.checked_mul(4)?;
-                    let dict_off_start = indices_start.checked_add(indices_len)?;
-                    let dict_offsets_len = dict_size.checked_mul(4)?;
-                    let dict_data_len_off = dict_off_start.checked_add(dict_offsets_len)?;
-                    if dict_data_len_off + 8 > filter_payload.len() {
-                        return None;
-                    }
-                    let dict_data_len = u64::from_le_bytes(
-                        filter_payload[dict_data_len_off..dict_data_len_off + 8]
-                            .try_into()
-                            .ok()?,
-                    ) as usize;
-                    let dict_data_start = dict_data_len_off + 8;
-                    let dict_offsets =
-                        bytes_as_u32_slice(&filter_payload[dict_off_start..], dict_size);
-                    let indices = bytes_as_u32_slice(&filter_payload[indices_start..], row_count);
-
-                    let mut target_dict_idx = None;
-                    for di in 0..dict_size {
-                        let ds = dict_offsets[di] as usize;
-                        let de = if di + 1 < dict_size {
-                            dict_offsets[di + 1] as usize
-                        } else {
-                            dict_data_len
-                        };
-                        if de >= ds
-                            && de - ds == target_len
-                            && dict_data_start + de <= filter_payload.len()
-                            && &filter_payload[dict_data_start + ds..dict_data_start + de]
-                                == target_bytes
-                        {
-                            target_dict_idx = Some((di + 1) as u32);
-                            break;
-                        }
-                    }
-                    let Some(tdi) = target_dict_idx else {
+                    let Some(tdi) = view.find_value(target_bytes) else {
                         return Some(part);
                     };
 
-                    let n = row_count.min(rg_rows).min(indices.len());
+                    let n = view.row_count.min(rg_rows);
                     let filter_has_nulls = filter_nulls.iter().any(|&b| b != 0);
 
                     if nc == 0 {
-                        for i in 0..n {
-                            if indices[i] != tdi {
-                                continue;
-                            }
+                        view.for_each_index_eq(tdi, n, |i| {
                             if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
-                                continue;
+                                return true;
                             }
                             if filter_has_nulls && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1 {
-                                continue;
+                                return true;
                             }
                             part.matches += 1;
-                        }
+                            true
+                        });
                         return Some(part);
                     }
 
@@ -638,28 +603,26 @@ impl OnDemandStorage {
 
                     match agg_type {
                         ColumnType::Float64 | ColumnType::Float32 => {
-                            for i in 0..scan_n {
-                                if indices[i] != tdi {
-                                    continue;
-                                }
+                            view.for_each_index_eq(tdi, scan_n, |i| {
                                 if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
-                                    continue;
+                                    return true;
                                 }
                                 if filter_has_nulls
                                     && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
                                 {
-                                    continue;
+                                    return true;
                                 }
                                 part.matches += 1;
                                 if agg_has_nulls && (agg_nulls[i / 8] >> (i % 8)) & 1 == 1 {
-                                    continue;
+                                    return true;
                                 }
                                 let off = i * 8;
                                 let v = f64::from_le_bytes(
-                                    agg_values[off..off + 8].try_into().ok()?,
+                                    agg_values[off..off + 8].try_into().unwrap(),
                                 );
                                 part.add_f64(v);
-                            }
+                                true
+                            });
                         }
                         ColumnType::Int64
                         | ColumnType::Int8
@@ -672,28 +635,26 @@ impl OnDemandStorage {
                         | ColumnType::Timestamp
                         | ColumnType::Date => {
                             part.is_int = true;
-                            for i in 0..scan_n {
-                                if indices[i] != tdi {
-                                    continue;
-                                }
+                            view.for_each_index_eq(tdi, scan_n, |i| {
                                 if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
-                                    continue;
+                                    return true;
                                 }
                                 if filter_has_nulls
                                     && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
                                 {
-                                    continue;
+                                    return true;
                                 }
                                 part.matches += 1;
                                 if agg_has_nulls && (agg_nulls[i / 8] >> (i % 8)) & 1 == 1 {
-                                    continue;
+                                    return true;
                                 }
                                 let off = i * 8;
                                 let v = i64::from_le_bytes(
-                                    agg_values[off..off + 8].try_into().ok()?,
+                                    agg_values[off..off + 8].try_into().unwrap(),
                                 ) as f64;
                                 part.add_f64(v);
-                            }
+                                true
+                            });
                         }
                         _ => return None,
                     }
@@ -755,7 +716,10 @@ impl OnDemandStorage {
             let encoding_version = rg_bytes[29];
             let null_bitmap_len = (rg_rows + 7) / 8;
             let del_vec_len = null_bitmap_len;
-            let del_start_body = rg_rows * 8;
+            let del_start_body = rg_id_section_len(
+                rg_rows,
+                rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+            );
 
             // Need RCIX for filter column AND all agg columns
             let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version >= 1 {
@@ -818,47 +782,21 @@ impl OnDemandStorage {
                             result
                         } else { vec![] }
                     } else { vec![] }
-                } else if filter_encoding == COL_ENCODING_PLAIN
-                    && matches!(filter_type, ColumnType::StringDict) && filter_payload.len() >= 16
+                } else if matches!(
+                    filter_encoding,
+                    COL_ENCODING_PLAIN | COL_ENCODING_COMPACT_DICTIONARY
+                ) && matches!(filter_type, ColumnType::StringDict)
                 {
-                    let count = u64::from_le_bytes(filter_payload[0..8].try_into().unwrap()) as usize;
-                    let dict_size = u64::from_le_bytes(filter_payload[8..16].try_into().unwrap()) as usize;
-                    if dict_size == 0 { vec![] } else {
-                        let indices_start = 16usize;
-                        let indices_len = count * 4;
-                        let dict_off_start = indices_start + indices_len;
-                        let dict_offsets_len = dict_size * 4;
-                        let dict_data_len_off = dict_off_start + dict_offsets_len;
-                        if dict_data_len_off + 8 <= filter_payload.len() {
-                            let dict_data_len = u64::from_le_bytes(
-                                filter_payload[dict_data_len_off..dict_data_len_off+8].try_into().unwrap_or([0;8])
-                            ) as usize;
-                            let dict_data_start = dict_data_len_off + 8;
-                            let dict_offsets = bytes_as_u32_slice(&filter_payload[dict_off_start..], dict_size);
-                            let indices = bytes_as_u32_slice(&filter_payload[indices_start..], count);
-                            let raw_end = (dict_data_start + dict_data_len).min(filter_payload.len());
-                            let raw_dict = &filter_payload[dict_data_start..raw_end];
-                            let tlen = target_bytes.len();
-                            let mut target_dict_idx: Option<u32> = None;
-                            let mut search_from = 0usize;
-                            while let Some(rel) = memmem_finder.find(&raw_dict[search_from..]) {
-                                let abs = search_from + rel;
-                                if let Ok(di) = dict_offsets.binary_search(&(abs as u32)) {
-                                    let de = if di + 1 < dict_size { dict_offsets[di+1] as usize } else { dict_data_len };
-                                    if de - abs == tlen {
-                                        target_dict_idx = Some((di + 1) as u32);
-                                        break;
-                                    }
-                                }
-                                search_from += rel + 1;
-                                if search_from >= raw_dict.len() { break; }
-                            }
-                            if let Some(tdi) = target_dict_idx {
+                    if let Ok(view) = StringDictView::parse(
+                        filter_payload,
+                        filter_encoding == COL_ENCODING_COMPACT_DICTIONARY,
+                    ) {
+                        if let Some(tdi) = view.find_value(target_bytes) {
                                 if nc <= 1 {
-                                    let n = count.min(rg_rows).min(indices.len());
+                                    let n = view.row_count.min(rg_rows);
                                     if nc == 0 {
                                         for i in 0..n {
-                                            if indices[i] == tdi {
+                                            if view.index(i) == Some(tdi) {
                                                 if has_deletes
                                                     && (body[del_start_body + i / 8] >> (i % 8))
                                                         & 1
@@ -905,7 +843,7 @@ impl OnDemandStorage {
                                                     let vals =
                                                         bytes_as_f64_slice(&agg_payload[8..], agg_n);
                                                     for i in 0..n {
-                                                        if indices[i] != tdi {
+                                                        if view.index(i) != Some(tdi) {
                                                             continue;
                                                         }
                                                         if has_deletes
@@ -955,7 +893,7 @@ impl OnDemandStorage {
                                                     let vals =
                                                         bytes_as_i64_slice(&agg_payload[8..], agg_n);
                                                     for i in 0..n {
-                                                        if indices[i] != tdi {
+                                                        if view.index(i) != Some(tdi) {
                                                             continue;
                                                         }
                                                         if has_deletes
@@ -995,10 +933,10 @@ impl OnDemandStorage {
                                     }
                                 }
 
-                                let n = count.min(rg_rows);
+                                let n = view.row_count.min(rg_rows);
                                 let mut result = Vec::new();
                                 for i in 0..n {
-                                    if indices[i] == tdi {
+                                    if view.index(i) == Some(tdi) {
                                         if !has_deletes || (body[del_start_body + i/8] >> (i%8)) & 1 == 0 {
                                             let null_byte = body.get(filter_col_off + i/8).copied().unwrap_or(0);
                                             if (null_byte >> (i%8)) & 1 == 0 {
@@ -1010,7 +948,6 @@ impl OnDemandStorage {
                                 result
                             } else { vec![] }
                         } else { vec![] }
-                    }
                 } else {
                     vec![]
                 };
@@ -1420,6 +1357,25 @@ impl OnDemandStorage {
             }
         }
 
+        if real_cols.len() == 1 && !self.has_pending_deltas() {
+            if let Some((count, sum, min, max, is_int)) = self
+                .execute_filtered_cached_numeric_mmap(group_ids, target_gid, real_cols[0])?
+            {
+                return Ok(Some(
+                    agg_cols
+                        .iter()
+                        .map(|name| {
+                            if *name == "*" || *name == "1" {
+                                (count, 0.0, 0.0, 0.0, false)
+                            } else {
+                                (count, sum, min, max, is_int)
+                            }
+                        })
+                        .collect(),
+                ));
+            }
+        }
+
         let (scanned_cols, deleted): (Vec<ColumnData>, Vec<u8>) = if self.has_v4_in_memory_data() {
             let schema = self.schema.read();
             let columns = self.columns.read();
@@ -1598,6 +1554,118 @@ impl OnDemandStorage {
             }
         }
         Ok(Some(results))
+    }
+
+    /// Zero-copy numeric side of a cached string-equality aggregation.
+    /// Group IDs already encode the string predicate, so only the numeric
+    /// column needs to be streamed from each row group.
+    fn execute_filtered_cached_numeric_mmap(
+        &self,
+        group_ids: &[u16],
+        target_gid: u16,
+        agg_col: &str,
+    ) -> io::Result<Option<(i64, f64, f64, f64, bool)>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let Some(col_idx) = footer.schema.get_index(agg_col) else {
+            return Ok(None);
+        };
+        let col_type = footer.schema.columns[col_idx].1;
+        let is_int = matches!(
+            col_type,
+            ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+        );
+        if !is_int && !matches!(col_type, ColumnType::Float64 | ColumnType::Float32) {
+            return Ok(None);
+        }
+        if footer.row_groups.iter().any(|rg| rg.deletion_count > 0) {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for filtered aggregation"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let mut row_offset = 0usize;
+        let mut count = 0i64;
+        let mut sum = 0.0f64;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 {
+                continue;
+            }
+            let Some(col_offsets) = footer.col_offsets.get(rg_i) else {
+                return Ok(None);
+            };
+            let Some(&col_offset) = col_offsets.get(col_idx) else {
+                return Ok(None);
+            };
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            if rg_bytes.len() < 32
+                || rg_bytes[28] != RG_COMPRESS_NONE
+                || rg_bytes[29] < 1
+            {
+                return Ok(None);
+            }
+            let body = &rg_bytes[32..];
+            let null_bitmap_len = rg_rows.div_ceil(8);
+            let data_start = col_offset as usize + null_bitmap_len;
+            if data_start + 9 > body.len() || body[data_start] != COL_ENCODING_PLAIN {
+                return Ok(None);
+            }
+            let payload = &body[data_start + 1..];
+            let encoded_rows = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+            let rows = encoded_rows
+                .min(rg_rows)
+                .min(group_ids.len().saturating_sub(row_offset))
+                .min((payload.len() - 8) / 8);
+            let values = unsafe { payload.as_ptr().add(8) };
+            for local_row in 0..rows {
+                if unsafe { *group_ids.get_unchecked(row_offset + local_row) } != target_gid {
+                    continue;
+                }
+                let value = if is_int {
+                    unsafe {
+                        std::ptr::read_unaligned(values.add(local_row * 8) as *const i64) as f64
+                    }
+                } else {
+                    unsafe {
+                        std::ptr::read_unaligned(values.add(local_row * 8) as *const f64)
+                    }
+                };
+                count += 1;
+                sum += value;
+                min = min.min(value);
+                max = max.max(value);
+            }
+            row_offset += rg_rows;
+        }
+
+        Ok(Some((
+            count,
+            sum,
+            if min == f64::INFINITY { 0.0 } else { min },
+            if max == f64::NEG_INFINITY { 0.0 } else { max },
+            is_int,
+        )))
     }
 
     /// Single-pass filtered numeric aggregation from mmap.
@@ -1795,7 +1863,10 @@ impl OnDemandStorage {
 
                     let body = &rg_bytes[32..];
                     let null_bitmap_len = (rg_rows + 7) / 8;
-                    let del_start = rg_rows * 8;
+                    let del_start = rg_id_section_len(
+                        rg_rows,
+                        rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+                    );
                     let del_len = null_bitmap_len;
                     if del_start + del_len > body.len() {
                         return None;
@@ -2351,7 +2422,10 @@ impl OnDemandStorage {
 
             let body = &rg_bytes[32..];
             let null_bitmap_len = (rg_rows + 7) / 8;
-            let del_start = rg_rows * 8;
+            let del_start = rg_id_section_len(
+                rg_rows,
+                rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+            );
             let del_len = null_bitmap_len;
             if del_start + del_len > body.len() {
                 return Ok(None);
@@ -2748,7 +2822,10 @@ impl OnDemandStorage {
             let null_bm = if col_off + null_bitmap_len <= body.len() { &body[col_off..col_off + null_bitmap_len] } else { &[] };
             let has_null_bm = null_bm.iter().any(|&b| b != 0);
             let has_deleted = rg_meta.deletion_count > 0;
-            let del_start = rg_rows * 8;
+            let del_start = rg_id_section_len(
+                rg_rows,
+                rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+            );
             let del_vec_len = null_bitmap_len;
             let del_bytes = if del_start + del_vec_len <= body.len() { &body[del_start..del_start + del_vec_len] } else { &[] };
 
@@ -3582,7 +3659,10 @@ impl OnDemandStorage {
                 let compress_flag = rg_bytes[28];
                 let encoding_version = rg_bytes[29];
                 let null_bitmap_len = (rg_rows + 7) / 8;
-                let del_start = rg_rows * 8;
+                let del_start = rg_id_section_len(
+                    rg_rows,
+                    rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+                );
                 let del_vec_len = null_bitmap_len;
                 let rcix = &footer.col_offsets[rg_i];
 
@@ -3897,7 +3977,10 @@ impl OnDemandStorage {
                                 let body = &rg_bytes[32..];
                                 let nbm = (rg_rows + 7) / 8;
                                 let has_del = rg_meta.deletion_count > 0;
-                                let del_start = rg_rows * 8;
+                                let del_start = rg_id_section_len(
+                                    rg_rows,
+                                    rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+                                );
                                 let del_bm: &[u8] = if has_del && del_start + nbm <= body.len() { &body[del_start..del_start + nbm] } else { &[] };
                                 let rcix = &footer.col_offsets[rg_i];
                                 let g1e = (row_off + rg_rows).min(group_ids1.len());
@@ -4352,7 +4435,10 @@ impl OnDemandStorage {
                 let null_bitmap_len = (rg_rows + 7) / 8;
                 let rcix = &footer.col_offsets[rg_i];
                 let has_deleted = rg_meta.deletion_count > 0;
-                let del_start = rg_rows * 8;
+                let del_start = rg_id_section_len(
+                    rg_rows,
+                    rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+                );
                 let del_vec_len = null_bitmap_len;
 
                 // Decompress if needed
@@ -4382,7 +4468,21 @@ impl OnDemandStorage {
                     let packed = if 17 + pb <= d.len() { &d[17..17+pb] } else { &[] as &[u8] };
                     (cnt, bw, mv, packed)
                 } else { (0, 0, 0, &[]) };
-                let filter_data_owned: Option<ColumnData> = if filter_is_bitpack { None } else {
+                let filter_float_dict = if f_encoding == COL_ENCODING_FLOAT_DICTIONARY
+                    && matches!(
+                        schema.columns[filter_idx].1,
+                        ColumnType::Float64 | ColumnType::Float32
+                    )
+                {
+                    Some(FloatDictView::parse(&f_bytes[1..])?)
+                } else {
+                    None
+                };
+                let filter_data_owned: Option<ColumnData> = if filter_is_bitpack
+                    || filter_float_dict.is_some()
+                {
+                    None
+                } else {
                     Some(if encoding_version >= 1 {
                         read_column_encoded(f_bytes, schema.columns[filter_idx].1)?.0
                     } else {
@@ -4570,6 +4670,78 @@ impl OnDemandStorage {
                                 let mask = (bp_bit_width == 0 || (delta >= delta_lo && delta <= delta_hi)) as i64;
                                 let gid = unsafe { *gids_slice.get_unchecked(i) } as usize;
                                 unsafe { *group_counts.get_unchecked_mut(gid) += mask; }
+                            }
+                        }
+                    }
+                } else if let Some(ref view) = filter_float_dict {
+                    let n = view.row_count.min(rg_n);
+                    let mut dict_matches = Vec::with_capacity(view.dict_size);
+                    let mut dict_sums = Vec::with_capacity(view.dict_size);
+                    for index in 0..view.dict_size {
+                        let value = view.dictionary_value(index).unwrap_or(0.0);
+                        let matches = value >= lo && value <= hi;
+                        dict_matches.push(matches as i64);
+                        dict_sums.push(if matches { value } else { 0.0 });
+                    }
+                    if !has_deleted {
+                        if agg_idx == Some(filter_idx) {
+                            for i in 0..n {
+                                let index = unsafe { view.index_unchecked(i) };
+                                if index >= view.dict_size {
+                                    continue;
+                                }
+                                let gid = unsafe { *gids_slice.get_unchecked(i) } as usize;
+                                unsafe {
+                                    *group_counts.get_unchecked_mut(gid) +=
+                                        *dict_matches.get_unchecked(index);
+                                    *group_sums.get_unchecked_mut(gid) +=
+                                        *dict_sums.get_unchecked(index);
+                                }
+                            }
+                        } else if let Some(av) = agg_f64 {
+                            let n = n.min(av.len());
+                            for i in 0..n {
+                                let index = unsafe { view.index_unchecked(i) };
+                                if index >= view.dict_size {
+                                    continue;
+                                }
+                                let mask = unsafe { *dict_matches.get_unchecked(index) };
+                                let gid = unsafe { *gids_slice.get_unchecked(i) } as usize;
+                                unsafe {
+                                    *group_counts.get_unchecked_mut(gid) += mask;
+                                    *group_sums.get_unchecked_mut(gid) +=
+                                        mask as f64 * *av.get_unchecked(i);
+                                }
+                            }
+                        } else {
+                            for i in 0..n {
+                                let index = unsafe { view.index_unchecked(i) };
+                                if index >= view.dict_size {
+                                    continue;
+                                }
+                                let mask = unsafe { *dict_matches.get_unchecked(index) };
+                                let gid = unsafe { *gids_slice.get_unchecked(i) } as usize;
+                                unsafe { *group_counts.get_unchecked_mut(gid) += mask; }
+                            }
+                        }
+                    } else {
+                        for i in 0..n {
+                            if !del_bytes.is_empty()
+                                && (del_bytes[i / 8] >> (i % 8)) & 1 != 0
+                            {
+                                continue;
+                            }
+                            let index = unsafe { view.index_unchecked(i) };
+                            if index >= view.dict_size {
+                                continue;
+                            }
+                            if unsafe { *dict_matches.get_unchecked(index) } != 0 {
+                                let gid = unsafe { *gids_slice.get_unchecked(i) } as usize;
+                                *group_counts.get_mut(gid).unwrap() += 1;
+                                if agg_idx == Some(filter_idx) {
+                                    *group_sums.get_mut(gid).unwrap() +=
+                                        unsafe { *dict_sums.get_unchecked(index) };
+                                }
                             }
                         }
                     }

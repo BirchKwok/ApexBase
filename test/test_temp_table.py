@@ -76,6 +76,86 @@ def test_register_temp_table_aggregate(temp_dir):
     client.close()
 
 
+def test_temp_table_medium_cardinality_strings_use_compact_storage(temp_dir):
+    client = ApexClient(temp_dir, drop_if_exists=True)
+    client.create_table("_dummy")
+    client.use_table("_dummy")
+
+    csv_path = os.path.join(temp_dir, "repeated_names.csv")
+    rows = 20_000
+    with open(csv_path, "w") as f:
+        f.write("name,category,value\n")
+        for i in range(rows):
+            f.write(f"user_{i % 2000},group_{i % 100},{i}\n")
+
+    client.register_temp_table("repeated_names", csv_path)
+
+    assert client.execute(
+        "SELECT COUNT(*) FROM repeated_names WHERE name = 'user_123'"
+    ).scalar() == 10
+    grouped = client.execute(
+        "SELECT category, COUNT(*) AS n FROM repeated_names "
+        "GROUP BY category ORDER BY category"
+    ).to_dict()
+    assert len(grouped) == 100
+    assert all(row["n"] == 200 for row in grouped)
+    filtered = client.execute(
+        "SELECT COUNT(*), AVG(value), MAX(value) FROM repeated_names "
+        "WHERE category = 'group_23'"
+    ).to_dict()[0]
+    assert filtered["COUNT(*)"] == 200
+    assert filtered["AVG(value)"] == 9973
+    assert filtered["MAX(value)"] == 19923
+    native_path = os.path.join(temp_dir, ".apex_tmp", "repeated_names.apex")
+    # name requires u16 indices, while category fits u8. A legacy u32-index
+    # file for these columns is roughly 390 KB.
+    assert os.path.getsize(native_path) < 320_000
+
+    client.close()
+
+
+def test_temp_table_contiguous_ids_are_implicit_and_queryable(temp_dir):
+    client = ApexClient(temp_dir, drop_if_exists=True)
+    client.create_table("_dummy")
+    client.use_table("_dummy")
+
+    csv_path = os.path.join(temp_dir, "implicit_ids.csv")
+    rows = 20_000
+    with open(csv_path, "w") as f:
+        f.write("value,label,score\n")
+        for i in range(rows):
+            f.write(f"{i},group_{i % 16},{i % 100 / 10}\n")
+
+    client.register_temp_table("implicit_ids", csv_path)
+    native_path = os.path.join(temp_dir, ".apex_tmp", "implicit_ids.apex")
+    with open(native_path, "rb") as f:
+        native = f.read()
+    row_group = native.index(b"APXG")
+    assert native[row_group + 30] == 1
+
+    row = client.execute(
+        "SELECT _id, value, label, score FROM implicit_ids WHERE _id = 2048"
+    ).to_dict()[0]
+    assert row == {
+        "_id": 2048,
+        "value": 2047,
+        "label": "group_15",
+        "score": 4.7,
+    }
+
+    last = client.execute(
+        "SELECT _id, value FROM implicit_ids WHERE _id = 20000"
+    ).to_dict()[0]
+    assert last == {"_id": 20000, "value": 19999}
+    stats = client.execute(
+        "SELECT COUNT(*), AVG(score), MAX(score) FROM implicit_ids "
+        "WHERE score >= 5"
+    ).to_dict()[0]
+    assert stats == {"COUNT(*)": 10000, "AVG(score)": 7.45, "MAX(score)": 9.9}
+    assert os.path.getsize(native_path) < 300_000
+    client.close()
+
+
 def test_temp_table_drop(temp_dir):
     client = ApexClient(temp_dir, drop_if_exists=True)
     client.create_table("_dummy")

@@ -151,7 +151,10 @@ impl OnDemandStorage {
         let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
         let body = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
 
-        let mut pos = rg_rows * 8;
+        let mut pos = rg_id_section_len(
+            rg_rows,
+            rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+        );
         let null_bitmap_len = (rg_rows + 7) / 8;
         pos = pos
             .checked_add(null_bitmap_len)

@@ -4,21 +4,21 @@ This page tracks the latest verified local benchmark snapshot rather than an old
 
 ## Latest Verified Snapshot
 
-- **System**: macOS 26.4.1, Apple arm (10 cores), 32 GB RAM
-- **Stack**: Python 3.12.4, ApexBase 1.19.0, SQLite 3.45.3, DuckDB 1.1.3, PyArrow 23.0.1
-- **Dataset**: 200,000 rows x 5 columns (`name`, `age`, `score`, `city`, `category`)
-- **Vector dataset**: 200,000 vectors x dim=128, `k=10`, batch size 10 queries
-- **Method**: 2 warmup iterations + 3 timed iterations
-- **Layout**: the default benchmark entrypoint tracks the README public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`.
-- **Fairness rule**: only the default fair OLAP/OLTP cross-engine tables count toward the `38/38` win/loss summary. Vector similarity uses a separate dataset and its own ApexBase-vs-DuckDB scoreboard.
+- **System**: macOS 26.5.2, Apple arm (10 cores), 32 GB RAM
+- **Stack**: Python 3.12.2, ApexBase 1.23.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
+- **Dataset**: 1,000,000 rows x 5 columns (`name`, `age`, `score`, `city`, `category`)
+- **Vector dataset**: 1,000,000 vectors x dim=128, `k=10`, batch size 10 queries
+- **Method**: 2 warmup iterations + 5 timed iterations
+- **Layout**: the default benchmark entrypoint tracks the README public scoreboard, including six competitive vector metrics; Apex-only vector metrics and other extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`.
+- **Fairness rule**: only the default fair OLAP/OLTP cross-engine tables count toward the `72/72` win/loss summary. Vector similarity uses a separate dataset and its own ApexBase-vs-DuckDB scoreboard.
 
 ## Scoreboard
 
 | Scope | Metrics | Apex wins | Ties | Slower |
 | --- | ---: | ---: | ---: | ---: |
-| Default fair (OLAP + OLTP) | 38 | 38 | 0 | 0 |
-| OLAP fair | 29 | 29 | 0 | 0 |
-| OLTP fair | 9 | 9 | 0 | 0 |
+| Default fair (OLAP + OLTP) | 72 | 72 | 0 | 0 |
+| OLAP fair | 45 | 45 | 0 | 0 |
+| OLTP fair | 27 | 27 | 0 | 0 |
 | Vector similarity (ApexBase vs DuckDB) | 6 | 6 | 0 | 0 |
 
 Stock SQLite is not ranked in the vector table because the built-in `sqlite3` used here has no native vector distance/top-k functions in this harness.
@@ -27,25 +27,27 @@ Stock SQLite is not ranked in the vector table because the built-in `sqlite3` us
 
 | Metric | ApexBase | SQLite | DuckDB | Gap to best other |
 | --- | ---: | ---: | ---: | --- |
-| COUNT(*) | 0.106 ms | 1.775 ms | 0.397 ms | 3.7x faster vs DuckDB |
-| SELECT * LIMIT 100 (warm cache) | 6 us | 0.107 ms | 0.236 ms | 17.8x faster vs SQLite |
-| Filtered LIMIT 100 (age>30) | 0.050 ms | 0.173 ms | 0.603 ms | 3.5x faster vs SQLite |
-| GROUP BY city (10 groups) | 0.060 ms | 60.108 ms | 2.399 ms | 40.0x faster vs DuckDB |
-| Window ROW_NUMBER PARTITION BY city | 0.622 ms | 99.086 ms | 12.809 ms | 20.6x faster vs DuckDB |
+| COUNT(*) | 0.072 ms | 7.94 ms | 0.493 ms | 6.8x faster vs DuckDB |
+| SELECT * LIMIT 100 (warm cache) | 0.075 ms | 0.124 ms | 0.244 ms | 1.7x faster vs SQLite |
+| Filtered LIMIT 100 (age>30) | 0.014 ms | 0.127 ms | 0.298 ms | 9.1x faster vs SQLite |
+| GROUP BY city (10 groups) | 1.51 ms | 357.54 ms | 3.89 ms | 2.6x faster vs DuckDB |
+| Temp Table (CSV) Query (filter+agg) | 0.538 ms | N/A | 0.797 ms | 1.5x faster vs DuckDB |
 
 ## Representative OLTP Gaps
 
 | Metric | ApexBase | SQLite | DuckDB | Gap to best other |
 | --- | ---: | ---: | ---: | --- |
-| Bulk Insert (N rows; default fair) | 53.948 ms | 197.464 ms | 35.84 s | 3.7x faster vs SQLite |
-| Point Lookup (SQL by ID) | 0.035 ms | 0.067 ms | 2.198 ms | 1.9x faster vs SQLite |
-| Retrieve Many (SQL, 100 IDs) | 0.175 ms | 0.317 ms | 3.942 ms | 1.8x faster vs SQLite |
-| FTS Index Build (name,city,category) | 103.738 ms | 246.588 ms | 790.703 ms | 2.4x faster vs SQLite |
-| FTS Search ('Electronics') | 0.160 ms | 5.700 ms | 14.644 ms | 35.6x faster vs SQLite |
+| Bulk Insert (N rows; default fair) | 225.05 ms | 1.02 s | 211.09 s | 4.5x faster vs SQLite |
+| Point Lookup (SQL by ID) | 0.039 ms | 0.055 ms | 4.00 ms | 1.4x faster vs SQLite |
+| Retrieve Many (SQL, 100 IDs) | 0.168 ms | 0.279 ms | 5.70 ms | 1.7x faster vs SQLite |
+| FTS Index Build (name,city,category) | 1.38 ms | 1.54 s | 1.35 s | 978x faster vs DuckDB |
+| FTS Search ('Electronics') | 5.45 ms | 29.91 ms | 24.34 ms | 4.5x faster vs DuckDB |
 
 ## Representative Vector Gaps
 
 SQLite is excluded here because stock `sqlite3` in this harness has no native vector distance/top-k support.
+
+Single-query rows compare one materialized TopK result from each engine. Batch rows compare ApexBase's `batch_topk_distance()` with ten DuckDB single-query SQL calls over the same deterministic query batch; every DuckDB result is materialized before the next query runs.
 
 | Metric | ApexBase | DuckDB | Gap to DuckDB |
 | --- | ---: | ---: | --- |
@@ -111,7 +113,7 @@ That separation is deliberate: the fair tables compare committed cross-engine be
 Use the same command as the snapshot above:
 
 ```bash
-python benchmarks/bench_vs_sqlite_duckdb.py --rows 200000 --warmup 2 --iterations 3
+python benchmarks/bench_vs_sqlite_duckdb.py
 ```
 
 Add `--skip-vector` if you want a tabular-only rerun without the separate vector module.
@@ -137,23 +139,31 @@ out-of-core stress run. Ratios are reported as ApexBase divided by DuckDB, so a
 value below `1.0x` is better for ApexBase.
 
 On the same Apple Silicon development machine, the focused 1,000,000-row
-Parquet run (9 measured queries after 3 warmups) produced this verification
+Parquet run (21 measured queries after 5 warmups) produced this verification
 snapshot:
 
 | Metric | ApexBase | DuckDB | ApexBase / DuckDB |
 | --- | ---: | ---: | ---: |
-| Direct filtered Parquet count | 1.49 ms | 9.49 ms | 0.157x |
-| Disk-backed materialization | 0.126 s | 0.279 s | 0.451x |
-| Filter + GROUP BY + COUNT/AVG | 1.485 ms | 3.422 ms | 0.434x |
-| Incremental peak RSS | 90.3 MB | 119.0 MB | 0.759x |
-| Native storage size | 33.9 MiB | 6.8 MiB | 5.012x |
+| Direct filtered Parquet count | 1.35 ms | 9.75 ms | 0.138x |
+| Disk-backed materialization | 0.131 s | 0.278 s | 0.469x |
+| Filter + GROUP BY + COUNT/AVG | 1.175 ms | 3.862 ms | 0.304x |
+| Incremental peak RSS | 77.8 MB | 126.9 MB | 0.613x |
+| Native storage size | 9.5 MiB | 6.5 MiB | 1.454x |
 
-The native query uses a single fused storage scan for a numeric range filter,
-one string grouping column, `COUNT(*)`, and `SUM`/`AVG` over one shared numeric
-column. Nullable inputs and more complex SQL shapes deliberately fall back to
-the general executor. The storage-size result is included because it remains a
-clear optimization target even though latency and peak memory are ahead in this
-workload.
+The native storage result first decreased from 33.9 MiB to 27.4 MiB by
+selecting string dictionary encoding from its actual serialized size instead
+of a periodic cardinality sample. One-, two-, or four-byte string dictionary
+indices reduced it further to 22.6 MiB. Temp materializations now omit the
+physical `_id` array when a row group's IDs are contiguous, reconstructing IDs
+from `min_id` only in `.apex_tmp` files; this keeps mutable-table storage and
+DML paths on their established format. Lossless low-cardinality `Float64`
+dictionaries then reduce this workload to 9.5 MiB. The float encoding is used
+only for at least 32K rows when sampling shows useful repetition and its
+serialized size is below 70% of plain storage; high-cardinality data retains
+the original encoding. The fused range-filter aggregation evaluates each
+dictionary value once and scans compact row indices without materializing a
+full float vector. Nullable inputs and more complex SQL shapes deliberately
+fall back to the general executor.
 
 Blob storage has a focused Lance comparison harness:
 

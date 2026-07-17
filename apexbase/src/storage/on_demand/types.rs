@@ -1335,8 +1335,11 @@ impl ColumnData {
             }
             
             // Build dictionary: string -> dict_index
-            let mut dict_map: AHashMap<&[u8], u32> = AHashMap::with_capacity(1000);
-            let mut dict_offsets_new = vec![0u32];
+            let expected_unique = (row_count / 4).clamp(16, 16_384);
+            let mut dict_map: AHashMap<&[u8], u32> =
+                AHashMap::with_capacity(expected_unique);
+            let mut dict_offsets_new = Vec::with_capacity(expected_unique + 1);
+            dict_offsets_new.push(0u32);
             let mut dict_data_new = Vec::new();
             let mut row_indices = Vec::with_capacity(row_count);
             let mut next_dict_idx = 1u32; // 0 reserved for NULL
