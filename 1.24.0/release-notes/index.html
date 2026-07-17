@@ -1312,6 +1312,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v1240" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.24.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v1230" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1808,6 +1819,21 @@
 <h2 id="unreleased">Unreleased<a class="headerlink" href="#unreleased" title="Permanent link">&para;</a></h2>
 <ul>
 <li>No unreleased changes recorded yet. New features and fixes will be listed here before the next public release.</li>
+</ul>
+<hr />
+<h2 id="v1240"><a href="https://github.com/BirchKwok/ApexBase/releases/tag/v1.24.0">v1.24.0</a><a class="headerlink" href="#v1240" title="Permanent link">&para;</a></h2>
+<p><em>2026-07-17</em></p>
+<p><a href="https://github.com/BirchKwok/ApexBase/compare/v1.23.0...v1.24.0">Compare with v1.23.0</a></p>
+<ul>
+<li>Add streaming, fixed-size RecordBatch imports for CSV and Parquet temporary tables, preserving rows and schemas across batch boundaries while keeping large file materialization memory-efficient</li>
+<li>Add direct Parquet <code>COUNT(*)</code> execution and numeric range-filtered <code>GROUP BY</code> aggregate fast paths to avoid unnecessary row materialization on common analytical queries</li>
+<li>Improve mmap range scans, numeric range <code>LIMIT</code> caching, aggregate WAL handling, and on-demand read/write paths for lower allocation and faster repeated queries</li>
+<li>Compact medium-cardinality string dictionaries using capacity derived from expected unique values, reducing memory overhead during ingestion and temporary-table workloads</li>
+<li>Correct schema-only V4 table writes and strengthen Arrow conversion, DML, blob, and storage handling across empty and incrementally populated tables</li>
+<li>Add an out-of-core CSV/Parquet benchmark against DuckDB covering direct file analysis, disk-backed materialization, repeated queries, peak RSS, and storage size</li>
+<li>Refresh the public ApexBase/SQLite/DuckDB benchmark scoreboard and performance documentation, including updated OLAP, OLTP, and vector metric accounting</li>
+<li>Expand Python regression coverage for cross-batch CSV/Parquet imports, file table functions, temporary tables, numeric range caching, SQL execution, and benchmark profile consistency</li>
+<li>Update the Rust crate and Python package version metadata to 1.24.0</li>
 </ul>
 <hr />
 <h2 id="v1230"><a href="https://github.com/BirchKwok/ApexBase/releases/tag/v1.23.0">v1.23.0</a><a class="headerlink" href="#v1230" title="Permanent link">&para;</a></h2>
