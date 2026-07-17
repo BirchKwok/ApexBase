@@ -65,7 +65,7 @@ def _ensure_lance():
     import lance
     return lance
 
-__version__ = "1.23.0"
+__version__ = "1.24.0"
 
 
 class _InstanceRegistry:
