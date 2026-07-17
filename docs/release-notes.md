@@ -9,6 +9,23 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 
 ---
 
+## [v1.24.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.24.0)
+*2026-07-17*
+
+[Compare with v1.23.0](https://github.com/BirchKwok/ApexBase/compare/v1.23.0...v1.24.0)
+
+- Add streaming, fixed-size RecordBatch imports for CSV and Parquet temporary tables, preserving rows and schemas across batch boundaries while keeping large file materialization memory-efficient
+- Add direct Parquet `COUNT(*)` execution and numeric range-filtered `GROUP BY` aggregate fast paths to avoid unnecessary row materialization on common analytical queries
+- Improve mmap range scans, numeric range `LIMIT` caching, aggregate WAL handling, and on-demand read/write paths for lower allocation and faster repeated queries
+- Compact medium-cardinality string dictionaries using capacity derived from expected unique values, reducing memory overhead during ingestion and temporary-table workloads
+- Correct schema-only V4 table writes and strengthen Arrow conversion, DML, blob, and storage handling across empty and incrementally populated tables
+- Add an out-of-core CSV/Parquet benchmark against DuckDB covering direct file analysis, disk-backed materialization, repeated queries, peak RSS, and storage size
+- Refresh the public ApexBase/SQLite/DuckDB benchmark scoreboard and performance documentation, including updated OLAP, OLTP, and vector metric accounting
+- Expand Python regression coverage for cross-batch CSV/Parquet imports, file table functions, temporary tables, numeric range caching, SQL execution, and benchmark profile consistency
+- Update the Rust crate and Python package version metadata to 1.24.0
+
+---
+
 ## [v1.23.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.23.0)
 *2026-07-15*
 
