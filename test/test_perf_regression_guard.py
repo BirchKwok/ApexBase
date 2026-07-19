@@ -261,3 +261,17 @@ def test_submillisecond_sql_metrics_use_calibrated_median_timing(benchmark):
         assert specs[name][1:4] == [False, False, True]
         assert specs[name][4] is None
         assert method in benchmark.MICRO_MEDIAN_BENCHMARK_METHODS
+
+
+def test_setup_benchmark_uses_median_to_reject_outlier(benchmark, monkeypatch):
+    timestamps = iter((0.0, 0.001, 1.0, 1.002, 2.0, 2.100))
+    monkeypatch.setattr(benchmark.time, "perf_counter", lambda: next(timestamps))
+
+    elapsed_ms = benchmark.run_bench_with_setup(
+        lambda: None,
+        lambda: None,
+        warmup=0,
+        iterations=3,
+    )
+
+    assert elapsed_ms == pytest.approx(2.0)

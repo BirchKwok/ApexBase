@@ -487,7 +487,7 @@ def run_bench_gc_median(fn, warmup=2, iterations=5):
 
 
 def run_bench_with_setup(setup_fn, bench_fn, warmup=2, iterations=5):
-    """Per-iteration setup WITHOUT cold-start (no DB reopen). Times only bench_fn."""
+    """Per-iteration setup without DB reopen; return median bench_fn latency."""
     for _ in range(warmup):
         setup_fn()
         bench_fn()
@@ -497,7 +497,7 @@ def run_bench_with_setup(setup_fn, bench_fn, warmup=2, iterations=5):
         t0 = time.perf_counter()
         bench_fn()
         times.append((time.perf_counter() - t0) * 1000)
-    return sum(times) / len(times)
+    return statistics.median(times)
 
 
 def measure_rss_mb():
