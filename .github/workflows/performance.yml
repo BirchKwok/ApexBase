@@ -75,14 +75,25 @@ jobs:
           fi
           echo "sha=${base_sha}" >> "${GITHUB_OUTPUT}"
 
-      - name: Benchmark base commit
+      - name: Build base commit
         shell: bash
         run: |
           base_dir="${RUNNER_TEMP}/apexbase-base"
           git worktree add --detach "${base_dir}" "${{ steps.base.outputs.sha }}"
           cd "${base_dir}"
-          maturin develop --release
-          cd "${GITHUB_WORKSPACE}"
+          maturin build --release --out "${RUNNER_TEMP}/wheels/base"
+
+      - name: Build current commit
+        shell: bash
+        run: |
+          maturin build --release --out "${RUNNER_TEMP}/wheels/current"
+          sleep 30
+
+      - name: Benchmark base commit
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall --no-deps \
+            "${RUNNER_TEMP}/wheels/base/"*.whl
           APEXBASE_BENCHMARK_COMMIT="${{ steps.base.outputs.sha }}" \
           APEXBASE_BENCHMARK_BRANCH="pull-request-base" \
             python benchmarks/bench_perf_canary.py \
@@ -94,7 +105,8 @@ jobs:
       - name: Benchmark current commit
         shell: bash
         run: |
-          maturin develop --release
+          python -m pip install --force-reinstall --no-deps \
+            "${RUNNER_TEMP}/wheels/current/"*.whl
           python benchmarks/bench_perf_canary.py \
             --rows 200000 \
             --warmup 2 \
@@ -109,9 +121,8 @@ jobs:
       - name: Benchmark base commit again
         shell: bash
         run: |
-          cd "${RUNNER_TEMP}/apexbase-base"
-          maturin develop --release
-          cd "${GITHUB_WORKSPACE}"
+          python -m pip install --force-reinstall --no-deps \
+            "${RUNNER_TEMP}/wheels/base/"*.whl
           APEXBASE_BENCHMARK_COMMIT="${{ steps.base.outputs.sha }}" \
           APEXBASE_BENCHMARK_BRANCH="pull-request-base" \
             python benchmarks/bench_perf_canary.py \

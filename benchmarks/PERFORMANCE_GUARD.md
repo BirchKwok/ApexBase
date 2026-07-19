@@ -48,9 +48,10 @@ set; every sample must contain the same metrics and compatible configuration.
 
 `.github/workflows/performance.yml` runs the canary for pull requests. It builds
 the PR base commit and the proposed commit in release mode, benchmarks both on
-the same runner in symmetric base/current/current/base order, compares each
-commit's two-sample median, records the actual source commit in every JSON
-report, and uploads the reports. The scheduled full benchmark runs on a
+the same runner, lets build load settle, then installs the prebuilt wheels in
+symmetric base/current/current/base order. It compares each commit's two-sample
+median, records the actual source commit in every JSON report, and uploads the
+reports. The scheduled full benchmark runs on a
 dedicated Apple Silicon runner labelled `apexbase-performance`; a GitHub-hosted
 runner is not treated as a stable nightly performance machine.
 
