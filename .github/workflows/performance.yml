@@ -43,6 +43,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Create benchmark virtual environment
+        run: |
+          python -m venv "${RUNNER_TEMP}/apexbase-venv"
+          echo "VIRTUAL_ENV=${RUNNER_TEMP}/apexbase-venv" >> "${GITHUB_ENV}"
+          echo "${RUNNER_TEMP}/apexbase-venv/bin" >> "${GITHUB_PATH}"
+
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: performance-macos-arm64
@@ -127,6 +133,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Create benchmark virtual environment
+        run: |
+          python -m venv "${RUNNER_TEMP}/apexbase-venv"
+          echo "VIRTUAL_ENV=${RUNNER_TEMP}/apexbase-venv" >> "${GITHUB_ENV}"
+          echo "${RUNNER_TEMP}/apexbase-venv/bin" >> "${GITHUB_PATH}"
 
       - uses: Swatinem/rust-cache@v2
         with:
