@@ -1699,6 +1699,9 @@ impl TableStorageBackend {
         &self,
         column_names: Option<&[&str]>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
+        if self.has_delta() || self.has_pending_deltas() || self.pending_v4_in_memory_rows() > 0 {
+            return self.read_columns_to_arrow(column_names, 0, None);
+        }
         if let Ok(batch) = self.storage.to_arrow_batch_dict(
             column_names,
             column_names.map(|c| c.contains(&"_id")).unwrap_or(true),

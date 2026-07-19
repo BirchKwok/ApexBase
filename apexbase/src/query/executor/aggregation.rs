@@ -2671,6 +2671,7 @@ impl ApexExecutor {
 
     /// Check if we can use incremental aggregation (no DISTINCT, no complex expressions)
     fn can_use_incremental_aggregation(stmt: &SelectStatement) -> bool {
+        let mut aggregate_source: Option<&str> = None;
         for col in &stmt.columns {
             match col {
                 SelectColumn::Aggregate {
@@ -2688,6 +2689,19 @@ impl ApexExecutor {
                             if c != "*" && c != "1" {
                                 return false;
                             }
+                        }
+                    }
+                    if !matches!(func, crate::query::AggregateFunc::Count) {
+                        if let Some(column) = column {
+                            let source = column
+                                .trim_matches('"')
+                                .rsplit('.')
+                                .next()
+                                .unwrap_or(column);
+                            if aggregate_source.is_some_and(|existing| existing != source) {
+                                return false;
+                            }
+                            aggregate_source = Some(source);
                         }
                     }
                 }

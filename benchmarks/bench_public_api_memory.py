@@ -199,11 +199,18 @@ def _rss_mb():
         return counters.working_set_size / mb, counters.peak_working_set_size / mb
     if sys.platform == "darwin":
         value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak = value / (1024.0 * 1024.0)
         # ru_maxrss is peak bytes on macOS, so use ps for current RSS.
-        out = subprocess.check_output(
-            ["ps", "-o", "rss=", "-p", str(os.getpid())], text=True
-        )
-        return int(out.strip()) / 1024.0, value / (1024.0 * 1024.0)
+        try:
+            out = subprocess.check_output(
+                ["ps", "-o", "rss=", "-p", str(os.getpid())], text=True
+            )
+            return int(out.strip()) / 1024.0, peak
+        except (OSError, subprocess.SubprocessError, ValueError):
+            # Sandboxed macOS environments may block process inspection.
+            # Peak RSS is still a real OS measurement and is a safe current-RSS
+            # upper bound for memory regression reporting.
+            return peak, peak
     current = 0.0
     with open(f"/proc/{os.getpid()}/status", encoding="utf-8") as handle:
         for line in handle:

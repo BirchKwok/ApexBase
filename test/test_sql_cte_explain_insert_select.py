@@ -284,3 +284,59 @@ class TestCTE:
 
         assert get_col_values(result, 'senior_cnt') == [3]
         assert get_col_values(result, 'young_cnt') == [2]
+
+    def test_cte_pruning_preserves_aggregate_source_columns(self, db_with_data):
+        db_with_data.execute(
+            "CREATE TABLE IF NOT EXISTS cte_orders "
+            "(order_id INT, user_id INT, status TEXT, order_day INT)"
+        )
+        db_with_data.execute("TRUNCATE TABLE cte_orders")
+        db_with_data.execute(
+            "INSERT INTO cte_orders VALUES "
+            "(1, 10, 'paid', 1), (2, 10, 'paid', 2), (3, 20, 'paid', 3)"
+        )
+        db_with_data.execute(
+            "CREATE TABLE IF NOT EXISTS cte_payments "
+            "(order_id INT, paid_amount DOUBLE)"
+        )
+        db_with_data.execute("TRUNCATE TABLE cte_payments")
+        db_with_data.execute(
+            "INSERT INTO cte_payments VALUES (1, 100.0), (2, 50.0), (3, 80.0)"
+        )
+        db_with_data.execute(
+            "CREATE TABLE IF NOT EXISTS cte_items (order_id INT, qty INT)"
+        )
+        db_with_data.execute("TRUNCATE TABLE cte_items")
+        db_with_data.execute(
+            "INSERT INTO cte_items VALUES (1, 2), (1, 3), (3, 4)"
+        )
+
+        result = db_with_data.execute("""
+            WITH paid_orders AS (
+                SELECT o.order_id, o.user_id, o.order_day, p.paid_amount
+                FROM cte_orders o
+                JOIN cte_payments p ON o.order_id = p.order_id
+                WHERE o.status = 'paid'
+            ),
+            item_agg AS (
+                SELECT order_id, SUM(qty) AS item_count
+                FROM cte_items
+                GROUP BY order_id
+            )
+            SELECT
+                po.user_id,
+                COUNT(*) AS order_count,
+                SUM(po.paid_amount) AS gmv,
+                AVG(po.paid_amount) AS avg_paid,
+                MAX(po.order_day) AS last_order_day,
+                SUM(COALESCE(ia.item_count, 0)) AS total_items
+            FROM paid_orders po
+            LEFT JOIN item_agg ia ON po.order_id = ia.order_id
+            GROUP BY po.user_id
+            ORDER BY po.user_id
+        """)
+
+        assert get_rows(result) == [
+            [10, 2, 150.0, 75.0, 2, 5.0],
+            [20, 1, 80.0, 80.0, 3, 4.0],
+        ]

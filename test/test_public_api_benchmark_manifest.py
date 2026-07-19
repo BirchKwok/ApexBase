@@ -54,6 +54,20 @@ def test_benchmark_rss_is_available_on_current_platform():
     assert peak_mb >= current_mb
 
 
+def test_benchmark_rss_falls_back_when_process_inspection_is_blocked(monkeypatch):
+    benchmark = _load_benchmark_module()
+    if benchmark.sys.platform != "darwin":
+        return
+
+    def blocked(*args, **kwargs):
+        raise PermissionError("process inspection blocked")
+
+    monkeypatch.setattr(benchmark.subprocess, "check_output", blocked)
+    current_mb, peak_mb = benchmark._rss_mb()
+    assert current_mb > 0
+    assert current_mb == peak_mb
+
+
 def _rust_manifest():
     source = RUST_BENCHMARK.read_text(encoding="utf-8")
     body = re.search(

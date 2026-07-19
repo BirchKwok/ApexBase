@@ -257,6 +257,140 @@ def _simple_id_list(sql: str) -> Optional[List[int]]:
     return ids
 
 
+def _classify_sql_route(sql: str, sql_upper: Optional[str] = None):
+    """Classify one statement for Python-side locking and fast-path routing."""
+    if sql_upper is None:
+        sql_upper = sql.strip().upper()
+
+    trimmed = sql.strip().rstrip(';').strip()
+    count_star_match = None
+    simple_projection = _simple_projection_columns(sql)
+
+    if ';' in trimmed:
+        sig = 'multi'
+    elif (count_star_match := _RE_SIMPLE_COUNT_STAR.match(sql)):
+        sig = 'count_star'
+    elif (simple_projection
+            and sql_upper.startswith('SELECT')
+            and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
+            and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+            and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+            and ' NOT ' not in sql_upper and ' IN ' not in sql_upper
+            and ';' not in sql_upper):
+        sig = 'projected_point_lookup'
+    elif (simple_projection
+            and sql_upper.startswith('SELECT')
+            and _RE_SIMPLE_ID_IN.search(sql)
+            and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+            and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+            and ' NOT ' not in sql_upper
+            and ';' not in sql_upper):
+        sig = 'projected_batch_lookup'
+    elif (simple_projection
+            and sql_upper.startswith('SELECT')
+            and 'WHERE' not in sql_upper and 'LIMIT' not in sql_upper
+            and 'ORDER' not in sql_upper and 'GROUP' not in sql_upper
+            and 'JOIN' not in sql_upper and 'DISTINCT' not in sql_upper
+            and ';' not in sql_upper):
+        sig = 'projected_full_scan'
+    elif (simple_projection
+            and sql_upper.startswith('SELECT')
+            and 'LIMIT' in sql_upper
+            and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
+        sig = 'projected_scan_limit'
+    elif (simple_projection
+            and sql_upper.startswith('SELECT')
+            and 'WHERE' in sql_upper
+            and _RE_SIMPLE_STRING_EQ.search(sql)
+            and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+            and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
+            and ' LIKE ' not in sql_upper
+            and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+            and '>' not in sql_upper and '<' not in sql_upper):
+        sig = 'projected_string_filter'
+    elif (simple_projection
+            and sql_upper.startswith('SELECT')
+            and 'WHERE' in sql_upper
+            and _RE_SIMPLE_STRING_EQ_LIMIT.search(sql)
+            and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+            and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
+            and ' LIKE ' not in sql_upper
+            and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+            and '>' not in sql_upper and '<' not in sql_upper):
+        sig = 'projected_string_filter_limit'
+    elif (sql_upper.startswith('SELECT *')
+            and 'WHERE' in sql_upper
+            and _RE_SIMPLE_STRING_EQ_LIMIT.search(sql)
+            and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+            and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
+            and ' LIKE ' not in sql_upper
+            and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+            and '>' not in sql_upper and '<' not in sql_upper):
+        sig = 'string_filter_limit'
+    elif (sql_upper.startswith('SELECT *')
+            and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
+            and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+            and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+            and ' NOT ' not in sql_upper and ' IN ' not in sql_upper
+            and ';' not in sql_upper):
+        sig = 'point_lookup'
+    elif (sql_upper.startswith('SELECT *')
+            and 'WHERE _ID IN' in sql_upper
+            and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+            and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+            and ' NOT ' not in sql_upper
+            and ';' not in sql_upper):
+        sig = 'batch_lookup'
+    elif (sql_upper.startswith('SELECT *') and 'LIMIT' in sql_upper
+            and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
+        sig = 'scan_limit'
+    elif (sql_upper.startswith('SELECT')
+            and ('FROM READ_CSV(' in sql_upper
+                 or 'FROM READ_PARQUET(' in sql_upper
+                 or 'FROM READ_JSON(' in sql_upper)):
+        sig = 'table_func'
+    elif (sql_upper.startswith('BEGIN')
+          or sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;')
+          or sql_upper.startswith('SAVEPOINT')
+          or sql_upper.startswith('RELEASE')
+          or sql_upper.startswith('ROLLBACK TO')):
+        sig = 'transaction'
+    elif sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE',
+                               'ALTER', 'DROP', 'CREATE', 'COPY')):
+        sig = 'write'
+    elif sql_upper.startswith(('SET ', 'RESET ')):
+        sig = 'session'
+    elif (sql_upper.startswith('SELECT *') and ' LIKE ' in sql_upper
+            and 'WHERE' in sql_upper and 'NOT LIKE' not in sql_upper
+            and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+            and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+            and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+            and "'" in sql):
+        sig = 'like'
+    else:
+        sig = 'complex'
+
+    return sig, count_star_match, simple_projection
+
+
+def _sql_route_family(sig: str) -> str:
+    """Collapse Python fast-path detail into the cross-layer routing contract."""
+    if sig == 'write':
+        return 'write'
+    if sig in ('transaction', 'multi', 'session'):
+        return sig
+    return 'read'
+
+
 def _split_simple_insert_value_groups(values_text: str) -> Optional[List[str]]:
     groups = []
     start = None
@@ -2295,124 +2429,9 @@ class ApexClient:
                     pass  # fall through to the general SQL executor
 
         # ── Single-point classification (mirrors Rust QuerySignature) ──
-        _trimmed = sql.strip().rstrip(';').strip()
-        is_multi_stmt = ';' in _trimmed
-
-        # Classify query type ONCE — no duplicate pattern matching
-        _count_star_match = None
-        _simple_projection = _simple_projection_columns(sql)
-        if is_multi_stmt:
-            _sig = 'multi'
-        elif (_count_star_match := _RE_SIMPLE_COUNT_STAR.match(sql)):
-            _sig = 'count_star'
-        elif (_simple_projection
-                and sql_upper.startswith('SELECT')
-                and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
-                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
-                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
-                and ' NOT ' not in sql_upper and ' IN ' not in sql_upper
-                and ';' not in sql_upper):
-            _sig = 'projected_point_lookup'
-        elif (_simple_projection
-                and sql_upper.startswith('SELECT')
-                and _RE_SIMPLE_ID_IN.search(sql)
-                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
-                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
-                and ' NOT ' not in sql_upper
-                and ';' not in sql_upper):
-            _sig = 'projected_batch_lookup'
-        elif (_simple_projection
-                and sql_upper.startswith('SELECT')
-                and 'WHERE' not in sql_upper and 'LIMIT' not in sql_upper
-                and 'ORDER' not in sql_upper and 'GROUP' not in sql_upper
-                and 'JOIN' not in sql_upper and 'DISTINCT' not in sql_upper
-                and ';' not in sql_upper):
-            _sig = 'projected_full_scan'
-        elif (_simple_projection
-                and sql_upper.startswith('SELECT')
-                and 'LIMIT' in sql_upper
-                and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
-            _sig = 'projected_scan_limit'
-        elif (_simple_projection
-                and sql_upper.startswith('SELECT')
-                and 'WHERE' in sql_upper
-                and _RE_SIMPLE_STRING_EQ.search(sql)
-                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
-                and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
-                and ' LIKE ' not in sql_upper
-                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
-                and '>' not in sql_upper and '<' not in sql_upper):
-            _sig = 'projected_string_filter'
-        elif (_simple_projection
-                and sql_upper.startswith('SELECT')
-                and 'WHERE' in sql_upper
-                and _RE_SIMPLE_STRING_EQ_LIMIT.search(sql)
-                and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
-                and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
-                and ' LIKE ' not in sql_upper
-                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
-                and '>' not in sql_upper and '<' not in sql_upper):
-            _sig = 'projected_string_filter_limit'
-        elif (sql_upper.startswith('SELECT *')
-                and 'WHERE' in sql_upper
-                and _RE_SIMPLE_STRING_EQ_LIMIT.search(sql)
-                and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
-                and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
-                and ' LIKE ' not in sql_upper
-                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
-                and '>' not in sql_upper and '<' not in sql_upper):
-            _sig = 'string_filter_limit'
-        elif (sql_upper.startswith('SELECT *')
-                and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
-                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
-                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
-                and ' NOT ' not in sql_upper and ' IN ' not in sql_upper
-                and ';' not in sql_upper):
-            _sig = 'point_lookup'
-        elif (sql_upper.startswith('SELECT *')
-                and 'WHERE _ID IN' in sql_upper
-                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
-                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
-                and ' NOT ' not in sql_upper
-                and ';' not in sql_upper):
-            _sig = 'batch_lookup'
-        elif (sql_upper.startswith('SELECT *') and 'LIMIT' in sql_upper
-                and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
-            _sig = 'scan_limit'
-        elif (sql_upper.startswith('SELECT')
-                and ('FROM READ_CSV(' in sql_upper
-                     or 'FROM READ_PARQUET(' in sql_upper
-                     or 'FROM READ_JSON(' in sql_upper)):
-            _sig = 'table_func'
-        elif (sql_upper.startswith('BEGIN') or
-              sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;') or
-              sql_upper.startswith('SAVEPOINT') or
-              sql_upper.startswith('RELEASE') or
-              sql_upper.startswith('ROLLBACK TO')):
-            _sig = 'transaction'
-        elif sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE',
-                                    'ALTER', 'DROP', 'CREATE', 'COPY')):
-            _sig = 'write'
-        elif sql_upper.startswith(('SET ', 'RESET ')):
-            _sig = 'session'
-        elif (sql_upper.startswith('SELECT *') and ' LIKE ' in sql_upper
-                and 'WHERE' in sql_upper and 'NOT LIKE' not in sql_upper
-                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
-                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
-                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
-                and "'" in sql):
-            _sig = 'like'
-        else:
-            _sig = 'complex'
+        _sig, _count_star_match, _simple_projection = _classify_sql_route(
+            sql, sql_upper
+        )
 
         # ── Table selection check ──
         # Cross-db qualified refs (e.g. FROM default.users) don't need a selected table

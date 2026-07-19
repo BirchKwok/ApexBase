@@ -13,6 +13,7 @@ Usage:
 import argparse
 import csv as csv_mod
 import gc
+import importlib.metadata as importlib_metadata
 import json
 import math
 import os
@@ -22,6 +23,7 @@ import shutil
 import sqlite3
 import statistics
 import string
+import subprocess
 import sys
 import tempfile
 import time
@@ -140,6 +142,7 @@ VECTOR_SQLITE_NOTE = (
 PROFILE_PUBLIC = "public"
 PROFILE_EXTENDED = "extended"
 PROFILE_CHOICES = (PROFILE_PUBLIC, PROFILE_EXTENDED)
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_VECTOR_HEAD_TO_HEAD_METRICS = VECTOR_HEAD_TO_HEAD_METRICS
 PUBLIC_VECTOR_BATCH_METRICS = VECTOR_BATCH_METRICS
 PUBLIC_VECTOR_APEX_ONLY_METRICS = []
@@ -2984,7 +2987,8 @@ def print_benchmark_section(title, description, benchmark_specs, results, eng_na
         json_rows.append({
             "category": title,
             "query": bench_name,
-            **{k: round(v, 3) for k, v in values.items()},
+            # Preserve microsecond-scale OLTP timings for regression checks.
+            **{k: round(v, 6) for k, v in values.items()},
         })
 
     if "ApexBase" in eng_names:
@@ -3801,7 +3805,6 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, p
 
 
 def get_system_info():
-    ensure_optional_imports()
     info = {
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -3828,6 +3831,82 @@ def get_system_info():
     if HAS_PYARROW:
         info["pyarrow"] = pa.__version__
     return info
+
+
+def _command_output(*command, allow_empty=False):
+    """Return one tool-version command's output without making reports fragile."""
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    if result.returncode != 0:
+        return "unavailable"
+    output = result.stdout.strip()
+    return output if output or allow_empty else "unavailable"
+
+
+def _distribution_version(name):
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return "not-installed"
+
+
+def get_git_info():
+    commit = os.environ.get("APEXBASE_BENCHMARK_COMMIT")
+    if not commit:
+        commit = _command_output("git", "rev-parse", "HEAD")
+    if commit == "unavailable":
+        commit = os.environ.get("GITHUB_SHA", "unknown")
+    branch = os.environ.get("APEXBASE_BENCHMARK_BRANCH")
+    if not branch:
+        branch = _command_output("git", "rev-parse", "--abbrev-ref", "HEAD")
+    status = _command_output("git", "status", "--porcelain", allow_empty=True)
+    return {
+        "commit": commit,
+        "branch": branch,
+        "dirty": status not in ("", "unavailable"),
+    }
+
+
+def get_dependency_versions():
+    """Record every runtime dependency relevant to benchmark reproducibility."""
+    return {
+        "apexbase": _distribution_version("apexbase"),
+        "sqlite": sqlite3.sqlite_version,
+        "duckdb": _distribution_version("duckdb"),
+        "pyarrow": _distribution_version("pyarrow"),
+        "numpy": np.__version__,
+        "pandas": _distribution_version("pandas"),
+        "polars": _distribution_version("polars"),
+    }
+
+
+def get_build_versions():
+    return {
+        "maturin": _distribution_version("maturin"),
+        "rustc": _command_output("rustc", "--version", "--verbose"),
+        "cargo": _command_output("cargo", "--version"),
+    }
+
+
+def get_report_metadata(suite):
+    """Build the shared, JSON-safe provenance envelope for benchmark reports."""
+    return {
+        "format_version": 1,
+        "suite": suite,
+        "git": get_git_info(),
+        "system": get_system_info(),
+        "dependencies": get_dependency_versions(),
+        "build": get_build_versions(),
+    }
 
 
 def main(argv=None, default_profile=PROFILE_PUBLIC):
@@ -4399,7 +4478,7 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     # Save JSON if requested
     if args.output:
         output = {
-            "system": sys_info,
+            **get_report_metadata("apexbase-vs-sqlite-duckdb"),
             "config": {
                 "profile": profile,
                 "rows": N,
