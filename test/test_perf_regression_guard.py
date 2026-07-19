@@ -95,11 +95,13 @@ def test_missing_metric_is_an_error(guard):
 def test_symmetric_samples_are_aggregated_by_median(guard):
     baseline = guard.aggregate_report_metrics([
         _report({"scan": 10.0}),
-        _report({"scan": 14.0}),
+        _report({"scan": 12.0}),
+        _report({"scan": 100.0}),
     ])
     current = guard.aggregate_report_metrics([
-        _report({"scan": 12.5}),
         _report({"scan": 11.5}),
+        _report({"scan": 12.0}),
+        _report({"scan": 50.0}),
     ])
 
     rows = guard.compare_metric_sets(
