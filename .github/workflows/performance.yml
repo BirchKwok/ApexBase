@@ -89,7 +89,7 @@ jobs:
             --rows 200000 \
             --warmup 2 \
             --iterations 7 \
-            --output "${RUNNER_TEMP}/perf-base.json"
+            --output "${RUNNER_TEMP}/perf-base-1.json"
 
       - name: Benchmark current commit
         shell: bash
@@ -99,13 +99,34 @@ jobs:
             --rows 200000 \
             --warmup 2 \
             --iterations 7 \
-            --output "${RUNNER_TEMP}/perf-current.json"
+            --output "${RUNNER_TEMP}/perf-current-1.json"
+          python benchmarks/bench_perf_canary.py \
+            --rows 200000 \
+            --warmup 2 \
+            --iterations 7 \
+            --output "${RUNNER_TEMP}/perf-current-2.json"
+
+      - name: Benchmark base commit again
+        shell: bash
+        run: |
+          cd "${RUNNER_TEMP}/apexbase-base"
+          maturin develop --release
+          cd "${GITHUB_WORKSPACE}"
+          APEXBASE_BENCHMARK_COMMIT="${{ steps.base.outputs.sha }}" \
+          APEXBASE_BENCHMARK_BRANCH="pull-request-base" \
+            python benchmarks/bench_perf_canary.py \
+            --rows 200000 \
+            --warmup 2 \
+            --iterations 7 \
+            --output "${RUNNER_TEMP}/perf-base-2.json"
 
       - name: Compare ApexBase performance
         run: |
           python benchmarks/compare_perf_baseline.py \
-            "${RUNNER_TEMP}/perf-base.json" \
-            "${RUNNER_TEMP}/perf-current.json" \
+            "${RUNNER_TEMP}/perf-base-1.json" \
+            "${RUNNER_TEMP}/perf-current-1.json" \
+            --baseline-sample "${RUNNER_TEMP}/perf-base-2.json" \
+            --current-sample "${RUNNER_TEMP}/perf-current-2.json" \
             --relative-threshold 0.15 \
             --absolute-threshold-ms 0.005 \
             --require-system-match

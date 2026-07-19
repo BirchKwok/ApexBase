@@ -40,14 +40,19 @@ absolute tolerance. The absolute tolerance prevents ordinary timer noise from
 failing microsecond-scale metrics. Missing metrics and incompatible benchmark
 configurations are errors rather than silently skipped comparisons.
 
+On variable shared runners, pass additional samples with `--baseline-sample`
+and `--current-sample`. Each metric is compared using the median for its sample
+set; every sample must contain the same metrics and compatible configuration.
+
 ## Automation
 
 `.github/workflows/performance.yml` runs the canary for pull requests. It builds
 the PR base commit and the proposed commit in release mode, benchmarks both on
-the same runner with the current benchmark harness, records the actual source
-commit in each JSON report, and uploads both reports. The scheduled full benchmark
-runs on a dedicated Apple Silicon runner labelled `apexbase-performance`; a
-GitHub-hosted runner is not treated as a stable nightly performance machine.
+the same runner in symmetric base/current/current/base order, compares each
+commit's two-sample median, records the actual source commit in every JSON
+report, and uploads the reports. The scheduled full benchmark runs on a
+dedicated Apple Silicon runner labelled `apexbase-performance`; a GitHub-hosted
+runner is not treated as a stable nightly performance machine.
 
 ## Repeatable pytest runtime gate
 

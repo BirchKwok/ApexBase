@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 from pathlib import Path
 
@@ -81,9 +82,34 @@ def compatibility_errors(baseline, current, require_system_match=False):
     return errors
 
 
-def compare_reports(
-    baseline,
-    current,
+def aggregate_report_metrics(reports):
+    reports = list(reports)
+    if not reports:
+        raise ReportError("at least one benchmark report is required")
+
+    samples = [extract_apex_metrics(report) for report in reports]
+    expected = set(samples[0])
+    for index, sample in enumerate(samples[1:], start=2):
+        actual = set(sample)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            details = []
+            if missing:
+                details.append("missing " + ", ".join(missing))
+            if extra:
+                details.append("extra " + ", ".join(extra))
+            raise ReportError(f"sample {index} metric set differs: " + "; ".join(details))
+
+    return {
+        name: statistics.median(sample[name] for sample in samples)
+        for name in sorted(expected)
+    }
+
+
+def compare_metric_sets(
+    baseline_metrics,
+    current_metrics,
     relative_threshold=0.15,
     absolute_threshold_ms=0.005,
     metrics=None,
@@ -91,8 +117,6 @@ def compare_reports(
     if relative_threshold < 0 or absolute_threshold_ms < 0:
         raise ValueError("thresholds must be non-negative")
 
-    baseline_metrics = extract_apex_metrics(baseline)
-    current_metrics = extract_apex_metrics(current)
     selected = list(metrics) if metrics else sorted(baseline_metrics)
     missing = [name for name in selected if name not in baseline_metrics or name not in current_metrics]
     if missing:
@@ -115,25 +139,47 @@ def compare_reports(
     return comparisons
 
 
+def compare_reports(
+    baseline,
+    current,
+    relative_threshold=0.15,
+    absolute_threshold_ms=0.005,
+    metrics=None,
+):
+    return compare_metric_sets(
+        extract_apex_metrics(baseline),
+        extract_apex_metrics(current),
+        relative_threshold,
+        absolute_threshold_ms,
+        metrics,
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path)
     parser.add_argument("current", type=Path)
     parser.add_argument("--relative-threshold", type=float, default=0.15)
     parser.add_argument("--absolute-threshold-ms", type=float, default=0.005)
+    parser.add_argument("--baseline-sample", action="append", type=Path, default=[])
+    parser.add_argument("--current-sample", action="append", type=Path, default=[])
     parser.add_argument("--metric", action="append", dest="metrics")
     parser.add_argument("--require-system-match", action="store_true")
     args = parser.parse_args(argv)
 
     try:
-        baseline = load_report(args.baseline)
-        current = load_report(args.current)
-        errors = compatibility_errors(baseline, current, args.require_system_match)
-        if errors:
-            raise ReportError("incompatible reports: " + "; ".join(errors))
-        rows = compare_reports(
-            baseline,
-            current,
+        baseline_reports = [load_report(args.baseline)]
+        baseline_reports.extend(load_report(path) for path in args.baseline_sample)
+        current_reports = [load_report(args.current)]
+        current_reports.extend(load_report(path) for path in args.current_sample)
+        reference = baseline_reports[0]
+        for report in baseline_reports[1:] + current_reports:
+            errors = compatibility_errors(reference, report, args.require_system_match)
+            if errors:
+                raise ReportError("incompatible reports: " + "; ".join(errors))
+        rows = compare_metric_sets(
+            aggregate_report_metrics(baseline_reports),
+            aggregate_report_metrics(current_reports),
             args.relative_threshold,
             args.absolute_threshold_ms,
             args.metrics,

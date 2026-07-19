@@ -92,6 +92,36 @@ def test_missing_metric_is_an_error(guard):
         )
 
 
+def test_symmetric_samples_are_aggregated_by_median(guard):
+    baseline = guard.aggregate_report_metrics([
+        _report({"scan": 10.0}),
+        _report({"scan": 14.0}),
+    ])
+    current = guard.aggregate_report_metrics([
+        _report({"scan": 12.5}),
+        _report({"scan": 11.5}),
+    ])
+
+    rows = guard.compare_metric_sets(
+        baseline,
+        current,
+        relative_threshold=0.0,
+        absolute_threshold_ms=0.0,
+    )
+
+    assert baseline == {"scan": 12.0}
+    assert current == {"scan": 12.0}
+    assert rows[0]["regressed"] is False
+
+
+def test_sample_metric_mismatch_is_an_error(guard):
+    with pytest.raises(guard.ReportError, match="sample 2 metric set differs: missing insert"):
+        guard.aggregate_report_metrics([
+            _report({"scan": 10.0, "insert": 5.0}),
+            _report({"scan": 10.0}),
+        ])
+
+
 def test_incompatible_config_is_reported(guard):
     errors = guard.compatibility_errors(
         _report({"scan": 10.0}),
