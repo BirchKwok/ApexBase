@@ -24,14 +24,14 @@ concurrency:
 
 env:
   RUSTFLAGS: "-C target-cpu=native"
+  PERF_BASE_TARGET_DIR: ${{ github.workspace }}/target/performance/base
+  PERF_CURRENT_TARGET_DIR: ${{ github.workspace }}/target/performance/current
 
 jobs:
   canary:
     if: github.event_name != 'schedule'
     runs-on: macos-14
     timeout-minutes: 45
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance
     steps:
       - uses: actions/checkout@v4
         with:
@@ -81,12 +81,14 @@ jobs:
           base_dir="${RUNNER_TEMP}/apexbase-base"
           git worktree add --detach "${base_dir}" "${{ steps.base.outputs.sha }}"
           cd "${base_dir}"
-          maturin build --release --out "${RUNNER_TEMP}/wheels/base"
+          CARGO_TARGET_DIR="${PERF_BASE_TARGET_DIR}" \
+            maturin build --release --out "${RUNNER_TEMP}/wheels/base"
 
       - name: Build current commit
         shell: bash
         run: |
-          maturin build --release --out "${RUNNER_TEMP}/wheels/current"
+          CARGO_TARGET_DIR="${PERF_CURRENT_TARGET_DIR}" \
+            maturin build --release --out "${RUNNER_TEMP}/wheels/current"
           sleep 30
 
       - name: Benchmark base commit
@@ -173,8 +175,6 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: [self-hosted, macOS, ARM64, apexbase-performance]
     timeout-minutes: 90
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance
     steps:
       - uses: actions/checkout@v4
         with:
@@ -216,19 +216,45 @@ jobs:
           base_dir="${RUNNER_TEMP}/apexbase-base"
           git worktree add --detach "${base_dir}" "${base_sha}"
           cd "${base_dir}"
-          maturin develop --release
+          CARGO_TARGET_DIR="${PERF_BASE_TARGET_DIR}" maturin develop --release
           cd "${GITHUB_WORKSPACE}"
           APEXBASE_BENCHMARK_COMMIT="${base_sha}" \
           APEXBASE_BENCHMARK_BRANCH="nightly-base" \
             python benchmarks/bench_vs_sqlite_duckdb.py \
-            --output "${RUNNER_TEMP}/perf-base-full.json"
+            --output "${RUNNER_TEMP}/perf-base-full-1.json"
 
       - name: Benchmark current commit
         shell: bash
         run: |
-          maturin develop --release
+          CARGO_TARGET_DIR="${PERF_CURRENT_TARGET_DIR}" maturin develop --release
           python benchmarks/bench_vs_sqlite_duckdb.py \
-            --output "${RUNNER_TEMP}/perf-current-full.json"
+            --output "${RUNNER_TEMP}/perf-current-full-1.json"
+          python benchmarks/bench_vs_sqlite_duckdb.py \
+            --output "${RUNNER_TEMP}/perf-current-full-2.json"
+
+      - name: Benchmark previous commit again
+        shell: bash
+        run: |
+          base_sha="$(git rev-parse HEAD^)"
+          base_dir="${RUNNER_TEMP}/apexbase-base"
+          cd "${base_dir}"
+          CARGO_TARGET_DIR="${PERF_BASE_TARGET_DIR}" maturin develop --release
+          cd "${GITHUB_WORKSPACE}"
+          APEXBASE_BENCHMARK_COMMIT="${base_sha}" \
+          APEXBASE_BENCHMARK_BRANCH="nightly-base" \
+            python benchmarks/bench_vs_sqlite_duckdb.py \
+            --output "${RUNNER_TEMP}/perf-base-full-2.json"
+          APEXBASE_BENCHMARK_COMMIT="${base_sha}" \
+          APEXBASE_BENCHMARK_BRANCH="nightly-base" \
+            python benchmarks/bench_vs_sqlite_duckdb.py \
+            --output "${RUNNER_TEMP}/perf-base-full-3.json"
+
+      - name: Benchmark current commit again
+        shell: bash
+        run: |
+          CARGO_TARGET_DIR="${PERF_CURRENT_TARGET_DIR}" maturin develop --release
+          python benchmarks/bench_vs_sqlite_duckdb.py \
+            --output "${RUNNER_TEMP}/perf-current-full-3.json"
 
       - name: Verify repeatable pytest runtime
         run: |
@@ -242,8 +268,12 @@ jobs:
       - name: Compare full ApexBase performance
         run: |
           python benchmarks/compare_perf_baseline.py \
-            "${RUNNER_TEMP}/perf-base-full.json" \
-            "${RUNNER_TEMP}/perf-current-full.json" \
+            "${RUNNER_TEMP}/perf-base-full-1.json" \
+            "${RUNNER_TEMP}/perf-current-full-1.json" \
+            --baseline-sample "${RUNNER_TEMP}/perf-base-full-2.json" \
+            --baseline-sample "${RUNNER_TEMP}/perf-base-full-3.json" \
+            --current-sample "${RUNNER_TEMP}/perf-current-full-2.json" \
+            --current-sample "${RUNNER_TEMP}/perf-current-full-3.json" \
             --relative-threshold 0.15 \
             --absolute-threshold-ms 0.005 \
             --require-system-match
@@ -254,5 +284,5 @@ jobs:
         with:
           name: performance-full
           path: |
-            ${{ runner.temp }}/perf-*-full.json
+            ${{ runner.temp }}/perf-*-full-*.json
             ${{ runner.temp }}/pytest-runtime.json

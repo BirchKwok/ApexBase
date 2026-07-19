@@ -133,6 +133,29 @@ def test_incompatible_config_is_reported(guard):
     assert errors == ["config.rows differs"]
 
 
+def test_system_match_rejects_dependency_or_build_drift(guard):
+    baseline = _report({"scan": 10.0})
+    baseline.update({
+        "system": {"machine": "arm64"},
+        "dependencies": {"numpy": "2.1.3"},
+        "build": {"rustc": "1.88.0"},
+    })
+    current = _report({"scan": 10.0})
+    current.update({
+        "system": {"machine": "arm64"},
+        "dependencies": {"numpy": "2.4.3"},
+        "build": {"rustc": "1.89.0"},
+    })
+
+    errors = guard.compatibility_errors(
+        baseline,
+        current,
+        require_system_match=True,
+    )
+
+    assert errors == ["dependencies differs", "build differs"]
+
+
 def test_vector_metrics_are_included(guard):
     report = _report({"scan": 10.0})
     report["vector_similarity"] = {
@@ -207,3 +230,34 @@ def test_benchmark_git_metadata_honors_ci_source_override(benchmark, monkeypatch
 
     assert git["commit"] == commit
     assert git["branch"] == "pull-request-base"
+
+
+def test_performance_workflow_isolates_base_and_current_cargo_targets():
+    workflow = (ROOT / ".github" / "workflows" / "performance.yml").read_text()
+
+    assert workflow.count('CARGO_TARGET_DIR="${PERF_BASE_TARGET_DIR}"') == 3
+    assert workflow.count('CARGO_TARGET_DIR="${PERF_CURRENT_TARGET_DIR}"') == 3
+    assert "CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance\n" not in workflow
+
+
+def test_nightly_full_comparison_uses_symmetric_median_samples():
+    workflow = (ROOT / ".github" / "workflows" / "performance.yml").read_text()
+    nightly = workflow.split("  nightly-full:\n", 1)[1]
+
+    for side in ("base", "current"):
+        for sample in range(1, 4):
+            assert f'perf-{side}-full-{sample}.json' in nightly
+    assert nightly.count("--baseline-sample") == 2
+    assert nightly.count("--current-sample") == 2
+
+
+def test_submillisecond_sql_metrics_use_calibrated_median_timing(benchmark):
+    specs = {name: spec for name, *spec in benchmark.BENCHMARKS}
+
+    for name, method in (
+        ("COUNT WHERE category", "bench_count_where_category"),
+        ("Point Lookup (SQL by ID)", "bench_point_lookup"),
+    ):
+        assert specs[name][1:4] == [False, False, True]
+        assert specs[name][4] is None
+        assert method in benchmark.MICRO_MEDIAN_BENCHMARK_METHODS

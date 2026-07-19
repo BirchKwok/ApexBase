@@ -2351,9 +2351,9 @@ BENCHMARKS = [
     ("Aggregation (5 funcs)",            "bench_aggregation",      False, False, False, None),
     ("Filtered aggregation (category)",  "bench_filtered_aggregation", False, False, False, None),
     ("Filtered aggregation (city)",      "bench_filtered_aggregation_city", False, False, False, None),
-    ("COUNT WHERE category",             "bench_count_where_category", False, False, False, None),
+    ("COUNT WHERE category",             "bench_count_where_category", False, False, True,  None),
     ("Complex (Filter+Group+Order)",     "bench_complex",          False, False, False, None),
-    ("Point Lookup (SQL by ID)",         "bench_point_lookup",     False, False, False, None),
+    ("Point Lookup (SQL by ID)",         "bench_point_lookup",     False, False, True,  None),
     ("Retrieve Many (SQL, 100 IDs)",     "bench_retrieve_many",    False, False, False, None),
     # --- New cases ---
     ("SELECT * -> pandas (full scan)",   "bench_full_scan_pandas", False, False, False, None),
@@ -2698,7 +2698,11 @@ OLTP_DEFAULT_BENCHMARKS = [
 MICRO_MEDIAN_BENCHMARK_METHODS = {
     method_name for _, method_name in OLTP_DEFAULT_BENCHMARKS
 }
-MICRO_MEDIAN_BENCHMARK_METHODS.add("bench_temp_csv_create_query")
+MICRO_MEDIAN_BENCHMARK_METHODS.update({
+    "bench_count_where_category",
+    "bench_point_lookup",
+    "bench_temp_csv_create_query",
+})
 
 OLTP_APEX_DIAGNOSTIC_BENCHMARKS = [
     ("Insert 10 rows (small-batch API diagnostic)", "bench_oltp_insert_10_rows"),
