@@ -31,7 +31,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 45
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/apexbase-target
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,7 +116,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, apexbase-performance]
     timeout-minutes: 90
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/apexbase-target
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance
     steps:
       - uses: actions/checkout@v4
         with:
