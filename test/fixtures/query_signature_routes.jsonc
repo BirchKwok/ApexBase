@@ -1,0 +1,120 @@
+{
+  "format_version": 1,
+  "description": "Shared SQL routing corpus for the Python and Rust query classifiers.",
+  "cases": [
+    {
+      "id": "count-star",
+      "sql": "SELECT COUNT(*) FROM t",
+      "python_route": "count_star",
+      "route_family": "read"
+    },
+    {
+      "id": "projected-point-lookup",
+      "sql": "SELECT name FROM t WHERE _id = 1",
+      "python_route": "projected_point_lookup",
+      "route_family": "read"
+    },
+    {
+      "id": "projected-batch-lookup",
+      "sql": "SELECT name FROM t WHERE _id IN (1, 2)",
+      "python_route": "projected_batch_lookup",
+      "route_family": "read"
+    },
+    {
+      "id": "projected-full-scan",
+      "sql": "SELECT name, score FROM t",
+      "python_route": "projected_full_scan",
+      "route_family": "read"
+    },
+    {
+      "id": "projected-scan-limit",
+      "sql": "SELECT name, score FROM t LIMIT 2",
+      "python_route": "projected_scan_limit",
+      "route_family": "read"
+    },
+    {
+      "id": "projected-string-filter",
+      "sql": "SELECT name FROM t WHERE city = 'BJ'",
+      "python_route": "projected_string_filter",
+      "route_family": "read"
+    },
+    {
+      "id": "projected-string-filter-limit",
+      "sql": "SELECT name FROM t WHERE city = 'BJ' LIMIT 2",
+      "python_route": "projected_string_filter_limit",
+      "route_family": "read"
+    },
+    {
+      "id": "string-filter-limit",
+      "sql": "SELECT * FROM t WHERE city = 'BJ' LIMIT 2",
+      "python_route": "string_filter_limit",
+      "route_family": "read"
+    },
+    {
+      "id": "point-lookup",
+      "sql": "SELECT * FROM t WHERE _id = 1",
+      "python_route": "point_lookup",
+      "route_family": "read"
+    },
+    {
+      "id": "batch-lookup",
+      "sql": "SELECT * FROM t WHERE _id IN (1, 2)",
+      "python_route": "batch_lookup",
+      "route_family": "read"
+    },
+    {
+      "id": "scan-limit",
+      "sql": "SELECT * FROM t LIMIT 2",
+      "python_route": "scan_limit",
+      "route_family": "read"
+    },
+    {
+      "id": "table-function",
+      "sql": "SELECT * FROM read_csv('/tmp/data.csv')",
+      "python_route": "table_func",
+      "route_family": "read"
+    },
+    {
+      "id": "transaction",
+      "sql": "BEGIN",
+      "python_route": "transaction",
+      "route_family": "transaction"
+    },
+    {
+      "id": "dml-write",
+      "sql": "INSERT INTO t VALUES (1)",
+      "python_route": "write",
+      "route_family": "write"
+    },
+    {
+      "id": "ddl-write",
+      "sql": "CREATE TABLE t (value INT)",
+      "python_route": "write",
+      "route_family": "write"
+    },
+    {
+      "id": "session-command",
+      "sql": "SET timezone = 'UTC'",
+      "python_route": "session",
+      "route_family": "session"
+    },
+    {
+      "id": "like-filter",
+      "sql": "SELECT * FROM t WHERE name LIKE 'a%'",
+      "python_route": "like",
+      "route_family": "read"
+    },
+    {
+      "id": "complex-read",
+      "sql": "SELECT name, SUM(score) FROM t GROUP BY name",
+      "python_route": "complex",
+      "route_family": "read"
+    },
+    {
+      "id": "multi-statement",
+      "sql": "INSERT INTO t VALUES (1); SELECT * FROM t",
+      "python_route": "multi",
+      "route_family": "multi"
+    }
+  ]
+}

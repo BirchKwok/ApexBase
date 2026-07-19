@@ -397,6 +397,32 @@ class TestBasicSQLExecute:
 
             client.close()
 
+    def test_execute_numeric_group_by_multiple_sum_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("metrics")
+            client.store([
+                {"group_id": 1, "amount": 1, "quantity": 10},
+                {"group_id": 1, "amount": 2, "quantity": 20},
+                {"group_id": 2, "amount": 4, "quantity": 7},
+            ])
+
+            result = client.execute("""
+                SELECT
+                    group_id,
+                    SUM(amount) AS total_amount,
+                    SUM(quantity) AS total_quantity
+                FROM metrics
+                GROUP BY group_id
+                ORDER BY group_id
+            """)
+
+            assert result.to_dict() == [
+                {"group_id": 1, "total_amount": 3, "total_quantity": 30},
+                {"group_id": 2, "total_amount": 4, "total_quantity": 7},
+            ]
+            client.close()
+
     def test_execute_join_group_by_count_col(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)

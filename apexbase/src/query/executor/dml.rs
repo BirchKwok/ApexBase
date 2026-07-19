@@ -179,10 +179,11 @@ impl ApexExecutor {
             }
         }
 
-        // Invalidate StorageEngine cache for all affected tables
+        // Invalidate read caches for all affected tables.
         let engine = crate::storage::engine::engine();
         for table_path in &affected_tables {
             engine.invalidate(table_path);
+            crate::storage::backend::invalidate_global_dict_cache(table_path);
         }
 
         Ok(ApexResult::Scalar(applied))

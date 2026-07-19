@@ -1063,6 +1063,23 @@ impl ApexExecutor {
                         unqualified_requires_all,
                     );
                 }
+                SelectColumn::Aggregate {
+                    column: Some(column),
+                    ..
+                } if column != "*"
+                    && !column
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_digit()) =>
+                {
+                    Self::collect_cte_column_ref(
+                        column,
+                        aliases,
+                        columns,
+                        requires_all,
+                        unqualified_requires_all,
+                    );
+                }
                 SelectColumn::Expression { expr, .. } => {
                     Self::collect_cte_columns_in_expr(
                         expr,

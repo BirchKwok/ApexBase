@@ -2778,6 +2778,19 @@ impl ApexStorageImpl {
         }
     }
 
+    /// Private classifier observability for Python/Rust routing contract tests.
+    fn _query_route_family(&self, sql: &str) -> &'static str {
+        use crate::query::query_signature::{self, QuerySignature};
+
+        match query_signature::classify(sql) {
+            QuerySignature::DmlWrite | QuerySignature::Ddl { .. } => "write",
+            QuerySignature::Transaction => "transaction",
+            QuerySignature::MultiStatement => "multi",
+            QuerySignature::SessionCommand => "session",
+            _ => "read",
+        }
+    }
+
     /// Execute SQL query.
     ///
     /// Uses `QuerySignature::classify()` for single-point dispatch — no duplicate
@@ -6410,6 +6423,9 @@ impl ApexStorageImpl {
         if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
             if let Ok(Some(batch_cols)) = backend.storage.retrieve_many_mmap_columns(&sorted_ids) {
                 let row_count = batch_cols.row_count;
+                if row_count != sorted_ids.len() {
+                    return Ok(None);
+                }
                 let Some(columns_dict) =
                     mmap_batch_columns_to_pydict(py, batch_cols, Some(&columns))?
                 else {
@@ -6425,6 +6441,7 @@ impl ApexStorageImpl {
         let mut col_values: Vec<Vec<PyObject>> = (0..columns.len())
             .map(|_| Vec::with_capacity(sorted_ids.len()))
             .collect();
+        let expected_rows = sorted_ids.len();
         let mut matched_rows = 0usize;
 
         for id in sorted_ids {
@@ -6450,6 +6467,10 @@ impl ApexStorageImpl {
                 col_values[idx].push(value);
             }
             matched_rows += 1;
+        }
+
+        if matched_rows != expected_rows {
+            return Ok(None);
         }
 
         let columns_dict = PyDict::new_bound(py);
@@ -6513,12 +6534,14 @@ impl ApexStorageImpl {
 
             if let Some(batch_cols) = batch_cols_opt {
                 let row_count = batch_cols.row_count;
-                let columns_dict = mmap_batch_columns_to_pydict(py, batch_cols, None)?
-                    .unwrap_or_else(|| PyDict::new_bound(py));
-                let out = PyDict::new_bound(py);
-                out.set_item("columns_dict", columns_dict)?;
-                out.set_item("rows_affected", row_count as i64)?;
-                return Ok(out.into());
+                if row_count == ids_u64.len() {
+                    let columns_dict = mmap_batch_columns_to_pydict(py, batch_cols, None)?
+                        .unwrap_or_else(|| PyDict::new_bound(py));
+                    let out = PyDict::new_bound(py);
+                    out.set_item("columns_dict", columns_dict)?;
+                    out.set_item("rows_affected", row_count as i64)?;
+                    return Ok(out.into());
+                }
             }
 
             // Fallback: per-row retrieve_rcix (non-RCIX RGs)
@@ -6527,6 +6550,23 @@ impl ApexStorageImpl {
                 if let Ok(Some(row)) = backend.storage.retrieve_rcix(id) {
                     all_rows.push(row);
                 }
+            }
+
+            if all_rows.len() != ids_u64.len() {
+                let batch = py
+                    .allow_threads(|| backend.read_rows_by_ids_to_arrow(&ids_u64))
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let columns_dict = PyDict::new_bound(py);
+                let schema = batch.schema();
+                for col_idx in 0..batch.num_columns() {
+                    let col_name = schema.field(col_idx).name();
+                    let col_list = arrow_col_to_pylist(py, batch.column(col_idx))?;
+                    columns_dict.set_item(col_name, col_list)?;
+                }
+                let out = PyDict::new_bound(py);
+                out.set_item("columns_dict", columns_dict)?;
+                out.set_item("rows_affected", batch.num_rows() as i64)?;
+                return Ok(out.into());
             }
 
             if all_rows.is_empty() {
