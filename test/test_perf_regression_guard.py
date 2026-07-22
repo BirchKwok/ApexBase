@@ -232,23 +232,16 @@ def test_benchmark_git_metadata_honors_ci_source_override(benchmark, monkeypatch
     assert git["branch"] == "pull-request-base"
 
 
-def test_performance_workflow_isolates_base_and_current_cargo_targets():
-    workflow = (ROOT / ".github" / "workflows" / "performance.yml").read_text()
-
-    assert workflow.count('CARGO_TARGET_DIR="${PERF_BASE_TARGET_DIR}"') == 3
-    assert workflow.count('CARGO_TARGET_DIR="${PERF_CURRENT_TARGET_DIR}"') == 3
-    assert "CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance\n" not in workflow
+def test_performance_workflow_is_not_used_as_an_acceptance_gate():
+    assert not (ROOT / ".github" / "workflows" / "performance.yml").exists()
 
 
-def test_nightly_full_comparison_uses_symmetric_median_samples():
-    workflow = (ROOT / ".github" / "workflows" / "performance.yml").read_text()
-    nightly = workflow.split("  nightly-full:\n", 1)[1]
+def test_github_workflows_do_not_run_local_performance_benchmarks():
+    workflows = ROOT / ".github" / "workflows"
+    sources = "\n".join(path.read_text() for path in workflows.glob("*.yml"))
 
-    for side in ("base", "current"):
-        for sample in range(1, 4):
-            assert f'perf-{side}-full-{sample}.json' in nightly
-    assert nightly.count("--baseline-sample") == 2
-    assert nightly.count("--current-sample") == 2
+    assert "bench_perf_canary.py" not in sources
+    assert "run_local_perf_guard.py" not in sources
 
 
 def test_submillisecond_sql_metrics_use_calibrated_median_timing(benchmark):

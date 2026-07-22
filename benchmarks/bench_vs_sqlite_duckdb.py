@@ -3872,11 +3872,16 @@ def get_git_info():
     branch = os.environ.get("APEXBASE_BENCHMARK_BRANCH")
     if not branch:
         branch = _command_output("git", "rev-parse", "--abbrev-ref", "HEAD")
-    status = _command_output("git", "status", "--porcelain", allow_empty=True)
+    dirty_override = os.environ.get("APEXBASE_BENCHMARK_DIRTY")
+    if dirty_override is None:
+        status = _command_output("git", "status", "--porcelain", allow_empty=True)
+        dirty = status not in ("", "unavailable")
+    else:
+        dirty = dirty_override == "1"
     return {
         "commit": commit,
         "branch": branch,
-        "dirty": status not in ("", "unavailable"),
+        "dirty": dirty,
     }
 
 
