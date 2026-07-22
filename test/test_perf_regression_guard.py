@@ -133,6 +133,29 @@ def test_incompatible_config_is_reported(guard):
     assert errors == ["config.rows differs"]
 
 
+def test_system_match_rejects_dependency_or_build_drift(guard):
+    baseline = _report({"scan": 10.0})
+    baseline.update({
+        "system": {"machine": "arm64"},
+        "dependencies": {"numpy": "2.1.3"},
+        "build": {"rustc": "1.88.0"},
+    })
+    current = _report({"scan": 10.0})
+    current.update({
+        "system": {"machine": "arm64"},
+        "dependencies": {"numpy": "2.4.3"},
+        "build": {"rustc": "1.89.0"},
+    })
+
+    errors = guard.compatibility_errors(
+        baseline,
+        current,
+        require_system_match=True,
+    )
+
+    assert errors == ["dependencies differs", "build differs"]
+
+
 def test_vector_metrics_are_included(guard):
     report = _report({"scan": 10.0})
     report["vector_similarity"] = {
@@ -207,3 +230,41 @@ def test_benchmark_git_metadata_honors_ci_source_override(benchmark, monkeypatch
 
     assert git["commit"] == commit
     assert git["branch"] == "pull-request-base"
+
+
+def test_performance_workflow_is_not_used_as_an_acceptance_gate():
+    assert not (ROOT / ".github" / "workflows" / "performance.yml").exists()
+
+
+def test_github_workflows_do_not_run_local_performance_benchmarks():
+    workflows = ROOT / ".github" / "workflows"
+    sources = "\n".join(path.read_text() for path in workflows.glob("*.yml"))
+
+    assert "bench_perf_canary.py" not in sources
+    assert "run_local_perf_guard.py" not in sources
+
+
+def test_submillisecond_sql_metrics_use_calibrated_median_timing(benchmark):
+    specs = {name: spec for name, *spec in benchmark.BENCHMARKS}
+
+    for name, method in (
+        ("COUNT WHERE category", "bench_count_where_category"),
+        ("Point Lookup (SQL by ID)", "bench_point_lookup"),
+    ):
+        assert specs[name][1:4] == [False, False, True]
+        assert specs[name][4] is None
+        assert method in benchmark.MICRO_MEDIAN_BENCHMARK_METHODS
+
+
+def test_setup_benchmark_uses_median_to_reject_outlier(benchmark, monkeypatch):
+    timestamps = iter((0.0, 0.001, 1.0, 1.002, 2.0, 2.100))
+    monkeypatch.setattr(benchmark.time, "perf_counter", lambda: next(timestamps))
+
+    elapsed_ms = benchmark.run_bench_with_setup(
+        lambda: None,
+        lambda: None,
+        warmup=0,
+        iterations=3,
+    )
+
+    assert elapsed_ms == pytest.approx(2.0)

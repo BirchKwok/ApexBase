@@ -79,6 +79,9 @@ def compatibility_errors(baseline, current, require_system_match=False):
         for key in SYSTEM_KEYS:
             if base_system.get(key) != current_system.get(key):
                 errors.append(f"system.{key} differs")
+        for section in ("dependencies", "build"):
+            if (baseline.get(section) or {}) != (current.get(section) or {}):
+                errors.append(f"{section} differs")
     return errors
 
 

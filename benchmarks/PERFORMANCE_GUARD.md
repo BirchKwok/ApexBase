@@ -44,20 +44,89 @@ On variable shared runners, pass additional samples with `--baseline-sample`
 and `--current-sample`. Each metric is compared using the median for its sample
 set; every sample must contain the same metrics and compatible configuration.
 
-## Automation
+## Local same-machine base/current guard
 
-`.github/workflows/performance.yml` runs the canary for pull requests. It builds
-the PR base commit and the proposed commit in release mode, benchmarks both on
-the same runner, lets build load settle, then installs the prebuilt wheels in
-balanced base/current/current/base/base/current order. It compares each commit's
-three-sample median, records the actual source commit in every JSON report, and
-uploads the reports. The scheduled full benchmark runs on a
-dedicated Apple Silicon runner labelled `apexbase-performance`; a GitHub-hosted
-runner is not treated as a stable nightly performance machine.
+GitHub is not required to detect regressions. The local runner builds the base
+revision and the current workspace as separate release wheels, installs both in
+one temporary Python environment, and samples them in balanced
+base/current/current/base/base/current order. The existing report comparator
+then compares the median of three samples per side. If that comparison reports
+a performance regression, the runner automatically collects two more samples
+per side in current/base/base/current order and makes the final decision from
+the five-sample medians. Configuration or metadata incompatibility still fails
+immediately instead of being retried.
+
+Both revisions are built from temporary Git worktrees. Tracked and untracked
+current workspace files are copied into the current worktree, and the current
+build starts from the lockfile generated for the base build. This prevents an
+ignored, machine-local `Cargo.lock` from creating accidental dependency drift.
+Cargo artifacts remain isolated between base and current while their target
+directories are reused across invocations to keep later release builds
+incremental.
+
+Before running it, activate the Python environment normally used to develop
+ApexBase. It must provide `maturin` and the benchmark dependencies from
+`pyproject.toml`; the temporary benchmark environment inherits those exact
+packages. Use a quiet machine, connect AC power, close CPU-heavy applications,
+and keep the same power and thermal settings for both revisions.
+
+For the 15-metric development canary:
+
+```bash
+python benchmarks/run_local_perf_guard.py --base-ref origin/main
+```
+
+The current side is built from the current workspace, including local source
+changes. `--base-ref` may be any local Git commit, branch, or tag. Fetch the
+remote first if `origin/main` must reflect its latest state.
+
+For the complete 78-metric suite:
+
+```bash
+python benchmarks/run_local_perf_guard.py \
+  --base-ref origin/main \
+  --mode full
+```
+
+The full mode is intentionally expensive: it performs six complete benchmark
+runs in addition to two release builds. The canary is the normal edit-time
+check; use full mode for final performance acceptance.
+
+By default, reports are written under
+`local-perf-results/<timestamp>/`. A custom directory must not already exist:
+
+```bash
+python benchmarks/run_local_perf_guard.py \
+  --base-ref HEAD^ \
+  --output-dir /tmp/apexbase-perf-check
+```
+
+Useful options are:
+
+- `--relative-threshold 0.15`: allow at most 15% relative slowdown.
+- `--absolute-threshold-ms 0.005`: tolerate up to 0.005 ms of timer noise.
+- `--settle-seconds 30`: wait after compilation before sampling.
+- `--rows`, `--warmup`, and `--iterations`: override the selected mode's
+  defaults. Use identical values for every baseline comparison series.
+
+A metric fails only when it exceeds both the relative and absolute tolerance.
+Exit status 0 means the gate passed; status 1 means at least one metric
+regressed; status 2 means the reports were incompatible or incomplete. The
+output directory normally keeps six JSON reports and `comparison.txt`. A
+confirmation run keeps ten JSON reports, the first decision in
+`comparison-initial.txt`, and the final five-sample decision in
+`comparison.txt`.
+
+This local guard is the required same-machine performance evidence. The
+repository intentionally does not run performance comparisons in GitHub
+Actions: hosted runners are not stable acceptance machines, while routing the
+workflow back to the development Mac would only duplicate this local guard.
+Keep the generated reports under `local-perf-results/` as the performance
+record for each accepted change.
 
 ## Repeatable pytest runtime gate
 
-The dedicated nightly runner also measures the complete, serial pytest suite
+The local acceptance process also measures the complete, serial pytest suite
 five times:
 
 ```bash
