@@ -34,7 +34,7 @@ fn invalid(msg: impl Into<String>) -> Status {
 fn execute_sql(sql: &str, base_dir: &PathBuf) -> Result<arrow::record_batch::RecordBatch, Status> {
     let default_table_path = base_dir.join("apexbase.apex");
     crate::query::executor::set_query_root_dir(base_dir);
-    let result = ApexExecutor::execute_with_base_dir(sql, base_dir, &default_table_path);
+    let result = crate::Database::execute(sql, base_dir, &default_table_path);
     crate::query::executor::clear_query_root_dir();
     result
         .map_err(apex_err)?

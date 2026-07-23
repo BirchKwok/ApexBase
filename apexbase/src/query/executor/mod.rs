@@ -346,6 +346,7 @@ const MAX_CACHE_ENTRIES: usize = 64; // Limit cache to 64 tables
 type CacheEntry = (
     Arc<TableStorageBackend>,
     std::time::SystemTime,
+    u64,
     Arc<AtomicU64>,
 );
 // DashMap provides fine-grained locking - concurrent reads don't block each other
@@ -453,7 +454,7 @@ fn evict_lru_cache_entries() {
     let mut access_times: Vec<(PathBuf, u64)> = STORAGE_CACHE
         .iter()
         .map(|entry| {
-            let (path, (_, _, access)) = entry.pair();
+            let (path, (_, _, _, access)) = entry.pair();
             (path.clone(), access.load(Ordering::Relaxed))
         })
         .collect();
@@ -785,7 +786,8 @@ fn refresh_storage_cache_signature(path: &Path) {
     if let Some(mut entry) = STORAGE_CACHE.get_mut(path) {
         let value = entry.value_mut();
         value.1 = storage_effective_modified(path);
-        value.2.store(now_nanos(), Ordering::Relaxed);
+        value.2 = crate::storage::epoch::current(path);
+        value.3.store(now_nanos(), Ordering::Relaxed);
     }
 }
 
@@ -803,7 +805,12 @@ pub fn cache_backend_pub(path: &Path, backend: Arc<TableStorageBackend>) {
 
     STORAGE_CACHE.insert(
         path.to_path_buf(),
-        (backend, modified, Arc::new(AtomicU64::new(now_nanos()))),
+        (
+            backend,
+            modified,
+            crate::storage::epoch::current(path),
+            Arc::new(AtomicU64::new(now_nanos())),
+        ),
     );
 }
 
@@ -845,8 +852,10 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
             let pair = entry.pair();
             let value = pair.1;
-            let last_access = &value.2;
-            if nanos_elapsed(last_access.load(Ordering::Relaxed)) < 500_000_000 {
+            let last_access = &value.3;
+            if value.2 == crate::storage::epoch::current(path)
+                && nanos_elapsed(last_access.load(Ordering::Relaxed)) < 500_000_000
+            {
                 let backend = Arc::clone(&value.0);
                 // Refresh last_access atomically — no write lock needed
                 last_access.store(now_nanos(), Ordering::Relaxed);
@@ -889,8 +898,8 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         let pair = entry.pair();
         let value = pair.1;
         let cached_time = value.1;
-        let last_access = &value.2;
-        if cached_time >= effective_modified {
+        let last_access = &value.3;
+        if value.2 == crate::storage::epoch::current(path) && cached_time >= effective_modified {
             let backend = Arc::clone(&value.0);
             last_access.store(now_nanos(), Ordering::Relaxed);
             return Ok(backend);
@@ -907,7 +916,7 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
                 // return stale cached backend if available.
                 if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
                     let pair = entry.pair();
-                    pair.1 .2.store(now_nanos(), Ordering::Relaxed);
+                    pair.1 .3.store(now_nanos(), Ordering::Relaxed);
                     return Ok(Arc::clone(&pair.1 .0));
                 }
                 // No cached backend — retry after a brief sleep (write should finish quickly)
@@ -929,6 +938,7 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         (
             Arc::clone(&backend),
             effective_modified,
+            crate::storage::epoch::current(path),
             Arc::new(AtomicU64::new(now_nanos())),
         ),
     );

@@ -104,7 +104,9 @@ impl OnDemandStorage {
         let schema = self.schema.read();
         let schema_len = schema.column_count();
         if schema_len == 0 || values.len() != schema_len {
-            return Err(err_input("schema-stable insert requires exact schema values"));
+            return Err(err_input(
+                "schema-stable insert requires exact schema values",
+            ));
         }
 
         for (idx, value) in values.iter().enumerate() {
@@ -165,7 +167,9 @@ impl OnDemandStorage {
                         columns[idx].push_f64(*v)
                     }
                     (ColumnType::String, SchemaStableValue::Str(v)) => columns[idx].push_string(v),
-                    (ColumnType::Binary, SchemaStableValue::Binary(v)) => columns[idx].push_bytes(v),
+                    (ColumnType::Binary, SchemaStableValue::Binary(v)) => {
+                        columns[idx].push_bytes(v)
+                    }
                     _ => unreachable!("validated schema-stable insert value"),
                 }
             }
@@ -234,15 +238,10 @@ impl OnDemandStorage {
                         };
                         let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
                         let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
-                        let id_encoding =
-                            rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
-                        if let Some(id) = rg_id_at(
-                            body,
-                            end - start,
-                            rg_meta.min_id,
-                            id_encoding,
-                            local,
-                        ) {
+                        let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
+                        if let Some(id) =
+                            rg_id_at(body, end - start, rg_meta.min_id, id_encoding, local)
+                        {
                             result.push(id);
                             found = true;
                         }
@@ -1573,10 +1572,9 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (8 + local_idx * 8) as u64, &mut v)?;
                     Value::Float64(f64::from_le_bytes(v))
                 }
-                (
-                    COL_ENCODING_FLOAT_DICTIONARY,
-                    ColumnType::Float64 | ColumnType::Float32,
-                ) => self.read_float_dict_value(data_base, local_idx)?,
+                (COL_ENCODING_FLOAT_DICTIONARY, ColumnType::Float64 | ColumnType::Float32) => {
+                    self.read_float_dict_value(data_base, local_idx)?
+                }
                 (COL_ENCODING_PLAIN, ColumnType::Bool) => {
                     let mut v = [0u8; 1];
                     self.read_cached_bytes(data_base + (8 + local_idx / 8) as u64, &mut v)?;
@@ -1930,10 +1928,9 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (8 + local_idx * 8) as u64, &mut v)?;
                     Value::Float64(f64::from_le_bytes(v))
                 }
-                (
-                    COL_ENCODING_FLOAT_DICTIONARY,
-                    ColumnType::Float64 | ColumnType::Float32,
-                ) => self.read_float_dict_value(data_base, local_idx)?,
+                (COL_ENCODING_FLOAT_DICTIONARY, ColumnType::Float64 | ColumnType::Float32) => {
+                    self.read_float_dict_value(data_base, local_idx)?
+                }
                 (COL_ENCODING_PLAIN, ColumnType::Bool) => {
                     let mut v = [0u8; 1];
                     self.read_cached_bytes(data_base + (8 + local_idx / 8) as u64, &mut v)?;
@@ -2715,20 +2712,15 @@ impl OnDemandStorage {
                     if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
                         guess
                     } else {
-                        let Some(id_at) = rg_id_at(
-                            body,
-                            rg_rows,
-                            rg_meta.min_id,
-                            id_encoding,
-                            guess,
-                        ) else {
+                        let Some(id_at) =
+                            rg_id_at(body, rg_rows, rg_meta.min_id, id_encoding, guess)
+                        else {
                             return Ok(None);
                         };
                         if id_at == id {
                             guess
                         } else {
-                            let ids_cow =
-                                bytes_as_u64_slice(&body[..id_section_len], rg_rows);
+                            let ids_cow = bytes_as_u64_slice(&body[..id_section_len], rg_rows);
                             match ids_cow.binary_search(&id) {
                                 Ok(i) => i,
                                 Err(_) => return Ok(None),
@@ -3175,13 +3167,12 @@ impl OnDemandStorage {
                             Value::Null
                         }
                     }
-                    (
-                        COL_ENCODING_FLOAT_DICTIONARY,
-                        ColumnType::Float64 | ColumnType::Float32,
-                    ) => FloatDictView::parse(data_bytes)?
-                        .value(local_idx)
-                        .map(Value::Float64)
-                        .unwrap_or(Value::Null),
+                    (COL_ENCODING_FLOAT_DICTIONARY, ColumnType::Float64 | ColumnType::Float32) => {
+                        FloatDictView::parse(data_bytes)?
+                            .value(local_idx)
+                            .map(Value::Float64)
+                            .unwrap_or(Value::Null)
+                    }
                     (COL_ENCODING_PLAIN, ColumnType::Bool) => {
                         let byte_off = 8 + local_idx / 8;
                         if byte_off < data_bytes.len() {
@@ -4164,7 +4155,7 @@ impl OnDemandStorage {
         #[cfg(target_os = "windows")]
         super::engine::engine().invalidate(&self.path);
         #[cfg(not(target_os = "windows"))]
-        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+        crate::storage::epoch::bump(&self.path);
 
         // Atomic write: write to .tmp file, then rename over the original.
         // If crash occurs mid-write, only the .tmp file is corrupted; original is intact.
@@ -4320,8 +4311,7 @@ impl OnDemandStorage {
             // Serialize RG body to buffer (IDs + deletion vector + columns)
             let is_single_rg = chunk_start == 0 && chunk_end == active_count;
             let null_bitmap_len = (chunk_rows + 7) / 8;
-            let mut body_buf: Vec<u8> =
-                Vec::with_capacity(id_section_len + chunk_rows * col_count);
+            let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + chunk_rows * col_count);
             {
                 let mut body_writer = std::io::Cursor::new(&mut body_buf);
 
@@ -4925,7 +4915,7 @@ impl OnDemandStorage {
         self.invalidate_page_cache();
         *self.file.write() = None;
         *self.write_file.write() = None;
-        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+        crate::storage::epoch::bump(&self.path);
 
         // Write updated footer at same offset (overwrite old footer)
         let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
@@ -5030,7 +5020,7 @@ impl OnDemandStorage {
         self.invalidate_page_cache();
         *self.file.write() = None;
         *self.write_file.write() = None;
-        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+        crate::storage::epoch::bump(&self.path);
 
         let deleted = self.deleted.read();
         let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
@@ -5591,7 +5581,7 @@ impl OnDemandStorage {
             *self.write_file.write() = None;
             #[cfg(windows)]
             super::engine::engine().invalidate(&self.path);
-            crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+            crate::storage::epoch::bump(&self.path);
 
             let mut file_mut = OpenOptions::new().read(true).write(true).open(&self.path)?;
             for (rg_i, wr) in &rg_writes {
@@ -5702,10 +5692,7 @@ impl OnDemandStorage {
                 }
 
                 let rg_ids_cow = (id_encoding == RG_IDS_PLAIN).then(|| {
-                    bytes_as_u64_slice(
-                        &mmap_ref[body_start..body_start + ids_size],
-                        rg_rows,
-                    )
+                    bytes_as_u64_slice(&mmap_ref[body_start..body_start + ids_size], rg_rows)
                 });
 
                 // Quick range check (IDs are monotonically increasing within each RG)
@@ -5725,9 +5712,7 @@ impl OnDemandStorage {
                     let pos = if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
                         target_id
                             .checked_sub(rg_meta.min_id)
-                            .and_then(|offset| {
-                                (offset < rg_rows as u64).then_some(offset as usize)
-                            })
+                            .and_then(|offset| (offset < rg_rows as u64).then_some(offset as usize))
                     } else {
                         rg_ids_cow
                             .as_deref()
@@ -5774,7 +5759,7 @@ impl OnDemandStorage {
         *self.write_file.write() = None;
         #[cfg(windows)]
         super::engine::engine().invalidate(&self.path);
-        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+        crate::storage::epoch::bump(&self.path);
 
         let mut file = OpenOptions::new().write(true).open(&self.path)?;
 
@@ -5854,7 +5839,7 @@ impl OnDemandStorage {
         self.invalidate_page_cache();
         *self.file.write() = None;
         *self.write_file.write() = None;
-        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+        crate::storage::epoch::bump(&self.path);
         self.delete_col_stats_sidecar();
 
         // Open file for append — seek to old footer position (overwrite it)
@@ -5896,8 +5881,7 @@ impl OnDemandStorage {
                 .count() as u32;
             (bitmap, count)
         };
-        let mut body_buf: Vec<u8> =
-            Vec::with_capacity(id_section_len + rg_rows * col_count);
+        let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + rg_rows * col_count);
         {
             let mut body_writer = std::io::Cursor::new(&mut body_buf);
 
@@ -6207,12 +6191,12 @@ impl OnDemandStorage {
         sample_rows: usize,
     ) -> f64 {
         match column {
-            Some(ColumnData::Bool { .. }) | Some(ColumnData::Int64(_)) | Some(ColumnData::Float64(_)) => {
-                match col_type {
-                    ColumnType::Bool => 1.0,
-                    _ => 8.0,
-                }
-            }
+            Some(ColumnData::Bool { .. })
+            | Some(ColumnData::Int64(_))
+            | Some(ColumnData::Float64(_)) => match col_type {
+                ColumnType::Bool => 1.0,
+                _ => 8.0,
+            },
             Some(ColumnData::String { offsets, .. }) => {
                 let rows = offsets.len().saturating_sub(1).min(sample_rows);
                 if rows == 0 {

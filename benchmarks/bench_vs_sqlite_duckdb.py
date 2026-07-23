@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -410,16 +411,41 @@ def run_bench_cold(setup_fn, bench_fn, warmup=2, iterations=5):
 
 def run_bench_cold_nogc(setup_fn, bench_fn, warmup=2, iterations=5):
     """Cold-start benchmark WITHOUT gc.collect() before timing.
-    Measures file-open + query latency without CPU-cache eviction noise."""
+    Measures file-open + query latency without CPU-cache eviction noise.
+
+    Sub-millisecond cold queries are timed in calibrated batches so one
+    scheduler interruption cannot dominate a complete benchmark sample.  The
+    setup still runs before every logical call and remains outside the timed
+    region, preserving cold-query semantics.
+    """
     for _ in range(warmup):
         setup_fn()
         bench_fn()
+
+    repeats = 1
+    best_single_ns = None
+    for _ in range(MICROBENCH_CALIBRATION_TRIALS):
+        setup_fn()
+        t0 = time.perf_counter_ns()
+        bench_fn()
+        elapsed_ns = time.perf_counter_ns() - t0
+        if best_single_ns is None or elapsed_ns < best_single_ns:
+            best_single_ns = elapsed_ns
+
+    if best_single_ns is not None and best_single_ns > 0:
+        while (best_single_ns * repeats < MICROBENCH_TARGET_SAMPLE_NS
+               and repeats < MICROBENCH_MAX_REPEATS):
+            repeats *= 2
+
     times = []
     for _ in range(iterations):
-        setup_fn()
-        t0 = time.perf_counter()
-        bench_fn()
-        times.append((time.perf_counter() - t0) * 1000)
+        elapsed_ns = 0
+        for _ in range(repeats):
+            setup_fn()
+            t0 = time.perf_counter_ns()
+            bench_fn()
+            elapsed_ns += time.perf_counter_ns() - t0
+        times.append(elapsed_ns / (1_000_000 * repeats))
     return sum(times) / len(times)
 
 
@@ -3865,19 +3891,38 @@ def _distribution_version(name):
 
 def get_git_info():
     commit = os.environ.get("APEXBASE_BENCHMARK_COMMIT")
-    if not commit:
-        commit = _command_output("git", "rev-parse", "HEAD")
-    if commit == "unavailable":
-        commit = os.environ.get("GITHUB_SHA", "unknown")
     branch = os.environ.get("APEXBASE_BENCHMARK_BRANCH")
-    if not branch:
-        branch = _command_output("git", "rev-parse", "--abbrev-ref", "HEAD")
     dirty_override = os.environ.get("APEXBASE_BENCHMARK_DIRTY")
-    if dirty_override is None:
-        status = _command_output("git", "status", "--porcelain", allow_empty=True)
-        dirty = status not in ("", "unavailable")
-    else:
-        dirty = dirty_override == "1"
+
+    status = ""
+    if not commit or not branch or dirty_override is None:
+        status = _command_output(
+            "git", "status", "--porcelain=v2", "--branch", allow_empty=True
+        )
+
+    if not commit:
+        prefix = "# branch.oid "
+        commit = next(
+            (line[len(prefix):] for line in status.splitlines() if line.startswith(prefix)),
+            "unavailable",
+        )
+    if commit in ("unavailable", "(initial)"):
+        commit = os.environ.get("GITHUB_SHA", "unknown")
+
+    if not branch:
+        prefix = "# branch.head "
+        branch = next(
+            (line[len(prefix):] for line in status.splitlines() if line.startswith(prefix)),
+            "unavailable",
+        )
+        if branch == "(detached)":
+            branch = "HEAD"
+
+    dirty = (
+        dirty_override == "1"
+        if dirty_override is not None
+        else any(line and not line.startswith("# ") for line in status.splitlines())
+    )
     return {
         "commit": commit,
         "branch": branch,
@@ -3899,23 +3944,31 @@ def get_dependency_versions():
 
 
 def get_build_versions():
-    return {
-        "maturin": _distribution_version("maturin"),
-        "rustc": _command_output("rustc", "--version", "--verbose"),
-        "cargo": _command_output("cargo", "--version"),
-    }
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        rustc = executor.submit(_command_output, "rustc", "--version", "--verbose")
+        cargo = executor.submit(_command_output, "cargo", "--version")
+        return {
+            "maturin": _distribution_version("maturin"),
+            "rustc": rustc.result(),
+            "cargo": cargo.result(),
+        }
 
 
 def get_report_metadata(suite):
     """Build the shared, JSON-safe provenance envelope for benchmark reports."""
-    return {
-        "format_version": 1,
-        "suite": suite,
-        "git": get_git_info(),
-        "system": get_system_info(),
-        "dependencies": get_dependency_versions(),
-        "build": get_build_versions(),
+    collectors = {
+        "git": get_git_info,
+        "system": get_system_info,
+        "dependencies": get_dependency_versions,
+        "build": get_build_versions,
     }
+    with ThreadPoolExecutor(max_workers=len(collectors)) as executor:
+        pending = {name: executor.submit(collector) for name, collector in collectors.items()}
+        return {
+            "format_version": 1,
+            "suite": suite,
+            **{name: future.result() for name, future in pending.items()},
+        }
 
 
 def main(argv=None, default_profile=PROFILE_PUBLIC):

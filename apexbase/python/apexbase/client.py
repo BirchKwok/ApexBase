@@ -1527,7 +1527,14 @@ class ApexClient:
         try:
             for write in writes:
                 if write[0] == "insert":
-                    _, table, rows, _ = write
+                    _, table, rows, insert_sqls = write
+                    if table != self._current_table:
+                        self._storage.use_table(table)
+                        self._current_table = table
+                    if self._storage.has_secondary_indexes():
+                        for insert_sql in insert_sqls:
+                            self._storage.execute(insert_sql)
+                        continue
                     pending_by_table.setdefault(table, []).extend(rows)
                     continue
 

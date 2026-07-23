@@ -305,7 +305,7 @@ fn get_table_columns(base_dir: &Path, table_name: &str) -> Vec<(String, ArrowDat
     }
 
     // Execute a LIMIT 0 query to get schema
-    match ApexExecutor::execute("SELECT * FROM data LIMIT 0", &table_path) {
+    match crate::Database::execute("SELECT * FROM data LIMIT 0", &table_path, &table_path) {
         Ok(result) => match result.to_record_batch() {
             Ok(batch) => batch
                 .schema()

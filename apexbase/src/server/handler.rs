@@ -91,7 +91,7 @@ impl ApexBaseHandler {
         let base_dir = self.effective_base_dir(current_db);
         let default_table_path = base_dir.join("apexbase.apex");
         crate::query::executor::set_query_root_dir(&self.base_dir);
-        let exec_result = ApexExecutor::execute_with_base_dir(sql, &base_dir, &default_table_path);
+        let exec_result = crate::Database::execute(sql, &base_dir, &default_table_path);
         crate::query::executor::clear_query_root_dir();
         exec_result
             .map_err(|e| e.to_string())?

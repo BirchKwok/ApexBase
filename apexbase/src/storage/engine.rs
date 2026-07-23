@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use ahash::AHashMap;
-use arrow::record_batch::RecordBatch;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 
@@ -39,7 +38,6 @@ use super::backend::TableStorageBackend;
 use super::on_demand::ColumnType;
 use super::DurabilityLevel;
 use crate::data::Value;
-use crate::query::ApexExecutor;
 
 // ============================================================================
 // Configuration
@@ -173,8 +171,7 @@ impl StorageEngine {
         self.insert_cache.write().remove(table_path);
         self.schema_cache.write().remove(table_path);
 
-        // Also invalidate executor cache
-        ApexExecutor::invalidate_cache_for_path(table_path);
+        crate::storage::epoch::bump(table_path);
     }
 
     /// Invalidate read/query caches after an append while keeping the insert backend warm.
@@ -186,7 +183,7 @@ impl StorageEngine {
     fn invalidate_after_append(&self, table_path: &Path) {
         self.cache.write().remove(table_path);
         self.schema_cache.write().remove(table_path);
-        ApexExecutor::invalidate_cache_for_path(table_path);
+        crate::storage::epoch::bump(table_path);
     }
 
     /// Invalidate all caches under a directory
@@ -200,8 +197,7 @@ impl StorageEngine {
             .write()
             .retain(|path, _| !path.starts_with(dir));
 
-        // Also invalidate executor cache
-        ApexExecutor::invalidate_cache_for_dir(dir);
+        crate::storage::epoch::remove_dir(dir);
     }
 
     // ========================================================================
@@ -429,7 +425,7 @@ impl StorageEngine {
             // For delta writes, only invalidate backend cache (not schema cache)
             // Schema doesn't change, so schema cache remains valid
             self.cache.write().remove(table_path);
-            ApexExecutor::invalidate_cache_for_path(table_path);
+            self.invalidate_after_append(table_path);
 
             ids
         } else {
@@ -450,9 +446,6 @@ impl StorageEngine {
 
             ids
         };
-
-        // Notify indexes about the new rows (keeps indexes in sync for Python store() API)
-        ApexExecutor::notify_indexes_after_write(table_path, &ids);
 
         Ok(ids)
     }
@@ -589,34 +582,6 @@ impl StorageEngine {
     // Read Operations
     // ========================================================================
 
-    /// Execute a SQL query and return results
-    ///
-    /// This method automatically:
-    /// 1. Compacts delta files if needed
-    /// 2. Executes the query
-    ///
-    /// # Arguments
-    /// * `sql` - SQL query string
-    /// * `base_dir` - Base directory for table resolution
-    /// * `default_table_path` - Default table path for unqualified table names
-    pub fn query(
-        &self,
-        sql: &str,
-        base_dir: &Path,
-        default_table_path: &Path,
-    ) -> io::Result<RecordBatch> {
-        // Compact delta if exists
-        if Self::has_delta_file(default_table_path) {
-            let storage = TableStorageBackend::open_for_write(default_table_path)?;
-            storage.compact()?;
-            self.invalidate(default_table_path);
-        }
-
-        // Execute query
-        let result = ApexExecutor::execute_with_base_dir(sql, base_dir, default_table_path)?;
-        result.to_record_batch()
-    }
-
     /// Check if a record with given ID exists
     pub fn exists(&self, table_path: &Path, id: u64) -> io::Result<bool> {
         let backend = self.get_read_backend(table_path)?;
@@ -627,25 +592,6 @@ impl StorageEngine {
     pub fn row_count(&self, table_path: &Path) -> io::Result<u64> {
         let backend = self.get_read_backend(table_path)?;
         Ok(backend.row_count())
-    }
-
-    /// Retrieve a single record by ID
-    pub fn retrieve(
-        &self,
-        table_path: &Path,
-        base_dir: &Path,
-        table_name: &str,
-        id: u64,
-    ) -> io::Result<Option<RecordBatch>> {
-        // Use SQL query which handles delta merging
-        let sql = format!("SELECT * FROM \"{}\" WHERE _id = {}", table_name, id);
-        let batch = self.query(&sql, base_dir, table_path)?;
-
-        if batch.num_rows() == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(batch))
-        }
     }
 
     // ========================================================================
@@ -1104,7 +1050,6 @@ impl StorageEngine {
                                 match storage.append_row_group(&ids, &new_columns, &new_nulls) {
                                     Ok(()) => {
                                         self.invalidate_after_append(table_path);
-                                        ApexExecutor::notify_indexes_after_write(table_path, &ids);
                                         return Ok(ids);
                                     }
                                     Err(_) => {
@@ -1163,7 +1108,6 @@ impl StorageEngine {
         )?;
         backend.save()?;
         self.invalidate(table_path);
-        ApexExecutor::notify_indexes_after_write(table_path, &ids);
         Ok(ids)
     }
 }

@@ -728,6 +728,23 @@ class TestCrossFeatureIntegration:
         assert len(df) == 1
         assert df.iloc[0]["name"] == "Bob"
 
+    def test_fast_txn_batch_insert_updates_composite_index(self, client):
+        """Fast transaction batch commit keeps every composite-index entry current."""
+        client.store([{"name": "Alice", "age": 25, "city": "NYC", "score": 90.0}])
+        client.execute("CREATE INDEX idx_city_age ON t1 (city, age)")
+
+        client.execute("BEGIN")
+        client.execute("INSERT INTO t1 (name, age, city, score) VALUES ('Bob', 30, 'LA', 85.0)")
+        client.execute("INSERT INTO t1 (name, age, city, score) VALUES ('Cara', 31, 'LA', 80.0)")
+        client.execute("COMMIT")
+
+        for name, age in (("Bob", 30), ("Cara", 31)):
+            df = client.execute(
+                f"SELECT * FROM t1 WHERE city = 'LA' AND age = {age}"
+            ).to_pandas()
+            assert len(df) == 1
+            assert df.iloc[0]["name"] == name
+
     def test_pragma_table_info_after_operations(self, client):
         """PRAGMA table_info should work after various DML operations."""
         client.store([{"name": "Alice", "age": 25, "city": "NYC", "score": 90.0}])

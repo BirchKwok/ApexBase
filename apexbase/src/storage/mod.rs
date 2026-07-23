@@ -11,6 +11,7 @@ pub mod bloom;
 pub mod concurrent;
 pub mod delta;
 pub mod engine;
+pub mod epoch;
 pub mod incremental;
 pub mod index;
 pub mod mvcc;

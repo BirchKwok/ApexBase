@@ -268,3 +268,26 @@ def test_setup_benchmark_uses_median_to_reject_outlier(benchmark, monkeypatch):
     )
 
     assert elapsed_ms == pytest.approx(2.0)
+
+
+def test_cold_microbenchmark_calibrates_repeats_without_timing_setup(
+    benchmark, monkeypatch
+):
+    timestamps = iter(range(18))
+    setup_calls = []
+    bench_calls = []
+    monkeypatch.setattr(benchmark, "MICROBENCH_CALIBRATION_TRIALS", 1)
+    monkeypatch.setattr(benchmark, "MICROBENCH_TARGET_SAMPLE_NS", 4)
+    monkeypatch.setattr(benchmark, "MICROBENCH_MAX_REPEATS", 4)
+    monkeypatch.setattr(benchmark.time, "perf_counter_ns", lambda: next(timestamps))
+
+    elapsed_ms = benchmark.run_bench_cold_nogc(
+        lambda: setup_calls.append(None),
+        lambda: bench_calls.append(None),
+        warmup=0,
+        iterations=2,
+    )
+
+    assert elapsed_ms == pytest.approx(0.000001)
+    assert len(setup_calls) == 9
+    assert len(bench_calls) == 9
