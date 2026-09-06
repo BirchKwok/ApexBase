@@ -32,6 +32,7 @@ python -m mkdocs serve
 | [Float16 Vector Guide](FLOAT16_VECTOR_GUIDE.md) | Users storing and querying embeddings |
 | [Vector Quantization Guide](VECTOR_QUANTIZATION_GUIDE.md) | Users building compressed candidate retrieval with exact reranking |
 | [Storage Architecture](STORAGE_ARCHITECTURE.md) | Contributors and maintainers |
+| [Architecture Review & Refactoring Plan (2026-09)](ARCHITECTURE_REVIEW_2026_09.md) | Maintainers reviewing architecture risks and phased improvements |
 | [Scan & Physical Execution](SCAN_EXECUTION_ARCHITECTURE.md) | Contributors extending filters, grouping, ordering, or scan scheduling |
 | [Engineering Guidelines](ENGINEERING_GUIDELINES.md) | Contributors changing query or storage paths |
 | [HTAP Roadmap](HTAP_ROADMAP.md) | High-level project direction |
