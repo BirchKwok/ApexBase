@@ -3457,7 +3457,7 @@ impl TableStorageBackend {
         for name in refs {
             let plain = name.rsplit('.').next().unwrap_or(name);
             if plain == "_id" {
-                let id_values: Vec<i64> = row_indices.iter().map(|&i| i as i64).collect();
+                let id_values = self.storage.read_ids_by_indices(row_indices)?;
                 fields.push(Field::new("_id", ArrowDataType::Int64, false));
                 arrays.push(Arc::new(Int64Array::from(id_values)) as ArrayRef);
                 continue;
@@ -6892,5 +6892,40 @@ mod tests {
                 assert_eq!(arr.value(0), 100, "Value should be 100");
             }
         }
+    }
+
+    #[test]
+    fn dict_indexed_read_projects_real_row_ids() {
+        use arrow::array::Int64Array;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dict_indexed_id_projection.apex");
+
+        let backend = TableStorageBackend::create(&path).unwrap();
+        backend.add_column("name", DataType::String).unwrap();
+        backend.add_column("value", DataType::Int64).unwrap();
+        let mut rows = Vec::new();
+        for i in 0..3 {
+            let mut row = HashMap::new();
+            row.insert("name".to_string(), Value::String(format!("row_{}", i)));
+            row.insert("value".to_string(), Value::Int64(i as i64));
+            rows.push(row);
+        }
+        backend.insert_rows(&rows).unwrap();
+        backend.save_full().unwrap();
+        drop(backend);
+
+        // Reopen so the `_id`-only projection is served by the persisted
+        // V4 mmap path (dict-indexed read); it must return real row ids,
+        // not 0-based file offsets.
+        let backend = TableStorageBackend::open(&path).unwrap();
+        let batch = backend
+            .read_columns_by_indices_to_arrow(&[0, 2], Some(&["_id"]))
+            .unwrap();
+        let ids = batch
+            .column_by_name("_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("batch must contain _id");
+        assert_eq!(ids.values(), &[1, 3]);
     }
 }

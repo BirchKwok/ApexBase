@@ -64,6 +64,7 @@ CANARY_SPECS = (
     ("Point lookup (SQL)", "bench_point_lookup", "median"),
     ("Point lookup (direct)", "bench_oltp_direct_point_lookup", "median"),
     ("Projected string equality", "bench_oltp_projected_string_eq", "median"),
+    ("Projected _id string equality", "bench_oltp_projected_id_string_eq", "median"),
     ("Insert 1 row", "bench_oltp_insert_one", "median"),
     ("UPDATE by ID", "bench_oltp_update_by_id", "median"),
     ("Batch UPDATE by ID (10K)", "bench_oltp_batch_update_by_id", "once"),

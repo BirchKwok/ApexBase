@@ -666,3 +666,31 @@ def test_fused_gate_fallback_shapes_match_generic_pipeline(tmp_path):
     assert actual_having == expected_having
     assert _assert_python_rust_query_parity(client, having_query)
     client.close()
+
+
+def test_id_projection_string_equality_returns_real_row_ids(tmp_path):
+    """`SELECT _id` over a string equality filter returns persisted 1-based
+    row ids, not 0-based file offsets (dict-indexed read regression)."""
+    client = ApexClient(str(tmp_path), enable_cache=False)
+    client.create_table("idproj", {"name": "string", "value": "int"})
+    client.use_table("idproj")
+    client.store(
+        [
+            {"name": "alpha", "value": 1},
+            {"name": "beta", "value": 2},
+            {"name": "alpha", "value": 3},
+        ]
+    )
+    client.flush()
+
+    all_ids = sorted(
+        int(row["_id"]) for row in client.execute("SELECT _id FROM idproj").to_dict()
+    )
+    assert all_ids == [1, 2, 3]
+
+    filtered_ids = sorted(
+        int(row["_id"])
+        for row in client.execute("SELECT _id FROM idproj WHERE name = 'alpha'").to_dict()
+    )
+    assert filtered_ids == [1, 3]
+    client.close()

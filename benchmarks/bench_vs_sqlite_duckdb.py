@@ -2793,6 +2793,9 @@ class ApexBaseBench:
     def bench_oltp_projected_string_eq(self):
         return self.client.execute("SELECT age, score, city FROM default WHERE name = 'user_5000'").to_dict()
 
+    def bench_oltp_projected_id_string_eq(self):
+        return self.client.execute("SELECT _id FROM default WHERE name = 'user_5000'").to_dict()
+
     def bench_oltp_city_limit_10(self):
         return self.client.execute(
             "SELECT name, age FROM default WHERE city = 'Beijing' LIMIT 100"
