@@ -906,9 +906,13 @@ impl ApexStorageImpl {
 
             if is_commit {
                 if let Some(txn_id) = current_txn {
-                    let result = session
-                        .commit_txn(txn_id)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let result = match session.commit_txn(txn_id) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            *self.current_txn_id.write() = None;
+                            return Err(PyRuntimeError::new_err(error.to_string()));
+                        }
+                    };
                     if let ApexResult::Scalar(n) = &result {
                         return Ok(ExecOut::Scalar("rows_applied".to_string(), *n));
                     }

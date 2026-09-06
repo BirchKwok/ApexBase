@@ -2424,3 +2424,365 @@ fn test_bitpack_roundtrip_encode_decode() {
         assert_eq!(consumed, encoded.len());
     }
 }
+
+// ============================================================================
+// Crash recovery (WAL commit marker + delta repair / reconstruction)
+// ============================================================================
+
+fn recovery_schema() -> Vec<(String, ColumnType)> {
+    vec![
+        ("name".to_string(), ColumnType::String),
+        ("value".to_string(), ColumnType::Int64),
+    ]
+}
+
+fn row(name: &str, value: i64) -> HashMap<String, ColumnValue> {
+    let mut data = HashMap::new();
+    data.insert("name".to_string(), ColumnValue::String(name.to_string()));
+    data.insert("value".to_string(), ColumnValue::Int64(value));
+    data
+}
+
+fn append_wal_records(path: &std::path::Path, records: &[crate::storage::incremental::WalRecord]) {
+    let wal_path = OnDemandStorage::wal_path(path);
+    let mut writer = crate::storage::incremental::WalWriter::open(&wal_path).unwrap();
+    for record in records {
+        writer.append(record).unwrap();
+    }
+    writer.flush().unwrap();
+}
+
+#[test]
+fn torn_delta_tail_is_truncated_on_open() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("torn.apex");
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+            &recovery_schema(),
+        )
+        .unwrap();
+        storage.insert_rows(&[row("seed", 0)]).unwrap();
+
+        storage.save_full().unwrap();
+        // A second open/appends a complete delta batch...
+        drop(storage);
+        let storage = OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe)
+            .unwrap();
+        storage
+            .insert_rows_to_delta(&[row("live", 1)])
+            .unwrap();
+        drop(storage);
+    }
+    // ...then simulate a kill mid-append with a torn trailing fragment.
+    {
+        use std::io::Write;
+        let delta_path = OnDemandStorage::delta_path(&path);
+        let len_before = std::fs::metadata(&delta_path).unwrap().len();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&delta_path).unwrap();
+        file.write_all(&[0u8; 13]).unwrap();
+        assert!(std::fs::metadata(&delta_path).unwrap().len() > len_before);
+        let storage =
+            OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe)
+                .unwrap();
+        assert_eq!(
+            storage.row_count(),
+            2,
+            "base={} delta={}",
+            storage.base_row_count(),
+            storage.delta_row_count()
+        );
+        let len = std::fs::metadata(&delta_path).unwrap().len();
+        assert_eq!(len, len_before, "torn tail must be truncated");
+    }
+}
+
+#[test]
+fn uncommitted_txn_delta_rows_are_rolled_back_on_open() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("uncommitted.apex");
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+            &recovery_schema(),
+        )
+        .unwrap();
+        storage.insert_rows(&[row("seed", 0)]).unwrap();
+
+        storage.save_full().unwrap();
+        drop(storage);
+        // Simulate a commit that applied its rows to the delta, then died
+        // before the WAL commit marker became durable.
+        let storage = OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe)
+            .unwrap();
+        storage
+            .insert_rows_to_delta(&[row("ghost", 1)])
+            .unwrap();
+        drop(storage);
+    }
+    append_wal_records(
+        &path,
+        &[
+            crate::storage::incremental::WalRecord::TxnBegin { txn_id: 99 },
+            crate::storage::incremental::WalRecord::Insert {
+                id: 2,
+                data: row("ghost", 1),
+                txn_id: 99,
+            },
+        ],
+    );
+    let storage =
+        OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe).unwrap();
+    assert_eq!(storage.row_count(), 1, "uncommitted rows must not survive");
+    assert!(!storage.exists(2));
+}
+
+#[test]
+fn committed_txn_insert_missing_from_delta_is_reconstructed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("reconstruct.apex");
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+            &recovery_schema(),
+        )
+        .unwrap();
+        storage.insert_rows(&[row("seed", 0)]).unwrap();
+
+        storage.save_full().unwrap();
+        drop(storage);
+    }
+    // The commit marker was durable but the rows never reached the delta.
+    append_wal_records(
+        &path,
+        &[
+            crate::storage::incremental::WalRecord::TxnBegin { txn_id: 7 },
+            crate::storage::incremental::WalRecord::Insert {
+                id: 2,
+                data: row("committed", 42),
+                txn_id: 7,
+            },
+            crate::storage::incremental::WalRecord::TxnCommit { txn_id: 7 },
+        ],
+    );
+    let storage =
+        OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe).unwrap();
+    assert_eq!(storage.row_count(), 2, "committed rows must be reconstructed");
+    assert!(storage.exists(2));
+    // Id allocation must continue past the reconstructed rows.
+    let ids = storage.insert_rows_to_delta(&[row("after", 3)]).unwrap();
+    assert_eq!(ids, vec![3]);
+}
+
+#[test]
+fn committed_txn_insert_already_in_delta_is_not_duplicated() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nodup.apex");
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+            &recovery_schema(),
+        )
+        .unwrap();
+        storage.insert_rows(&[row("seed", 0)]).unwrap();
+
+        storage.save_full().unwrap();
+        drop(storage);
+        // Normal commit: rows applied to delta AND WAL-logged with a marker.
+        let storage = OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe)
+            .unwrap();
+        storage
+            .insert_rows_to_delta(&[row("applied", 1)])
+            .unwrap();
+        drop(storage);
+    }
+    append_wal_records(
+        &path,
+        &[
+            crate::storage::incremental::WalRecord::TxnBegin { txn_id: 5 },
+            crate::storage::incremental::WalRecord::Insert {
+                id: 2,
+                data: row("applied", 1),
+                txn_id: 5,
+            },
+            crate::storage::incremental::WalRecord::TxnCommit { txn_id: 5 },
+        ],
+    );
+    let storage =
+        OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe).unwrap();
+    assert_eq!(storage.row_count(), 2, "recovery must not duplicate applied rows");
+}
+
+#[test]
+fn committed_txn_delete_is_reapplied_on_open() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("delete_replay.apex");
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+            &recovery_schema(),
+        )
+        .unwrap();
+        storage.insert_rows(&[row("victim", 0)]).unwrap();
+        storage.save_full().unwrap();
+        drop(storage);
+    }
+    // Sanity: the victim row (id 1, FIRST_ROW_ID) is visible before recovery.
+    {
+        let storage =
+            OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe)
+                .unwrap();
+        assert!(storage.exists(1), "victim row must exist before recovery");
+        drop(storage);
+    }
+    // Commit marker durable, but the process died before applying the delete.
+    append_wal_records(
+        &path,
+        &[
+            crate::storage::incremental::WalRecord::TxnBegin { txn_id: 3 },
+            crate::storage::incremental::WalRecord::Delete { id: 1, txn_id: 3 },
+            crate::storage::incremental::WalRecord::TxnCommit { txn_id: 3 },
+        ],
+    );
+    let storage =
+        OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe).unwrap();
+    assert!(!storage.exists(1), "committed delete must be re-applied");
+}
+
+#[test]
+fn auto_commit_insert_missing_from_delta_is_reconstructed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("autocommit.apex");
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+            &recovery_schema(),
+        )
+        .unwrap();
+        storage.insert_rows(&[row("seed", 0)]).unwrap();
+
+        storage.save_full().unwrap();
+        drop(storage);
+    }
+    append_wal_records(
+        &path,
+        &[crate::storage::incremental::WalRecord::Insert {
+            id: 2,
+            data: row("auto", 9),
+            txn_id: 0,
+        }],
+    );
+    let storage =
+        OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe).unwrap();
+    assert_eq!(storage.row_count(), 2);
+    assert!(storage.exists(2));
+}
+
+
+#[test]
+fn torn_delta_tail_with_committed_marker_is_repaired_and_reconstructed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("torn_committed.apex");
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+            &recovery_schema(),
+        )
+        .unwrap();
+        storage.insert_rows(&[row("seed", 0)]).unwrap();
+        storage.save_full().unwrap();
+        drop(storage);
+        // A commit that applied its batch, then died mid-way through the
+        // next append (torn tail), with the commit marker durable.
+        let storage = OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe)
+            .unwrap();
+        let ids = storage.insert_rows_to_delta(&[row("committed", 1)]).unwrap();
+        assert_eq!(ids, vec![2]);
+        drop(storage);
+    }
+    let delta_path = OnDemandStorage::delta_path(&path);
+    let len_before = std::fs::metadata(&delta_path).unwrap().len();
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&delta_path).unwrap();
+        file.write_all(&[0u8; 9]).unwrap();
+    }
+    append_wal_records(
+        &path,
+        &[
+            crate::storage::incremental::WalRecord::TxnBegin { txn_id: 11 },
+            crate::storage::incremental::WalRecord::Insert {
+                id: 2,
+                data: row("committed", 1),
+                txn_id: 11,
+            },
+            crate::storage::incremental::WalRecord::TxnCommit { txn_id: 11 },
+        ],
+    );
+    let storage =
+        OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe).unwrap();
+    assert_eq!(storage.row_count(), 2, "torn tail repaired, committed row intact");
+    assert!(storage.exists(2));
+    assert_eq!(
+        std::fs::metadata(&delta_path).unwrap().len(),
+        len_before,
+        "torn tail must be truncated"
+    );
+}
+
+
+#[test]
+fn delta_batch_cache_tracks_appends() {
+    let dir = tempdir().unwrap();
+    let table_path = dir.path().join("delta_batch_cache.apex");
+    let storage = OnDemandStorage::create(&table_path).unwrap();
+
+    let mut first = HashMap::new();
+    first.insert("value".to_string(), vec![1]);
+    storage
+        .insert_typed_to_delta(
+            first,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+    let delta_path = OnDemandStorage::delta_path(&table_path);
+    let (batches_before, _) =
+        OnDemandStorage::delta_complete_batches(&delta_path).unwrap();
+    assert_eq!(batches_before.len(), 1);
+
+    // Cache hit must return the same boundaries.
+    let (cached, _) = OnDemandStorage::delta_complete_batches(&delta_path).unwrap();
+    assert_eq!(cached, batches_before);
+
+    // Append a second batch: the memoized state must pick it up.
+    let mut second = HashMap::new();
+    second.insert("value".to_string(), vec![2]);
+    storage
+        .insert_typed_to_delta(
+            second,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+    let (after, _) = OnDemandStorage::delta_complete_batches(&delta_path).unwrap();
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0], batches_before[0]);
+
+    // Subsequent reads serve the updated boundary.
+    let (again, _) = OnDemandStorage::delta_complete_batches(&delta_path).unwrap();
+    assert_eq!(again, after);
+}

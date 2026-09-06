@@ -331,6 +331,48 @@ class TestCrashRecovery:
 class TestTransactionIsolation:
     """Test transaction isolation properties with concurrent threads."""
 
+    def test_conflicting_commit_aborts_and_clears_client_state(self):
+        """A failed OCC commit must not leave either client layer in a transaction."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            owner = ApexClient(temp_dir, _auto_manage=False)
+            owner.create_table('commit_conflict', {'name': 'string', 'value': 'int'})
+            owner.use_table('commit_conflict')
+            owner.store([{'name': 'row', 'value': 0}])
+            owner.flush()
+
+            contender = ApexClient(temp_dir, _auto_manage=False)
+            contender.use_table('commit_conflict')
+            row_id = owner.execute(
+                "SELECT _id FROM commit_conflict WHERE name = 'row'"
+            ).first()['_id']
+
+            # Establish two independent Rust transactions. The public BEGIN
+            # shortcut is intentionally Python-local until a query needs the
+            # shared transaction manager.
+            owner._storage.execute('BEGIN')
+            contender._storage.execute('BEGIN')
+            owner._in_txn = True
+            contender._in_txn = True
+            owner.execute(
+                f"UPDATE commit_conflict SET name = 'owner' WHERE _id = {row_id}"
+            )
+            contender.execute(
+                f"UPDATE commit_conflict SET name = 'contender' WHERE _id = {row_id}"
+            )
+
+            owner.execute('COMMIT')
+            with pytest.raises(RuntimeError, match='conflict'):
+                contender.execute('COMMIT')
+
+            assert contender._in_txn is False
+            contender.execute('BEGIN')
+            contender.execute('ROLLBACK')
+            assert owner.execute(
+                f"SELECT name FROM commit_conflict WHERE _id = {row_id}"
+            ).first()['name'] == 'owner'
+            contender.close()
+            owner.close()
+
     def test_read_your_writes(self):
         """Within a transaction, SELECT should see buffered INSERT writes."""
         with tempfile.TemporaryDirectory() as temp_dir:

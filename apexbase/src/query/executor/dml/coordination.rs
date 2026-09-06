@@ -163,16 +163,27 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         let mgr = crate::txn::txn_manager();
 
-        // Commit validates OCC conflicts and returns buffered writes without
-        // cloning them in the executor first.
-        let writes = mgr.commit_with_writes(txn_id).map_err(|e| {
+        // Keep OCC/MVCC state unpublished until storage and indexes finish.
+        let prepared = mgr.prepare_commit(txn_id).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("Transaction conflict: {}", e))
         })?;
+        let writes = prepared.writes();
+        macro_rules! commit_try {
+            ($expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = mgr.rollback(txn_id);
+                        return Err(error);
+                    }
+                }
+            };
+        }
 
         // Collect affected table paths
         let mut affected_tables: std::collections::HashSet<std::path::PathBuf> =
             std::collections::HashSet::new();
-        for write in &writes {
+        for write in writes {
             let table_name = write.table();
             let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
             affected_tables.insert(table_path);
@@ -189,15 +200,15 @@ impl ApexExecutor {
         let mut wal_backends: std::collections::HashMap<std::path::PathBuf, TableStorageBackend> =
             std::collections::HashMap::new();
         for table_path in &affected_tables {
-            if let Ok(Some(backend)) = Self::open_txn_wal_backend(table_path) {
-                let _ = backend.storage.wal_write_txn_begin(txn_id);
+            if let Some(backend) = commit_try!(Self::open_txn_wal_backend(table_path)) {
+                commit_try!(backend.storage.wal_write_txn_begin(txn_id));
                 wal_backends.insert(table_path.clone(), backend);
             }
         }
 
         // Phase 2 (P0-4): Write buffered DML to WAL with txn_id BEFORE applying to storage
         // This ensures crash recovery can replay committed transactions from WAL.
-        for write in &writes {
+        for write in writes {
             use crate::txn::context::TxnWrite;
             let table_name = write.table();
             let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
@@ -221,12 +232,12 @@ impl ApexExecutor {
                                 (k.clone(), cv)
                             })
                             .collect();
-                        let _ = backend
+                        commit_try!(backend
                             .storage
-                            .wal_write_txn_insert(txn_id, *row_id, wal_data);
+                            .wal_write_txn_insert(txn_id, *row_id, wal_data));
                     }
                     TxnWrite::Delete { row_id, .. } => {
-                        let _ = backend.storage.wal_write_txn_delete(txn_id, *row_id);
+                        commit_try!(backend.storage.wal_write_txn_delete(txn_id, *row_id));
                     }
                     TxnWrite::Update { .. } => {
                         // Updates are applied as delta store changes (not WAL-logged individually)
@@ -235,29 +246,31 @@ impl ApexExecutor {
             }
         }
 
-        // Phase 3: Apply buffered writes to storage
-        let applied = Self::apply_txn_writes(&writes, base_dir, default_table_path);
-
-        // Phase 4: Write TxnCommit to each affected table's WAL (flush + optional sync)
+        // Phase 3: Emit the WAL commit marker — the commit point. Once the
+        // marker is durable (OS flush for Safe, fsync for Max), the
+        // transaction is committed even if this process dies before the rows
+        // are applied: the next full open re-applies committed inserts and
+        // deletes that are missing from the table (crash recovery). Fast
+        // durability tables have no WAL and therefore no durable commit
+        // record; their commits are best-effort by design.
         for table_path in &affected_tables {
             if let Some(backend) = wal_backends.get(table_path) {
-                let _ = backend.storage.wal_write_txn_commit(txn_id);
+                commit_try!(backend.storage.wal_write_txn_commit(txn_id));
             }
         }
 
-        // Invalidate read caches for all affected tables.
-        let engine = crate::storage::engine::engine();
-        for table_path in &affected_tables {
-            engine.invalidate(table_path);
-            crate::storage::backend::invalidate_global_dict_cache(table_path);
-        }
+        // Phase 4: Apply buffered writes to storage. A failure after the
+        // commit point leaves the transaction durably committed in the WAL:
+        // the error is propagated, the MVCC state is rolled back, and the
+        // rows converge on the next open. Callers must not re-issue the DML.
+        let applied = commit_try!(Self::apply_txn_writes(writes, base_dir, default_table_path,));
 
         // Index maintenance is coordinated above storage so StorageEngine never
         // depends on the query runtime. WAL-backed inserts can already be visible
         // to normal reads here, so use the committed transaction payload directly
         // instead of reopening the table and trying to identify its new rows.
         let mut inserted_rows = std::collections::HashMap::new();
-        for write in &writes {
+        for write in writes {
             if let crate::txn::context::TxnWrite::Insert {
                 table,
                 row_id,
@@ -279,15 +292,39 @@ impl ApexExecutor {
                 continue;
             }
             for (row_id, values) in rows {
-                idx_mgr.on_insert(row_id, values)?;
+                commit_try!(idx_mgr.on_insert(row_id, values));
             }
-            idx_mgr.save()?;
+            commit_try!(idx_mgr.save());
+        }
+
+        commit_try!(mgr.finalize_commit(prepared));
+
+        // Record the applied WAL watermark: the whole WAL is now reflected
+        // in the table, so opens skip the recovery scan until the WAL grows
+        // again (a new commit or a crash between marker and apply).
+        for table_path in &affected_tables {
+            if let Some(backend) = wal_backends.get(table_path) {
+                commit_try!(backend.storage.wal_mark_applied());
+            }
+        }
+
+        for epoch_write in &_epoch_writes {
+            epoch_write.commit();
+        }
+
+        // Publish cache invalidation only after the transaction is committed.
+        let engine = crate::storage::engine::engine();
+        for table_path in &affected_tables {
+            engine.invalidate(table_path);
+            crate::storage::backend::invalidate_global_dict_cache(table_path);
         }
 
         Ok(ApexResult::Scalar(applied))
     }
 
-    pub(in crate::query::executor) fn open_txn_wal_backend(storage_path: &Path) -> io::Result<Option<TableStorageBackend>> {
+    pub(in crate::query::executor) fn open_txn_wal_backend(
+        storage_path: &Path,
+    ) -> io::Result<Option<TableStorageBackend>> {
         let wal_path = {
             let mut p = storage_path.to_path_buf();
             let ext = p
@@ -312,7 +349,7 @@ impl ApexExecutor {
         writes: &[crate::txn::context::TxnWrite],
         base_dir: &Path,
         default_table_path: &Path,
-    ) -> i64 {
+    ) -> io::Result<i64> {
         use crate::txn::context::TxnWrite;
 
         let mut applied = 0i64;
@@ -347,30 +384,22 @@ impl ApexExecutor {
                     }
 
                     let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
-                    match Self::try_apply_txn_insert_delta(&table_path, &row_maps) {
-                        Ok(Some(count)) => applied += count,
-                        Ok(None) => {
-                            match Self::execute_insert(&table_path, Some(&columns), &values_list) {
-                                Ok(_) => applied += values_list.len() as i64,
-                                Err(e) => {
-                                    eprintln!("Warning: failed to apply txn insert batch: {}", e)
-                                }
-                            }
+                    match Self::try_apply_txn_insert_delta(&table_path, &row_maps)? {
+                        Some(count) => applied += count,
+                        None => {
+                            Self::execute_insert(&table_path, Some(&columns), &values_list)?;
+                            applied += values_list.len() as i64;
                         }
-                        Err(e) => eprintln!("Warning: failed to apply txn insert delta: {}", e),
                     }
                     idx = next_idx;
                 }
                 _ => {
-                    match Self::apply_txn_write(&writes[idx], base_dir, default_table_path) {
-                        Ok(count) => applied += count,
-                        Err(e) => eprintln!("Warning: failed to apply txn write: {}", e),
-                    }
+                    applied += Self::apply_txn_write(&writes[idx], base_dir, default_table_path)?;
                     idx += 1;
                 }
             }
         }
-        applied
+        Ok(applied)
     }
 
     pub(in crate::query::executor) fn txn_insert_columns(data: &std::collections::HashMap<String, Value>) -> Vec<String> {

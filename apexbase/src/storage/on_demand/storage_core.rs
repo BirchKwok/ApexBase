@@ -37,6 +37,13 @@ static DELTA_ROW_COUNT_CACHE: once_cell::sync::Lazy<
     RwLock<HashMap<PathBuf, (u64, std::time::SystemTime, usize, u64)>>,
 > = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
+// Complete-batch boundaries of delta files, memoized per file state
+// (length, modified time). Steady-state reads hit this and skip the full
+// boundary walk; a grow or rewrite of the file re-scans once.
+static DELTA_BATCH_CACHE: once_cell::sync::Lazy<
+    RwLock<HashMap<PathBuf, (u64, std::time::SystemTime, Vec<(u64, u64)>, u64)>>,
+> = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+
 // ============================================================================
 // Streaming V4 rewrite helpers (bounded-memory compaction / rewrites)
 // ============================================================================
@@ -765,6 +772,19 @@ pub struct OnDemandStorage {
     pub(crate) global_lock: parking_lot::RwLock<()>,
 }
 
+    /// Result of parsing a WAL for crash recovery.
+    struct WalRecoveryScan {
+        /// Auto-commit and committed DML records (replayable, deduplicated
+        /// by row id against the table).
+        records: Vec<super::incremental::WalRecord>,
+        /// Insert ids whose transaction has no commit record.
+        uncommitted_insert_ids: std::collections::HashSet<u64>,
+        /// Delete ids of committed transactions (re-applied if missing).
+        committed_delete_ids: Vec<u64>,
+        /// next_id implied by the committed WAL inserts.
+        recovered_next_id: u64,
+    }
+
 impl OnDemandStorage {
     fn validate_v4_layout(
         header: &OnDemandHeader,
@@ -1020,81 +1040,42 @@ impl OnDemandStorage {
         let deleted_len = (id_count + 7) / 8;
         let deleted = vec![0u8; deleted_len];
 
-        // Handle WAL recovery and initialization for safe/max durability
+        // WAL handling: a recovery scan runs when the WAL may hold committed
+        // records that never reached the table (kill or failed commit between
+        // the commit marker and the apply). The applied-watermark sidecar
+        // keeps steady-state opens cheap: a successful commit or a recovery
+        // run records the current WAL length, so a matching length means the
+        // whole WAL is already reflected in base+delta.
         let wal_path = Self::wal_path(path);
-        let (wal_writer, wal_buffer, recovered_next_id) =
-            if durability != super::DurabilityLevel::Fast {
-                if wal_path.exists() {
-                    // Replay WAL for crash recovery
-                    let mut reader = super::incremental::WalReader::open(&wal_path)?;
-                    let all_records = reader.read_all()?;
-
-                    // P0-3: Collect committed txn_ids for recovery filtering
-                    let committed_txns: std::collections::HashSet<u64> = all_records
-                        .iter()
-                        .filter_map(|r| match r {
-                            super::incremental::WalRecord::TxnCommit { txn_id } => Some(*txn_id),
-                            _ => None,
-                        })
-                        .collect();
-
-                    // Filter: keep only auto-commit (txn_id=0) and committed txn DML records
-                    // ALSO: idempotency guard — skip Insert/BatchInsert records whose IDs
-                    // are already in the base file (id < next_id). This prevents duplicate
-                    // rows if WAL is replayed after the base file was already saved.
-                    let base_next_id = next_id; // next_id from base file before WAL recovery
-                    let records: Vec<_> = all_records
-                        .into_iter()
-                        .filter(|r| {
-                            match r {
-                                super::incremental::WalRecord::Insert { txn_id, id, .. } => {
-                                    (*txn_id == 0 || committed_txns.contains(txn_id))
-                                        && *id >= base_next_id // Skip if already persisted
-                                }
-                                super::incremental::WalRecord::BatchInsert {
-                                    txn_id,
-                                    start_id,
-                                    rows,
-                                    ..
-                                } => {
-                                    let end_id = *start_id + rows.len() as u64;
-                                    (*txn_id == 0 || committed_txns.contains(txn_id))
-                                        && end_id > base_next_id // Keep if any rows are new
-                                }
-                                super::incremental::WalRecord::Delete { txn_id, id, .. } => {
-                                    (*txn_id == 0 || committed_txns.contains(txn_id))
-                                        && *id < base_next_id // Only delete rows that exist in base
-                                }
-                                _ => true, // Keep checkpoints, txn boundaries
-                            }
-                        })
-                        .collect();
-
-                    // Find max ID from WAL records (handles both Insert and BatchInsert)
-                    let max_wal_id = records
-                        .iter()
-                        .filter_map(|r| match r {
-                            super::incremental::WalRecord::Insert { id, .. } => Some(*id),
-                            super::incremental::WalRecord::BatchInsert {
-                                start_id, rows, ..
-                            } => Some(*start_id + rows.len() as u64 - 1),
-                            _ => None,
-                        })
-                        .max();
-
-                    let recovered_id = max_wal_id.map(|id| id + 1).unwrap_or(next_id);
-
-                    // Open for append
-                    let writer = super::incremental::WalWriter::open(&wal_path)?;
-                    (Some(writer), records, recovered_id)
-                } else {
-                    // Create new WAL
-                    let writer = super::incremental::WalWriter::create(&wal_path, next_id)?;
-                    (Some(writer), Vec::new(), next_id)
-                }
+        // Fast opens never repair: their id allocation is baseline
+        // (base/delta high-water marks) and the recovery scan is reserved for
+        // read opens and safe/max write opens.
+        let wal_scan =
+            if durability != super::DurabilityLevel::Fast
+                && wal_path.exists()
+                && Self::wal_needs_recovery(&wal_path)?
+            {
+                Some(Self::scan_wal_for_recovery(&wal_path, next_id)?)
             } else {
-                (None, Vec::new(), next_id)
+                None
             };
+        let recovered_next_id = match &wal_scan {
+            Some(scan) => scan.recovered_next_id,
+            None => next_id,
+        };
+        let wal_buffer = match &wal_scan {
+            Some(scan) => scan.records.clone(),
+            None => Vec::new(),
+        };
+        let wal_writer = if durability != super::DurabilityLevel::Fast {
+            if wal_path.exists() {
+                Some(super::incremental::WalWriter::open(&wal_path)?)
+            } else {
+                Some(super::incremental::WalWriter::create(&wal_path, next_id)?)
+            }
+        } else {
+            None
+        };
 
         let delta_next_id = {
             let delta_path = Self::delta_path(path);
@@ -1113,7 +1094,7 @@ impl OnDemandStorage {
         // Read compression type from header flags
         let comp_type = CompressionType::from_flags(header.flags);
 
-        Ok(Self {
+        let storage = Self {
             path: path.to_path_buf(),
             in_memory: false,
             file: RwLock::new(Some(file)),
@@ -1165,7 +1146,23 @@ impl OnDemandStorage {
             scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_f16_col: std::sync::Mutex::new(String::new()),
             global_lock: parking_lot::RwLock::new(()),
-        })
+        };
+
+        // Crash recovery: repair torn delta tails on write opens, roll back
+        // rows of uncommitted transactions, and re-apply committed inserts/
+        // deletes that are missing from the table.
+        if durability != super::DurabilityLevel::Fast {
+            storage.repair_torn_delta_tail()?;
+            if let Some(scan) = &wal_scan {
+                storage.recover_committed_records(
+                    next_id,
+                    &scan.uncommitted_insert_ids,
+                    &scan.committed_delete_ids,
+                )?;
+                Self::write_wal_marker(path)?;
+            }
+        }
+        Ok(storage)
     }
 
     /// Open for reading only, reusing a pre-opened File and known file_len.
@@ -1223,7 +1220,39 @@ impl OnDemandStorage {
         let cached_fo = header.footer_offset;
         let comp_type = CompressionType::from_flags(header.flags);
 
-        Ok(Self {
+        // Crash convergence: a WAL-backed table may hold committed records
+        // that never reached the table (kill or failed commit between the
+        // commit marker and the apply). Reads must see the committed state,
+        // so repair the delta/deltastore sidecars before serving reads. The
+        // base file itself is never modified on this path.
+        let wal_scan =
+            if Self::wal_path_exists(path) && Self::wal_needs_recovery(&Self::wal_path(path))? {
+                Some(Self::scan_wal_for_recovery(&Self::wal_path(path), next_id)?)
+            } else {
+                None
+            };
+        let base_next_id = next_id;
+        let next_id = match &wal_scan {
+            Some(scan) => {
+                let delta_path = Self::delta_path(path);
+                let delta_next_id = if delta_path.exists() {
+                    Self::get_max_id_from_delta_fast(&delta_path)
+                        .ok()
+                        .map(|id| id.saturating_add(1))
+                        .unwrap_or(base_next_id)
+                } else {
+                    base_next_id
+                };
+                scan.recovered_next_id.max(base_next_id).max(delta_next_id)
+            }
+            None => base_next_id,
+        };
+        let wal_buffer = match &wal_scan {
+            Some(scan) => scan.records.clone(),
+            None => Vec::new(),
+        };
+
+        let storage = Self {
             path: path.to_path_buf(),
             in_memory: false,
             file: RwLock::new(Some(file)),
@@ -1249,7 +1278,7 @@ impl OnDemandStorage {
             }),
             durability: super::DurabilityLevel::Fast,
             wal_writer: RwLock::new(None),
-            wal_buffer: RwLock::new(Vec::new()),
+            wal_buffer: RwLock::new(wal_buffer),
             auto_flush_rows: AtomicU64::new(10000),
             auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
             pending_rows: AtomicU64::new(0),
@@ -1272,7 +1301,17 @@ impl OnDemandStorage {
             scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_f16_col: std::sync::Mutex::new(String::new()),
             global_lock: parking_lot::RwLock::new(()),
-        })
+        };
+
+        if let Some(scan) = &wal_scan {
+            storage.recover_committed_records(
+                base_next_id,
+                &scan.uncommitted_insert_ids,
+                &scan.committed_delete_ids,
+            )?;
+            Self::write_wal_marker(path)?;
+        }
+        Ok(storage)
     }
 
     /// Set auto-flush thresholds for automatic persistence
@@ -2396,96 +2435,653 @@ impl OnDemandStorage {
     /// Get the maximum ID from a delta file (for computing next_id on open)
     fn get_max_id_from_delta(delta_path: &Path) -> io::Result<u64> {
         use std::io::{Read, Seek, SeekFrom};
+        let (batches, _) = Self::delta_complete_batches(delta_path)?;
+        if batches.is_empty() {
+            return Ok(0);
+        }
         let mut file = File::open(delta_path)?;
-        let mut max_id: u64 = 0;
-
-        loop {
-            // Read record count
-            let mut count_buf = [0u8; 8];
-            match file.read_exact(&mut count_buf) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-            let record_count = u64::from_le_bytes(count_buf) as usize;
-
-            // Read IDs and track max
-            for _ in 0..record_count {
+        let mut max_id = 0u64;
+        for (start, count) in &batches {
+            file.seek(SeekFrom::Start(start + 8))?;
+            for _ in 0..*count {
                 let mut id_buf = [0u8; 8];
                 file.read_exact(&mut id_buf)?;
-                let id = u64::from_le_bytes(id_buf);
-                max_id = max_id.max(id);
+                max_id = max_id.max(u64::from_le_bytes(id_buf));
             }
+        }
+        Ok(max_id)
+    }
 
-            // Skip rest of record (int columns)
-            let mut count_buf4 = [0u8; 4];
-            file.read_exact(&mut count_buf4)?;
-            let int_col_count = u32::from_le_bytes(count_buf4) as usize;
-            for _ in 0..int_col_count {
-                let mut len_buf = [0u8; 2];
-                file.read_exact(&mut len_buf)?;
-                let name_len = u16::from_le_bytes(len_buf) as usize;
-                file.seek(SeekFrom::Current(name_len as i64))?;
-                file.seek(SeekFrom::Current((record_count * 8) as i64))?;
+    /// Collect all row ids present in a delta file's complete batches.
+    fn delta_id_set(delta_path: &Path) -> io::Result<std::collections::HashSet<u64>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let (batches, _) = Self::delta_complete_batches(delta_path)?;
+        let mut ids = std::collections::HashSet::new();
+        if batches.is_empty() {
+            return Ok(ids);
+        }
+        let mut file = File::open(delta_path)?;
+        for (start, count) in &batches {
+            file.seek(SeekFrom::Start(start + 8))?;
+            for _ in 0..*count {
+                let mut id_buf = [0u8; 8];
+                file.read_exact(&mut id_buf)?;
+                ids.insert(u64::from_le_bytes(id_buf));
             }
+        }
+        Ok(ids)
+    }
 
-            // Skip float columns
-            file.read_exact(&mut count_buf4)?;
-            let float_col_count = u32::from_le_bytes(count_buf4) as usize;
-            for _ in 0..float_col_count {
-                let mut len_buf = [0u8; 2];
-                file.read_exact(&mut len_buf)?;
-                let name_len = u16::from_le_bytes(len_buf) as usize;
-                file.seek(SeekFrom::Current(name_len as i64))?;
-                file.seek(SeekFrom::Current((record_count * 8) as i64))?;
+    /// Skip the column sections (int/float/string/bool) of a delta batch
+    /// whose header (record count + ids) has already been consumed.
+    /// Returns false when the batch is truncated.
+    fn skip_delta_batch_columns(file: &mut File, record_count: u64, snapshot_len: u64) -> bool {
+        let Some(fixed) = record_count.checked_mul(8) else {
+            return false;
+        };
+        let mut count_buf4 = [0u8; 4];
+        // Int columns
+        if !Self::read_delta_bytes_bounded(file, &mut count_buf4, snapshot_len) {
+            return false;
+        }
+        let int_col_count = u32::from_le_bytes(count_buf4) as usize;
+        for _ in 0..int_col_count {
+            let mut len_buf = [0u8; 2];
+            if !Self::read_delta_bytes_bounded(file, &mut len_buf, snapshot_len) {
+                return false;
             }
-
-            // Skip string columns (variable length - need to read lengths)
-            file.read_exact(&mut count_buf4)?;
-            let string_col_count = u32::from_le_bytes(count_buf4) as usize;
-            for _ in 0..string_col_count {
-                let mut len_buf = [0u8; 2];
-                file.read_exact(&mut len_buf)?;
-                let name_len = u16::from_le_bytes(len_buf) as usize;
-                file.seek(SeekFrom::Current(name_len as i64))?;
-                for _ in 0..record_count {
-                    let mut str_len_buf = [0u8; 4];
-                    file.read_exact(&mut str_len_buf)?;
-                    let str_len = u32::from_le_bytes(str_len_buf) as usize;
-                    file.seek(SeekFrom::Current(str_len as i64))?;
+            let Some(skip) = (u16::from_le_bytes(len_buf) as u64).checked_add(fixed) else {
+                return false;
+            };
+            if !Self::skip_delta_bytes_bounded(file, skip, snapshot_len) {
+                return false;
+            }
+        }
+        // Float columns
+        if !Self::read_delta_bytes_bounded(file, &mut count_buf4, snapshot_len) {
+            return false;
+        }
+        let float_col_count = u32::from_le_bytes(count_buf4) as usize;
+        for _ in 0..float_col_count {
+            let mut len_buf = [0u8; 2];
+            if !Self::read_delta_bytes_bounded(file, &mut len_buf, snapshot_len) {
+                return false;
+            }
+            let Some(skip) = (u16::from_le_bytes(len_buf) as u64).checked_add(fixed) else {
+                return false;
+            };
+            if !Self::skip_delta_bytes_bounded(file, skip, snapshot_len) {
+                return false;
+            }
+        }
+        // String columns
+        if !Self::read_delta_bytes_bounded(file, &mut count_buf4, snapshot_len) {
+            return false;
+        }
+        let string_col_count = u32::from_le_bytes(count_buf4) as usize;
+        for _ in 0..string_col_count {
+            let mut len_buf = [0u8; 2];
+            if !Self::read_delta_bytes_bounded(file, &mut len_buf, snapshot_len)
+                || !Self::skip_delta_bytes_bounded(
+                    file,
+                    u16::from_le_bytes(len_buf) as u64,
+                    snapshot_len,
+                )
+            {
+                return false;
+            }
+            for _ in 0..record_count {
+                let mut str_len_buf = [0u8; 4];
+                if !Self::read_delta_bytes_bounded(file, &mut str_len_buf, snapshot_len)
+                    || !Self::skip_delta_bytes_bounded(
+                        file,
+                        u32::from_le_bytes(str_len_buf) as u64,
+                        snapshot_len,
+                    )
+                {
+                    return false;
                 }
             }
-
-            // Skip bool columns
-            file.read_exact(&mut count_buf4)?;
-            let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
-            for _ in 0..bool_col_count {
-                let mut len_buf = [0u8; 2];
-                file.read_exact(&mut len_buf)?;
-                let name_len = u16::from_le_bytes(len_buf) as usize;
-                file.seek(SeekFrom::Current(name_len as i64))?;
-                let skip_bytes = (record_count + 7) / 8;
-                file.seek(SeekFrom::Current(skip_bytes as i64))?;
+        }
+        // Bool columns (one byte per row)
+        if !Self::read_delta_bytes_bounded(file, &mut count_buf4, snapshot_len) {
+            return false;
+        }
+        let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
+        for _ in 0..bool_col_count {
+            let mut len_buf = [0u8; 2];
+            if !Self::read_delta_bytes_bounded(file, &mut len_buf, snapshot_len) {
+                return false;
             }
+            let Some(skip) = (u16::from_le_bytes(len_buf) as u64).checked_add(record_count)
+            else {
+                return false;
+            };
+            if !Self::skip_delta_bytes_bounded(file, skip, snapshot_len) {
+                return false;
+            }
+        }
+        true
+    }
 
-            // Skip binary columns (variable length)
-            file.read_exact(&mut count_buf4)?;
-            let binary_col_count = u32::from_le_bytes(count_buf4) as usize;
-            for _ in 0..binary_col_count {
-                let mut len_buf = [0u8; 2];
-                file.read_exact(&mut len_buf)?;
-                let name_len = u16::from_le_bytes(len_buf) as usize;
-                file.seek(SeekFrom::Current(name_len as i64))?;
-                for _ in 0..record_count {
-                    let mut bin_len_buf = [0u8; 4];
-                    file.read_exact(&mut bin_len_buf)?;
-                    let bin_len = u32::from_le_bytes(bin_len_buf) as usize;
-                    file.seek(SeekFrom::Current(bin_len as i64))?;
+    /// Enumerate an append-only delta file's complete batches as
+    /// `(batch_start_offset, record_count)` pairs, plus the end offset of the
+    /// last complete batch. A torn trailing batch (the file ends mid-batch,
+    /// e.g. after a kill during an append) is ignored so callers can truncate
+    /// the file or bound their reads.
+    ///
+    /// Memoized per file state (length, modified time) so steady-state reads
+    /// cost a stat instead of a full boundary walk; appends re-scan once.
+    fn delta_complete_batches(delta_path: &Path) -> io::Result<(Vec<(u64, u64)>, u64)> {
+        let meta = std::fs::metadata(delta_path)?;
+        let file_len = meta.len();
+        let modified = meta.modified()?;
+        {
+            let cache = DELTA_BATCH_CACHE.read();
+            if let Some((cached_len, cached_modified, batches, last_end)) =
+                cache.get(delta_path)
+            {
+                if *cached_len == file_len && *cached_modified == modified {
+                    return Ok((batches.clone(), *last_end));
+                }
+            }
+        }
+        let scanned = Self::scan_delta_batches(delta_path, file_len)?;
+        let mut cache = DELTA_BATCH_CACHE.write();
+        if cache.len() > 128 {
+            cache.clear();
+        }
+        cache.insert(
+            delta_path.to_path_buf(),
+            (file_len, modified, scanned.0.clone(), scanned.1),
+        );
+        Ok(scanned)
+    }
+
+    /// Single fresh walk of the delta body; `delta_complete_batches` is the
+    /// memoized wrapper.
+    fn scan_delta_batches(
+        delta_path: &Path,
+        file_len: u64,
+    ) -> io::Result<(Vec<(u64, u64)>, u64)> {
+        use std::io::Read;
+        let mut file = File::open(delta_path)?;
+        let mut batches: Vec<(u64, u64)> = Vec::new();
+        let mut last_end = file_len;
+        loop {
+            let batch_start = file.stream_position()?;
+            if batch_start >= file_len {
+                break;
+            }
+            let mut count_buf = [0u8; 8];
+            if !Self::read_delta_bytes_bounded(&mut file, &mut count_buf, file_len) {
+                last_end = batch_start;
+                break;
+            }
+            let record_count = u64::from_le_bytes(count_buf);
+            if !Self::skip_delta_bytes_bounded(
+                &mut file,
+                record_count.saturating_mul(8),
+                file_len,
+            ) {
+                last_end = batch_start;
+                break;
+            }
+            if !Self::skip_delta_batch_columns(&mut file, record_count, file_len) {
+                last_end = batch_start;
+                break;
+            }
+            batches.push((batch_start, record_count));
+            if file.stream_position()? >= file_len {
+                break;
+            }
+        }
+        Ok((batches, last_end))
+    }
+
+
+    /// Sidecar recording the WAL length that is known to be applied to the
+    /// table (8 bytes). Absent, short, or stale means the WAL needs a scan.
+    fn wal_path_exists(table_path: &Path) -> bool {
+        Self::wal_path(table_path).exists()
+    }
+
+    fn wal_meta_path(wal_path: &Path) -> PathBuf {
+        let mut meta = wal_path.to_path_buf();
+        let name = meta.file_name().unwrap_or_default().to_string_lossy();
+        meta.set_file_name(format!("{}.meta", name));
+        meta
+    }
+
+    /// Cheap gate: does the WAL hold committed records that may be missing
+    /// from the table? Steady state: every successful commit and every
+    /// recovery run records the current WAL length, so a matching length
+    /// means the whole WAL is already reflected in base+delta.
+    fn wal_needs_recovery(wal_path: &Path) -> io::Result<bool> {
+        use crate::storage::incremental::WAL_HEADER_SIZE;
+        let meta = std::fs::metadata(wal_path)?;
+        if meta.len() <= (WAL_HEADER_SIZE as u64) {
+            return Ok(false);
+        }
+        let marker = std::fs::read(Self::wal_meta_path(wal_path))
+            .ok()
+            .filter(|bytes| bytes.len() == 8)
+            .map(|bytes| u64::from_le_bytes(bytes[0..8].try_into().unwrap()))
+            .unwrap_or(0);
+        let r = marker != meta.len();
+        Ok(r)
+    }
+
+    /// Record the current WAL length as fully applied (crash-recovery
+    /// watermark). Opens skip the WAL scan while this matches the length.
+    pub fn wal_mark_applied(&self) -> io::Result<()> {
+        Self::write_wal_marker(&self.path)
+    }
+
+    fn write_wal_marker(table_path: &Path) -> io::Result<()> {
+        use crate::storage::incremental::WAL_HEADER_SIZE;
+        let wal_path = Self::wal_path(table_path);
+        if let Ok(meta) = std::fs::metadata(&wal_path) {
+            if meta.len() > (WAL_HEADER_SIZE as u64) {
+                std::fs::write(Self::wal_meta_path(&wal_path), meta.len().to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse a WAL and split its records for crash recovery: uncommitted
+    /// insert ids (their applied delta rows belong to a dead transaction and
+    /// must be rolled back), committed delete ids (re-applied when the
+    /// process died between the commit marker and the apply), the replayable
+    /// record set (auto-commit + committed DML), and the recovered next id.
+    fn scan_wal_for_recovery(
+        wal_path: &Path,
+        base_next_id: u64,
+    ) -> io::Result<WalRecoveryScan> {
+        let mut reader = super::incremental::WalReader::open(wal_path)?;
+        let all_records = reader.read_all()?;
+
+        let committed_txns: std::collections::HashSet<u64> = all_records
+            .iter()
+            .filter_map(|r| match r {
+                super::incremental::WalRecord::TxnCommit { txn_id } => Some(*txn_id),
+                _ => None,
+            })
+            .collect();
+
+        let mut uncommitted_insert_ids: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+        let mut committed_delete_ids: Vec<u64> = Vec::new();
+        for record in &all_records {
+            match record {
+                super::incremental::WalRecord::Insert { id, txn_id, .. }
+                    if *txn_id != 0
+                        && !committed_txns.contains(txn_id)
+                        && !crate::txn::is_live_txn(*txn_id) =>
+                {
+                    uncommitted_insert_ids.insert(*id);
+                }
+                super::incremental::WalRecord::BatchInsert {
+                    start_id,
+                    rows,
+                    txn_id,
+                } if *txn_id != 0
+                    && !committed_txns.contains(txn_id)
+                    && !crate::txn::is_live_txn(*txn_id) =>
+                {
+                    for offset in 0..rows.len() as u64 {
+                        uncommitted_insert_ids.insert(*start_id + offset);
+                    }
+                }
+                super::incremental::WalRecord::Delete { id, txn_id }
+                    if *txn_id != 0
+                        && committed_txns.contains(txn_id)
+                        && !crate::txn::is_live_txn(*txn_id) =>
+                {
+                    committed_delete_ids.push(*id);
+                }
+                _ => {}
+            }
+        }
+
+        // Keep auto-commit (txn_id=0) and committed txn DML records. Insert
+        // records whose IDs are already in the base file are dropped
+        // (persisted; replaying them would duplicate rows).
+        let records: Vec<_> = all_records
+            .into_iter()
+            .filter(|r| {
+                match r {
+                    super::incremental::WalRecord::Insert { txn_id, id, .. } => {
+                        (*txn_id == 0 || committed_txns.contains(txn_id))
+                            && *id >= base_next_id
+                    }
+                    super::incremental::WalRecord::BatchInsert {
+                        txn_id,
+                        start_id,
+                        rows,
+                        ..
+                    } => {
+                        let end_id = *start_id + rows.len() as u64;
+                        (*txn_id == 0 || committed_txns.contains(txn_id))
+                            && end_id > base_next_id
+                    }
+                    super::incremental::WalRecord::Delete { txn_id, id, .. } => {
+                        (*txn_id == 0 || committed_txns.contains(txn_id))
+                            && *id < base_next_id
+                    }
+                    _ => true,
+                }
+            })
+            .collect();
+
+        let max_wal_id = records
+            .iter()
+            .filter_map(|r| match r {
+                super::incremental::WalRecord::Insert { id, .. } => Some(*id),
+                super::incremental::WalRecord::BatchInsert {
+                    start_id,
+                    rows,
+                    ..
+                } => Some(*start_id + rows.len() as u64 - 1),
+                _ => None,
+            })
+            .max();
+
+        Ok(WalRecoveryScan {
+            records,
+            uncommitted_insert_ids,
+            committed_delete_ids,
+            recovered_next_id: max_wal_id.map(|id| id + 1).unwrap_or(base_next_id),
+        })
+    }
+
+    /// Truncate a torn trailing delta batch: a kill mid-append can leave
+    /// incomplete rows that no reader can parse.
+    pub(crate) fn repair_torn_delta_tail(&self) -> io::Result<()> {
+        let delta_path = Self::delta_path(&self.path);
+        if !delta_path.exists() {
+            return Ok(());
+        }
+        let (_, last_end) = Self::delta_complete_batches(&delta_path)?;
+        let file_len = std::fs::metadata(&delta_path)?.len();
+        if last_end < file_len {
+            let mut file = OpenOptions::new().write(true).open(&delta_path)?;
+            file.set_len(last_end)?;
+            file.sync_all()?;
+            let max_id = Self::get_max_id_from_delta(&delta_path)?;
+            let _ = Self::write_delta_max_id(&delta_path, max_id);
+        }
+        Ok(())
+    }
+
+    /// Crash recovery for WAL-backed tables, run when a WAL scan finds
+    /// records that may not be reflected in the table:
+    ///
+    /// 1. Truncates complete trailing delta batches whose rows all belong to
+    ///    uncommitted transactions: the process died after applying the rows
+    ///    but before the WAL commit marker became durable, so the rows must
+    ///    not become visible.
+    /// 2. Re-applies committed inserts whose rows are missing from the base
+    ///    file and the delta file: the commit marker was durable but the
+    ///    process died before the rows were applied.
+    /// 3. Re-applies committed deletes.
+    ///
+    /// The WAL file is left intact (all instances in a process share it
+    /// append-only); reconstruction deduplicates by row id, so repeated
+    /// opens are idempotent until a checkpoint truncates the WAL.
+    pub(crate) fn recover_committed_records(
+        &self,
+        base_next_id: u64,
+        uncommitted_insert_ids: &std::collections::HashSet<u64>,
+        committed_delete_ids: &[u64],
+    ) -> io::Result<()> {
+        use std::io::SeekFrom;
+        let delta_path = Self::delta_path(&self.path);
+        let has_delta = delta_path.exists();
+
+        // 1) Uncommitted trailing batches.
+        if has_delta && !uncommitted_insert_ids.is_empty() {
+            let (batches, _) = Self::delta_complete_batches(&delta_path)?;
+            let mut cut: Option<u64> = None;
+            if batches.last().is_some() {
+                let mut file = File::open(&delta_path)?;
+                for (start, count) in batches.iter().rev() {
+                    let mut batch_uncommitted = true;
+                    file.seek(SeekFrom::Start(start + 8))?;
+                    for _ in 0..*count {
+                        let mut id_buf = [0u8; 8];
+                        file.read_exact(&mut id_buf)?;
+                        if !uncommitted_insert_ids.contains(&u64::from_le_bytes(id_buf)) {
+                            batch_uncommitted = false;
+                            break;
+                        }
+                    }
+                    if batch_uncommitted {
+                        cut = Some(*start);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if let Some(cut) = cut {
+                let file_len = std::fs::metadata(&delta_path)?.len();
+                if cut < file_len {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .open(&delta_path)?;
+                    file.set_len(cut)?;
+                    file.sync_all()?;
+                    let max_id = Self::get_max_id_from_delta(&delta_path)?;
+                    let _ = Self::write_delta_max_id(&delta_path, max_id);
                 }
             }
         }
 
-        Ok(max_id)
+        // 2) Committed inserts missing from base+delta.
+        {
+            let wal_records = self.wal_buffer.read();
+            let committed: std::collections::HashSet<u64> = wal_records
+                .iter()
+                .filter_map(|r| match r {
+                    super::incremental::WalRecord::TxnCommit { txn_id } => Some(*txn_id),
+                    _ => None,
+                })
+                .collect();
+            let mut candidates: Vec<(u64, &std::collections::HashMap<String, ColumnValue>)> =
+                Vec::new();
+            let mut max_insert_id = 0u64;
+            for record in wal_records.iter() {
+                match record {
+                    super::incremental::WalRecord::Insert { id, data, txn_id }
+                        if (*txn_id == 0 || committed.contains(txn_id))
+                            && !crate::txn::is_live_txn(*txn_id) =>
+                    {
+                        max_insert_id = max_insert_id.max(*id);
+                        if *id >= base_next_id {
+                            candidates.push((*id, data));
+                        }
+                    }
+                    super::incremental::WalRecord::BatchInsert {
+                        start_id,
+                        rows,
+                        txn_id,
+                    } if (*txn_id == 0 || committed.contains(txn_id))
+                        && !crate::txn::is_live_txn(*txn_id) =>
+                    {
+                        for (offset, row) in rows.iter().enumerate() {
+                            let id = *start_id + offset as u64;
+                            max_insert_id = max_insert_id.max(id);
+                            if id >= base_next_id {
+                                candidates.push((id, row));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !candidates.is_empty() {
+                let delta_max = if has_delta {
+                    Self::get_max_id_from_delta_fast(&delta_path).unwrap_or(0)
+                } else {
+                    0
+                };
+                // Cheap check: base holds ids < base_next_id and the delta
+                // holds ids <= delta_max, so a committed insert can only be
+                // missing when it exceeds both high-water marks.
+                let base_max_id = base_next_id.saturating_sub(1);
+                if max_insert_id > delta_max.max(base_max_id) {
+                    let delta_ids = if has_delta {
+                        Self::delta_id_set(&delta_path)?
+                    } else {
+                        std::collections::HashSet::new()
+                    };
+                    let missing: Vec<(u64, &std::collections::HashMap<String, ColumnValue>)> =
+                        candidates
+                            .iter()
+                            .filter(|(id, _)| !delta_ids.contains(id))
+                            .copied()
+                            .collect();
+                    if !missing.is_empty() {
+                        self.append_wal_rows_to_delta(&missing, delta_max)?;
+                    }
+                }
+            }
+        }
+
+        // 3) Committed deletes.
+        if !committed_delete_ids.is_empty() {
+            let mut any_deleted = false;
+            for id in committed_delete_ids {
+                if self.delta_delete_row(*id)? {
+                    any_deleted = true;
+                }
+            }
+            if any_deleted {
+                self.save_delta_store()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Append rows taken from WAL records to the delta file using the WAL
+    /// row ids (crash recovery). Column semantics mirror the live insert
+    /// path: missing or unsupported values fall back to column defaults.
+    fn append_wal_rows_to_delta(
+        &self,
+        rows: &[(u64, &std::collections::HashMap<String, ColumnValue>)],
+        existing_delta_max: u64,
+    ) -> io::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let schema = self.schema.read();
+        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+        for (col_name, col_type) in &schema.columns {
+            match col_type {
+                ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date => {
+                    int_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                ColumnType::Float64 | ColumnType::Float32 => {
+                    float_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                    string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                ColumnType::Bool => {
+                    bool_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                _ => {}
+            }
+        }
+        for (_, data) in rows {
+            for (col_name, col_type) in &schema.columns {
+                match col_type {
+                    ColumnType::Int64
+                    | ColumnType::Int8
+                    | ColumnType::Int16
+                    | ColumnType::Int32
+                    | ColumnType::UInt8
+                    | ColumnType::UInt16
+                    | ColumnType::UInt32
+                    | ColumnType::UInt64
+                    | ColumnType::Timestamp
+                    | ColumnType::Date => {
+                        let v = data
+                            .get(col_name)
+                            .and_then(|v| match v {
+                                ColumnValue::Int64(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        int_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    ColumnType::Float64 | ColumnType::Float32 => {
+                        let v = data
+                            .get(col_name)
+                            .and_then(|v| match v {
+                                ColumnValue::Float64(f) => Some(*f),
+                                _ => None,
+                            })
+                            .unwrap_or(0.0);
+                        float_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                        let v = data
+                            .get(col_name)
+                            .and_then(|v| match v {
+                                ColumnValue::String(s) => Some(s.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("")
+                            .to_string();
+                        string_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    ColumnType::Bool => {
+                        let v = data
+                            .get(col_name)
+                            .and_then(|v| match v {
+                                ColumnValue::Bool(b) => Some(*b),
+                                _ => None,
+                            })
+                            .unwrap_or(false);
+                        bool_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        drop(schema);
+
+        let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+        self.append_typed_to_delta_with_ids(
+            &ids,
+            &int_columns,
+            &float_columns,
+            &string_columns,
+            &bool_columns,
+        )?;
+        // Keep the max-id meta consistent when the delta already held rows
+        // with higher ids (e.g. appended by another client after a crash).
+        let new_meta_max = existing_delta_max.max(ids.iter().copied().max().unwrap_or(0));
+        let meta_max =
+            Self::get_max_id_from_delta_fast(&Self::delta_path(&self.path)).unwrap_or(0);
+        if meta_max < new_meta_max {
+            Self::write_delta_max_id(&Self::delta_path(&self.path), new_meta_max)?;
+        }
+        Ok(())
     }
 
     fn get_max_id_from_delta_fast(delta_path: &Path) -> io::Result<u64> {
@@ -3914,6 +4510,7 @@ impl OnDemandStorage {
             let _ = std::fs::remove_file(Self::delta_meta_path(&delta_path));
             DELTA_NUMERIC_RANGE_CACHE.write().remove(&delta_path);
             DELTA_ROW_COUNT_CACHE.write().remove(&delta_path);
+            DELTA_BATCH_CACHE.write().remove(&delta_path);
             DELTA_STRING_INDEX_CACHE.write().remove(&delta_path);
         }
         write_streaming_column_stats(&self.path, &schema_cols, &column_stats)?;
@@ -4704,8 +5301,16 @@ impl OnDemandStorage {
     /// Read delta file and return column data without merging into memory
     /// Returns: (delta_ids, column_data_map) where column_data_map is column_name -> ColumnData
     fn read_delta_data(&self) -> io::Result<Option<(Vec<u64>, HashMap<String, ColumnData>)>> {
+        use std::io::SeekFrom;
         let delta_path = Self::delta_path(&self.path);
         if !delta_path.exists() {
+            return Ok(None);
+        }
+
+        // Only parse complete batches; a torn trailing batch (a kill during
+        // an append) must not make the whole delta unreadable.
+        let (batches, _) = Self::delta_complete_batches(&delta_path)?;
+        if batches.is_empty() {
             return Ok(None);
         }
 
@@ -4713,14 +5318,11 @@ impl OnDemandStorage {
         let mut all_ids: Vec<u64> = Vec::new();
         let mut all_columns: HashMap<String, ColumnData> = HashMap::new();
 
-        loop {
-            // Try to read record count
+        for (batch_start, _count) in &batches {
+            file.seek(SeekFrom::Start(*batch_start))?;
+            // Read record count
             let mut count_buf = [0u8; 8];
-            match file.read_exact(&mut count_buf) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
+            file.read_exact(&mut count_buf)?;
             let record_count = u64::from_le_bytes(count_buf) as usize;
 
             // Read IDs

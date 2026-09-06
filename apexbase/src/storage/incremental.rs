@@ -35,7 +35,7 @@ use super::on_demand::{ColumnData, ColumnType, ColumnValue, OnDemandStorage};
 const WAL_MAGIC: &[u8; 8] = b"APEXWAL\0";
 const WAL_VERSION: u32 = 2;
 const WAL_VERSION_V1: u32 = 1;
-const WAL_HEADER_SIZE: usize = 24; // magic(8) + version(4) + next_id(8) + flags(4)
+pub(crate) const WAL_HEADER_SIZE: usize = 24; // magic(8) + version(4) + next_id(8) + flags(4)
 
 // Record types
 const RECORD_INSERT: u8 = 1;

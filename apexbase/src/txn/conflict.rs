@@ -170,10 +170,22 @@ impl ConflictDetector {
 
     /// Record that a transaction has committed its writes
     pub fn record_commit(&self, ctx: &TxnContext, commit_ts: u64) {
+        self.record_prepared_commit(ctx.txn_id(), ctx.write_set(), ctx.write_keys(), commit_ts);
+    }
+
+    /// Record a prepared transaction whose write-set ownership has moved to
+    /// the commit coordinator while its intent keys remain in the context.
+    pub(crate) fn record_prepared_commit(
+        &self,
+        txn_id: TxnId,
+        writes: &[TxnWrite],
+        write_keys: &HashSet<(String, u64)>,
+        commit_ts: u64,
+    ) {
         let mut committed = self.committed_writes.write();
-        for write in ctx.write_set() {
+        for write in writes {
             committed.push(CommittedWrite {
-                txn_id: ctx.txn_id(),
+                txn_id,
                 commit_ts,
                 table: write.table().to_string(),
                 row_id: write.row_id(),
@@ -182,8 +194,8 @@ impl ConflictDetector {
 
         // Release active write locks
         let mut active = self.active_writes.write();
-        for key in ctx.write_keys() {
-            if active.get(key) == Some(&ctx.txn_id()) {
+        for key in write_keys {
+            if active.get(key) == Some(&txn_id) {
                 active.remove(key);
             }
         }

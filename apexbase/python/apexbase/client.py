@@ -4055,7 +4055,12 @@ class ApexClient:
                     if sql_upper in ('ROLLBACK', 'ROLLBACK;'):
                         return self._rollback_fast_txn(show_internal_id)
                     self._promote_fast_txn_to_rust_unlocked()
-                result = self._storage.execute(sql)
+                try:
+                    result = self._storage.execute(sql)
+                except Exception:
+                    if sql_upper in ('COMMIT', 'COMMIT;'):
+                        self._in_txn = False
+                    raise
                 if sql_upper.startswith('BEGIN'):
                     self._in_txn = True
                 elif sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;'):

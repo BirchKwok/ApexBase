@@ -28,4 +28,4 @@ pub mod manager;
 
 pub use conflict::{ConflictDetector, ConflictResult};
 pub use context::TxnContext;
-pub use manager::{txn_manager, TxnId, TxnManager, TxnStatus};
+pub use manager::{is_live_txn, txn_manager, TxnId, TxnManager, TxnStatus};

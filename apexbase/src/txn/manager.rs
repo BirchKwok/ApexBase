@@ -29,12 +29,37 @@ pub fn txn_manager() -> &'static TxnManager {
     &TXN_MANAGER
 }
 
+/// True if the transaction is still open in this process (active, or a
+/// commit in progress between validation and finalize).
+pub fn is_live_txn(txn_id: TxnId) -> bool {
+    txn_manager().is_live_txn(txn_id)
+}
+
 // ============================================================================
 // Transaction ID
 // ============================================================================
 
 /// Unique transaction identifier
 pub type TxnId = u64;
+
+/// A transaction that passed OCC validation and owns its write intents, but
+/// whose storage changes have not yet been published as committed.
+pub(crate) struct PreparedCommit {
+    txn_id: TxnId,
+    writes: Vec<TxnWrite>,
+}
+
+impl PreparedCommit {
+    #[inline]
+    pub(crate) fn txn_id(&self) -> TxnId {
+        self.txn_id
+    }
+
+    #[inline]
+    pub(crate) fn writes(&self) -> &[TxnWrite] {
+        &self.writes
+    }
+}
 
 /// Global transaction ID generator
 static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
@@ -213,14 +238,14 @@ impl TxnManager {
     /// 4. If valid: apply writes, record commit, release snapshot
     /// 5. If conflict: abort transaction
     pub fn commit(&self, txn_id: TxnId) -> io::Result<()> {
-        self.commit_with_writes(txn_id).map(|_| ())
+        let prepared = self.prepare_commit(txn_id)?;
+        self.finalize_commit(prepared).map(|_| ())
     }
 
-    /// COMMIT and return the committed write set to the caller.
-    ///
-    /// This lets the query executor apply buffered writes to storage without
-    /// cloning the write set before validation.
-    pub fn commit_with_writes(&self, txn_id: TxnId) -> io::Result<Vec<TxnWrite>> {
+    /// Validate a transaction and reserve its write keys for storage commit.
+    /// The transaction remains active in `Validating` state until the caller
+    /// invokes `finalize_commit` or `rollback`.
+    pub(crate) fn prepare_commit(&self, txn_id: TxnId) -> io::Result<PreparedCommit> {
         let mut txns = self.active_txns.write();
         let txn = txns.get_mut(&txn_id).ok_or_else(|| {
             io::Error::new(
@@ -241,40 +266,70 @@ impl TxnManager {
 
         txn.status = TxnStatus::Validating;
 
-        // For read-only transactions, just release
-        if txn.context.is_read_only() || !txn.context.has_writes() {
-            txn.status = TxnStatus::Committed;
-            txn.context.set_finished();
-            let snapshot_id = txn.snapshot.id;
-            txns.remove(&txn_id);
-            drop(txns);
-            self.snapshot_manager.release(snapshot_id);
-            self.total_committed.fetch_add(1, Ordering::Relaxed);
-            return Ok(Vec::new());
+        if txn.context.has_writes() {
+            let validation_result = self.conflict_detector.validate(&txn.context);
+            if !validation_result.is_ok() {
+                txn.status = TxnStatus::Aborted;
+                txn.context.set_finished();
+                self.conflict_detector.record_abort(&txn.context);
+                let snapshot_id = txn.snapshot.id;
+                txns.remove(&txn_id);
+                drop(txns);
+                self.snapshot_manager.release(snapshot_id);
+                self.total_aborted.fetch_add(1, Ordering::Relaxed);
+                return validation_result.to_io_result().map(|_| unreachable!());
+            }
+
+            let intent_result = self.conflict_detector.acquire_write_intent(&txn.context);
+            if !intent_result.is_ok() {
+                txn.status = TxnStatus::Aborted;
+                txn.context.set_finished();
+                self.conflict_detector.record_abort(&txn.context);
+                let snapshot_id = txn.snapshot.id;
+                txns.remove(&txn_id);
+                drop(txns);
+                self.snapshot_manager.release(snapshot_id);
+                self.total_aborted.fetch_add(1, Ordering::Relaxed);
+                return intent_result.to_io_result().map(|_| unreachable!());
+            }
         }
 
-        // OCC Validation
-        let validation_result = self.conflict_detector.validate(&txn.context);
-        if !validation_result.is_ok() {
-            // Conflict detected → abort
-            txn.status = TxnStatus::Aborted;
-            txn.context.set_finished();
-            self.conflict_detector.record_abort(&txn.context);
-            let snapshot_id = txn.snapshot.id;
-            txns.remove(&txn_id);
-            drop(txns);
-            self.snapshot_manager.release(snapshot_id);
-            self.total_aborted.fetch_add(1, Ordering::Relaxed);
-            return validation_result.to_io_result().map(|_| Vec::new());
-        }
+        Ok(PreparedCommit {
+            txn_id,
+            writes: txn.context.take_write_set(),
+        })
+    }
 
-        // Commit successful
+    /// Publish a prepared transaction after all required storage work succeeds.
+    pub(crate) fn finalize_commit(
+        &self,
+        prepared: PreparedCommit,
+    ) -> io::Result<Vec<TxnWrite>> {
+        let txn_id = prepared.txn_id;
+        let mut txns = self.active_txns.write();
+        let txn = txns.get_mut(&txn_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Transaction {} not found", txn_id),
+            )
+        })?;
+        if txn.status != TxnStatus::Validating {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Transaction {} is not prepared (status: {:?})",
+                    txn_id, txn.status
+                ),
+            ));
+        }
         let commit_ts = next_timestamp();
-        self.conflict_detector
-            .record_commit(&txn.context, commit_ts);
-
-        // Extract write set for VersionStore recording and executor storage apply.
-        let writes = txn.context.take_write_set();
+        self.conflict_detector.record_prepared_commit(
+            txn_id,
+            &prepared.writes,
+            txn.context.write_keys(),
+            commit_ts,
+        );
+        let writes = prepared.writes;
 
         txn.status = TxnStatus::Committed;
         txn.context.set_finished();
@@ -282,7 +337,7 @@ impl TxnManager {
         txns.remove(&txn_id);
         drop(txns);
 
-        // Record committed writes in per-table VersionStores for MVCC visibility
+        // Record committed writes in per-table VersionStores for MVCC visibility.
         for write in &writes {
             match write {
                 TxnWrite::Insert {
@@ -301,9 +356,8 @@ impl TxnManager {
                     ..
                 } => {
                     let store = self.get_version_store(table);
-                    // Ensure base version exists so older snapshots can see the row
                     if store.read_latest(*row_id).is_none() && !old_data.is_empty() {
-                        store.insert(*row_id, 1, old_data.clone()); // begin_ts=1: existed from start
+                        store.insert(*row_id, 1, old_data.clone());
                     }
                     let _ = store.delete(*row_id, commit_ts);
                 }
@@ -315,9 +369,8 @@ impl TxnManager {
                     ..
                 } => {
                     let store = self.get_version_store(table);
-                    // Ensure base version exists so older snapshots can see old data
                     if store.read_latest(*row_id).is_none() && !old_data.is_empty() {
-                        store.insert(*row_id, 1, old_data.clone()); // begin_ts=1: existed from start
+                        store.insert(*row_id, 1, old_data.clone());
                     }
                     let _ = store.update(*row_id, commit_ts, new_data.clone());
                 }
@@ -327,18 +380,29 @@ impl TxnManager {
         self.snapshot_manager.release(snapshot_id);
         self.total_committed.fetch_add(1, Ordering::Relaxed);
 
-        // Advance watermark periodically
         let oldest = self.snapshot_manager.oldest_active_timestamp();
         if oldest != u64::MAX {
             self.conflict_detector.advance_watermark(oldest);
         }
-
-        // Auto-trigger GC for old MVCC versions
         for store in self.version_stores.read().values() {
             self.gc.maybe_run(store, &self.snapshot_manager);
         }
 
         Ok(writes)
+    }
+
+    /// Backward-compatible one-shot commit for callers that do not coordinate
+    /// external storage application.
+    pub fn commit_with_writes(&self, txn_id: TxnId) -> io::Result<Vec<TxnWrite>> {
+        let prepared = self.prepare_commit(txn_id)?;
+        self.finalize_commit(prepared)
+    }
+
+        /// True if the transaction is still open in this process: either active
+    /// or in a commit between validation and finalize. Storage recovery uses
+    /// this to skip records a live commit will apply itself.
+    pub fn is_live_txn(&self, txn_id: TxnId) -> bool {
+        self.active_txns.read().contains_key(&txn_id)
     }
 
     /// ROLLBACK - Abort a transaction and discard all writes
@@ -613,5 +677,69 @@ mod tests {
         mgr.commit(txn1).unwrap();
         mgr.commit(txn2).unwrap();
         assert_eq!(mgr.total_committed(), 2);
+    }
+
+    #[test]
+    fn prepared_commit_does_not_publish_before_finalize() {
+        let mgr = TxnManager::new_standalone();
+        let txn_id = mgr.begin();
+        mgr.with_context(txn_id, |ctx| {
+            ctx.buffer_insert("users", 7, make_row("prepared"))
+        })
+        .unwrap();
+
+        let prepared = mgr.prepare_commit(txn_id).unwrap();
+        assert_eq!(prepared.txn_id(), txn_id);
+        assert_eq!(prepared.writes().len(), 1);
+        assert_eq!(mgr.active_count(), 1);
+        assert_eq!(mgr.total_committed(), 0);
+        assert_eq!(mgr.conflict_detector().committed_write_count(), 0);
+        assert!(mgr
+            .with_context(txn_id, |_| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("not active"));
+
+        mgr.finalize_commit(prepared).unwrap();
+        assert!(!mgr.is_active(txn_id));
+        assert_eq!(mgr.total_committed(), 1);
+        assert_eq!(mgr.conflict_detector().committed_write_count(), 1);
+        assert_eq!(
+            mgr.get_version_store("users")
+                .read_latest(7)
+                .unwrap()
+                .get("name"),
+            Some(&Value::String("prepared".to_string()))
+        );
+    }
+
+    #[test]
+    fn rollback_of_prepared_commit_releases_write_intent() {
+        let mgr = TxnManager::new_standalone();
+        let first = mgr.begin();
+        mgr.with_context(first, |ctx| {
+            ctx.buffer_insert("users", 9, make_row("first"))
+        })
+        .unwrap();
+        let prepared = mgr.prepare_commit(first).unwrap();
+
+        let blocked = mgr.begin();
+        mgr.with_context(blocked, |ctx| {
+            ctx.buffer_insert("users", 9, make_row("blocked"))
+        })
+        .unwrap();
+        assert!(mgr.prepare_commit(blocked).is_err());
+        assert!(!mgr.is_active(blocked));
+
+        mgr.rollback(prepared.txn_id()).unwrap();
+        assert_eq!(mgr.total_committed(), 0);
+
+        let retry = mgr.begin();
+        mgr.with_context(retry, |ctx| {
+            ctx.buffer_insert("users", 9, make_row("retry"))
+        })
+        .unwrap();
+        mgr.commit(retry).unwrap();
+        assert_eq!(mgr.total_committed(), 1);
     }
 }
