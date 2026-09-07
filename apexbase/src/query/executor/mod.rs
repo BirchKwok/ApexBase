@@ -2368,6 +2368,7 @@ include!("scan_pipeline.rs");
 include!("late_materialization.rs");
 include!("fts.rs");
 include!("topk_vector.rs");
+include!("file_fast_paths.rs");
 include!("joins.rs");
 include!("expressions.rs");
 include!("aggregation.rs");
