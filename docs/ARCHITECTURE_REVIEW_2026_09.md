@@ -284,7 +284,7 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 相关设计：[存储架构](STORAGE_ARCHITECTURE.md)、[扫描架构](SCAN_EXECUTION_ARCHITECTURE.md)、[优化器路线](QUERY_OPTIMIZER_ROADMAP.md)、[工程约束](ENGINEERING_GUIDELINES.md)、[HTAP 路线](HTAP_ROADMAP.md)。本文是该快照的评估与建议；后续实施应更新阶段状态并附功能、故障恢复和同机性能证据。
 ## 10. 实施状态（R1：提交正确性）
 
-状态：已完成，验收证据见下。本阶段未变更公开 API 与文件格式；所有改动位于 `origin/main`（d0f7d28）之上的工作区，尚未提交。
+状态：已完成，验收证据见下。本阶段未变更公开 API 与文件格式；改动已提交为 `origin/main`（d0f7d28）之上的 3 个 commit（`dc691d5`、`323220f`，另加本文档 `45663d4`）。
 
 ### 10.1 提交契约与实现
 
@@ -317,3 +317,58 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 3. 跨表原子提交记录尚未引入（各表 WAL 独立记录），跨表 commit 的恢复粒度为按表收敛。
 4. `open_txn_wal_backend` 固定 Safe 级别：Max 表的 commit marker 不 fsync（既有行为，本阶段未变更）。
 5. 公开 benchmark 的跨日对比在亚毫秒指标上波动大，不宜单独作为回退证据。
+
+## 11. 实施状态（R2：职责拆分）
+
+状态：已完成（9 个纯移动 commit），阶段最终验收通过。本阶段零行为变更：路由顺序、公开 API、错误语义不变，无新增重复实现；每个 commit 只移动代码，不修改任何函数体。
+
+### 11.1 拆分明细
+
+新文件均为 split impl block 形式：顶层 `impl ApexExecutor { ... }`，经 `query/executor/mod.rs` 的 `include!` 文本纳入同一模块（与既有 `select.rs`/`joins.rs`/`window.rs` 及 `dml/` 子模块的组织形式一致），因此无需任何可见性调整，跨文件方法调用（ddl/joins/topk 等）保持原样。
+
+| 新文件 | 职责 | 行数 |
+| --- | --- | --- |
+| `index_access.rs` | 索引加速读取：`try_index_accelerated_read`、谓词提取（`extract_index_predicates` / `is_fully_indexable_predicate` / `lookup_index_expression`）、index-only scan、行 ID 交并、`table_has_index_catalog` | 699 |
+| `topk.rs` | ORDER BY+LIMIT top-k：数值过滤、NOT NULL、通用排序索引、批次补全 | 369 |
+| `fused_group.rs` | 融合 GROUP BY：谓词树解析（`extract_fused_predicate`）、聚合 lane、精确/epsilon 边界 | 787 |
+| `scan_pipeline.rs` | 扫描谓词 GROUP BY 族：filter+group+order、`build_scan_predicate`、cached transform/ratio/numeric、v4 | 1396 |
+| `late_materialization.rs` | 扫描适配：SELECT * / ORDER BY / GROUP BY 的 late materialization | 825 |
+| `fts.rs` | FTS：MATCH()/FUZZY_MATCH() 压缩 bitmap 解析与 score 投影 | 262 |
+| `topk_vector.rs` | 向量 top-k：`topk_distance` 模式检测与距离计算 | 400 |
+| `file_fast_paths.rs` | 外部文件快路径：CSV/JSON/Parquet count/聚合与文件读取器过滤下推 | 832 |
+| `predicate_extract.rs` | 谓词提取助手：LIKE/IN/BETWEEN/比较/区间模式 | 334 |
+
+`select.rs` 从 12313 行降至 6440 行，保留分发器 `execute_select_with_base_dir`（按计划路由最后拆）及 count/distinct、字符串/数值过滤、mmap 扫描快路径族。
+
+对应 commit（`origin/main` d0f7d28 之上）：`80162ed` index_access、`eb7f20c` topk、`9e05399` fused_group、`1f1598b` scan_pipeline、`499baea` late_materialization、`f5b8628` fts、`d8bdf10` topk_vector、`c1e202d` file_fast_paths、`7da4db2` predicate_extract。
+
+### 11.2 纯移动纪律与编译警告
+
+- 每个 commit 的移动内容与移动前文件逐行一致（脚本核验：新文件无非包装行不属于原 `select.rs`；`select.rs` 除被移动块与其分隔空行外零增删），函数签名、doc 注释、逻辑均未改动。
+- `include!` 为同模块文本纳入，未引入新的模块边界或 `pub(in ...)` 可见性变化；`dml/`、`aggregation/` 等既有子模块不受影响。
+- 最终完整门禁的独立 release 构建为 197（基线）→ 201 条 warning：新增的 4 条报告记录来自同 5 个既有死函数（`try_fast_v4_group_by`、`try_fast_simple_agg`、`extract_bool_equality`、`try_fast_filter_groupby`、`execute_with_groupby_late_materialization`）由 rustc 在原文件中的 1 条“多函数未使用”警告，拆分后按 5 个文件分别报告；死代码集合与基线完全一致，未新增死代码。按 AGENTS.md，既有 warning 不在本阶段顺手治理。
+
+### 11.3 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| 分批功能验证（9 批，逐批） | 每批：cargo check + 完整 cargo test --release（517 单元 + 6 文档）+ 完整串行 pytest（1746 passed），全部通过 |
+| 完整串行 pytest（release 重装后冷态首跑） | 1746 passed in 21.88s |
+| 完整 cargo test --release | 517 单元 + 6 文档 passed |
+| 公开 benchmark（1M 行，2 预热 5 计时） | 103/103 项执行 + 向量 6/6 胜出；报告 `benchmarks/results/r2_public_20260907.json` |
+| 本地同机 canary（base=origin/main，200K 行） | 通过，55 指标，报告 `local-perf-results/20260907-085433/` |
+| 本地同机完整模式首轮（base=`d0f7d28`，1M 行） | 初判 2 项回退 → 五样本终判 1 项回退（Filtered aggregation (city) +23.89%）；聚焦 A/B 判定为采样噪声，见下；报告 `local-perf-results/20260907-090753/` |
+| 本地同机完整模式复核（base=`d0f7d28`，同参数） | 一轮因 IN subquery COUNT 的窗口尖峰退出 1，原始报告与聚焦 A/B 全部保留；报告 `local-perf-results/20260907-122834/` |
+| 本地同机完整模式最终重跑（base=`d0f7d28`，同参数） | 通过；初判 2 项回退后自动扩展，五样本终判 109/109 通过，Q/s 2/2、量化向量 8/8 通过；报告 `local-perf-results/20260907-140211/` |
+
+公开 benchmark 与基线（`latest_public_baseline.json`，492956bb）对比：15 个工作负载组中 12 组持平或改善（-15.9% ~ -0.6%）；Aggregation +6.6%、Set Operations +13.3%、Subqueries & CTE +58.9% 为亚毫秒级负载（绝对 3.5 → 5.6 ms）的跨运行波动，该两项 ApexBase 仍 4/0 快于 SQLite/DuckDB。回退判定以同机 base/current 门禁为准。
+
+完整模式首轮（`local-perf-results/20260907-090753/`）说明：五样本中位数下仅 `Filtered aggregation (city)` 0.448 → 0.555 ms（+23.89%，相对与绝对阈值同时超限）判为回退；原始样本显示 current 侧 5 个样本中 2 个为 3~5 倍孤立尖峰（1.606 / 1.981 ms），而 base 侧无同级尖峰，相邻同构指标 `Filtered aggregation (category)` 在 current 侧反而更快（0.428~0.454 ms）。随后对该指标做 40 次/侧、逐窗口交错（base10→current10×4 窗口）的聚焦 A/B（同一 1M 行数据集，两侧均 warm）：base 中位数 0.3125 ms vs current 0.3000 ms（**-4.01%，current 更快**），p10/p90 几乎重合（0.237/0.436 vs 0.239/0.430），且两侧均出现同级孤立尖峰（base 0.527/0.513，current 0.888/0.606）。判定为首轮采样窗口的测量噪声，与 R1 首轮 INTERSECT (ordered) +26.69% 的处理路径一致；未删除任何样本、未调整阈值，原始报告全部保留。
+
+固定基线复核（`local-perf-results/20260907-122834/`）中，五样本终判仅 `IN subquery COUNT` 为 0.663 → 1.569 ms（+136.50%），current 五个样本为 0.763/2.022/1.569/0.680/4.631 ms，3 个尖峰推高了中位数；对应 base 为 0.632/0.865/0.632/0.663/0.697 ms。使用同一 1M 行数据库、相同 SQL 和两侧 release wheel 做 40 次/侧、4 个 base10→current10 窗口的聚焦 A/B，base 中位数 0.4167 ms、current 0.4279 ms（+2.69%），两侧均有窗口漂移且 current 有 1.04/2.14 ms 孤立尖峰；报告保存在 `local-perf-results/20260907-122834/focused-in-subquery/`。该失败不被覆盖或删除，阶段完成依据是随后从头执行、退出码为 0 的完整门禁（`local-perf-results/20260907-140211/`），其五样本终判 109 项全部通过。
+
+### 11.4 残余与后续
+
+1. 路由分发仍保留 count/distinct、字符串/数值过滤、mmap 扫描快路径族的派发；R3 扩展扫描协议后，该族可沿新协议边界继续拆分。
+2. `topk.rs`（标量 top-k）与 `topk_vector.rs`（向量 top-k）按执行形态分列；若 R6 引入向量组合计划再统一重组。
+3. 本阶段未触碰 `mmap_scan/`、`aggregation/`、`dml/` 内部结构，也未修改 backend 委托接口；"逐步清理 backend 委托职责"在 R3 共享扫描协议落地时一并处理。
