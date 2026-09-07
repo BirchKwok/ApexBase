@@ -2363,6 +2363,7 @@ include!("signature_engine.rs");
 include!("select.rs");
 include!("index_access.rs");
 include!("topk.rs");
+include!("fused_group.rs");
 include!("joins.rs");
 include!("expressions.rs");
 include!("aggregation.rs");
