@@ -2364,6 +2364,7 @@ include!("select.rs");
 include!("index_access.rs");
 include!("topk.rs");
 include!("fused_group.rs");
+include!("scan_pipeline.rs");
 include!("joins.rs");
 include!("expressions.rs");
 include!("aggregation.rs");
