@@ -518,8 +518,9 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 
 ## 14. 实施状态（R5：规划与并行）
 
-状态：本轮增量完成（R5.1：EXPLAIN ANALYZE 报告实际物理路径）；
-CBO 驱动物理访问、成本校准、morsel 并行评估为 R5 余项（§14.5）。
+状态：R5.1（EXPLAIN ANALYZE 报告实际物理路径）与 R5.2（CBO 驱动物理访问
+与规划/执行分歧报告）完成；成本校准、morsel 并行评估、JOIN 路径标签为
+R5 余项（§14.5）。
 
 ### 14.1 交付物
 
@@ -631,9 +632,12 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
 
 ### 14.5 残余与后续（R5 余项）
 
-1. **CBO 驱动物理访问**：`Chosen Plan` 目前仍是描述性输出，执行器
-   路由顺序未由 QueryPlan 直接驱动；下一步将路由决策与规划器策略
-   对齐（先对齐、再校准，不改变既有快路径优先级语义）。
+1. **CBO 驱动物理访问**（索引路由对齐已完成，见 §14.6）：索引路由
+   现由规划器选定的策略直接驱动，规划/执行分歧由 EXPLAIN ANALYZE
+   报告。余项：规划器索引候选目前只携带列 + 查找类型，尚未携带可
+   直接执行的键/范围/残余谓词与物化信息；shape 快路径仍在 CBO 之前
+   执行（优先级语义不变），全路由 plan 驱动待成本校准（余项 2）后
+   再推进。
 2. **成本校准**：`estimated_cost` 与实测（Actual Time / Actual Path）
    闭环校准；EXPLAIN ANALYZE 的 Actual Path 为此提供训练/验证数据源。
 3. **morsel 并行评估**：R3 已限定串行分批（内存与正确性前提）；
@@ -641,3 +645,57 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
 4. **JOIN 路径标签**：`execute_select_with_joins` 及 CTE 物化路径
    暂无路由标签（本轮范围为基础 SELECT 路由），其 EXPLAIN ANALYZE
    不输出 `Actual Path` 行；并入余项 1 的路由对齐工作。
+
+### 14.6 R5.2：CBO 驱动物理访问与规划/执行分歧
+
+#### 14.6.1 交付物
+
+1. **索引路由由 plan 直接驱动**：执行器 CBO 块从"计划为
+   扫描/聚合时跳过索引"（负形式）改为"当且仅当计划选择
+   `OltpIndexLookup`/`OltpPrimaryKey` 时走索引路由"（正形式）。
+   计划触发条件不变（有 WHERE 且表有索引），快路径优先级语义
+   不变（shape 快路径仍在 CBO 之前胜出）。
+2. **规划/执行分歧报告**：`PLAN_DIVERGENCE` thread-local 槽
+   （默认关闭、关闭时零状态、首记录生效）。计划选择二级索引
+   访问但执行期索引路由不可用（如执行侧 MCV 选择性高于规划
+   侧 1/NDV 估计，全表扫描被判更便宜）时，EXPLAIN ANALYZE
+   在 `Actual Path` 后输出 `Plan Divergence:` 行，把规划与
+   执行的偏差变为可观测事实（R5"EXPLAIN 与实际执行一致"的
+   首个可执行证据闭环）。
+3. **真实分歧样本**：规划器对偏斜分布的索引列以 1/NDV 估计
+   选择性、执行侧使用 MCV 实际频率；`city='heavy'`（占 50% 行）
+   形状下计划选索引、执行回退全扫并被报告（§14.6.3）。该样本
+   同时是成本校准（余项 2，1/NDV vs MCV）的输入。
+
+#### 14.6.2 实现明细
+
+| 文件 | 变更 |
+| --- | --- |
+| `apexbase/src/query/executor/mod.rs` | `PLAN_DIVERGENCE` thread-local + `record_plan_divergence` / `finish_plan_divergence`；`begin_path_trace` 重置该槽 |
+| `apexbase/src/query/executor/select.rs` | CBO 块改正形式 plan 门控（`plan_uses_index_route` / `plan_uses_secondary_index`）；计划选二级索引而索引路由不可用时记录分歧 |
+| `apexbase/src/query/executor/ddl.rs` | EXPLAIN ANALYZE 在 Actual Path 后输出 `Plan Divergence:` 行（同 R5.1 错误安全次序） |
+| `docs/RESOURCE_OWNERSHIP.md` | §1.1 登记 `PLAN_DIVERGENCE` |
+
+#### 14.6.3 测试覆盖（Rust + Python 两侧）
+
+- Rust（2 项新增）：
+  - `plan_divergence_first_record_wins_and_is_off_by_default`：
+    首记录生效、默认关闭无状态残留、begin 重置。
+  - `explain_analyze_reports_index_plan_divergence`：1000 行偏斜
+    fixture（heavy=50%，NDV=8）+ CREATE INDEX + ANALYZE——偏斜
+    值报告 `OltpIndexLookup` + `Plan Divergence`（实际路由非索引）；
+    稀有值走索引路由且无分歧行。
+- Python（1 项新增，10K 行 fixture）：
+  `test_explain_analyze_reports_plan_divergence_for_skewed_index`，
+  同样两个形状在已安装 wheel 上验证契约。
+
+#### 14.6.4 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功（约 5 分钟）；同口径 `cargo build --release` R5.1 与 R5.2 均为 195 条 lib 警告且警告清单逐项一致（无新增警告；§14.4 引用的 197 为原始输出行数，含 1 条 cargo manifest 警告与 1 条汇总行） |
+| pytest（完整串行） | 1761 passed（既有 1760 + 新增 1），29.2s |
+| cargo test（完整） | 534 lib + 6 doc passed（lib 含 2 项新增） |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103 项全部执行；中位比值 current/base = 0.992（vs `benchmarks/latest_public_baseline.json`，492956b）；7 项 ≥+15%：5 项专项重测在基线水平或更快，2 项重测偏高的（Filter name 0.3853 / Filtered aggregation 0.7737 ms）经同状态交错 A/B（n=240/侧）推翻：base 0.4282/0.6417 vs current 0.4291/0.6532 ms（+0.22% / +1.79%，两 wheel 读数同度抬高 = 机器状态）；原始 JSON 存 `benchmarks/public_bench_current.json` |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时） | 20260908-224041 exit 1（初判 2 项，5 样本终判剩 1 项：Derived ratio GROUP BY +20.34%）；专项交错 A/B（n=240/侧，共享 200K 数据集）：base 0.4639 vs current 0.4416 ms（**-4.79%**，R5.2 更快，4/8 窗领先）→ 机器状态噪声，该指标在 R5.1 验收中亦被标记并以同法推翻 |
+| 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a） | 20260908-225550 exit 1（初判 2 项，5 样本终判剩 1 项：NOT filter +18.31%）；专项交错 A/B（n=240/侧，共享 1M bench 布局数据集）：base 1.3346 vs current 1.2929 ms（**-3.13%**，7/8 窗 R5.2 更快）→ 机器状态漂移。guard 套件不创建任何索引，全部 guard 指标在 CBO 块走 `catalog_is_empty` 快退出，R5.2 改动对该路径不可达。如实记录：本机为持续高负载桌面（约 8 小时构建/基准），完整模式未产生干净 exit 0；同机结论以 78 项完整运行 + 逐项同状态交错 A/B 为依据 |

@@ -27,6 +27,7 @@
 | `QUERY_ROOT_DIR` / `TEMP_DIR`（thread-local） | `Session`（façade） | 当前线程 | 调用方传入的 root/temp 目录 | — | `Session` drop 时 RAII 恢复 | 每查询 | 无（线程本地；R4 起调度器工作线程也会收到，见 §3） |
 | `KEEP_DICT_PROJECTION`（thread-local） | 执行器 | 当前线程 | 布尔开关 | — | `with_keep_dict_projection` 结束 | 每查询 | 无 |
 | `PATH_TRACE`（thread-local） | 执行器 | 当前线程 | EXPLAIN ANALYZE 记录的实际物理路径标签（首个胜出路由 + 可选细节） | 单个短字符串 | `begin_path_trace` 重置 / `finish_path_trace` 取出置 None | 每 EXPLAIN ANALYZE | 无（线程本地；默认关闭，非 EXPLAIN ANALYZE 查询零成本） |
+| `PLAN_DIVERGENCE`（thread-local，Cell） | 执行器 | 当前线程 | EXPLAIN ANALYZE 记录的规划/执行分歧说明（首个胜出，静态字符串） | 单个 `&'static str` | `begin_path_trace` 重置 / `finish_plan_divergence` 取出置 None | 每 EXPLAIN ANALYZE | 无（线程本地；默认关闭且未记录时零状态、零分配） |
 
 ### 1.2 查询规划与分类（`apexbase/src/query/`）
 
