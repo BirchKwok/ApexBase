@@ -519,9 +519,10 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 ## 14. 实施状态（R5：规划与并行）
 
 状态：R5.1（EXPLAIN ANALYZE 报告实际物理路径）、R5.2（CBO 驱动物理访问
-与规划/执行分歧报告）、R5.3（成本校准：时间维度，§14.7）与 R5.4
-（morsel 并行评估：设计/评估文档，不改代码，§14.8）完成；JOIN 路径
-标签为 R5 余项（§14.5）。
+与规划/执行分歧报告）、R5.3（成本校准：时间维度，§14.7）、R5.4
+（morsel 并行评估：设计/评估文档，不改代码，§14.8）与 R5.5（JOIN 与
+CTE 路径标签，§14.9）完成；§14.5 余项仅剩规划器候选携带可直接执行的
+键/范围/残余谓词与物化信息（全路由 plan 驱动）。
 
 ### 14.1 交付物
 
@@ -652,9 +653,10 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
    ——A 期 opt-in（env/客户端参数 + 全局在飞 worker 预算），B 期
    成本自动启用（依赖 R5.3 时间校准 + 超订阅争抢矩阵 + 并行加速曲
    线证据）。余项：A 期实现、加速曲线与争抢矩阵实测未开始。
-4. **JOIN 路径标签**：`execute_select_with_joins` 及 CTE 物化路径
-   暂无路由标签（本轮范围为基础 SELECT 路由），其 EXPLAIN ANALYZE
-   不输出 `Actual Path` 行；并入余项 1 的路由对齐工作。
+4. **JOIN 路径标签**（已完成，见 §14.9）：`execute_select_with_joins`
+   的 4 条快路径与通用 hash join、CTE 的递归/内联/物化三条路由均有
+   路由标签，其 EXPLAIN ANALYZE 输出 `Actual Path` 行；并入余项 1
+   的路由对齐工作。
 
 ### 14.6 R5.2：CBO 驱动物理访问与规划/执行分歧
 
@@ -895,3 +897,72 @@ scatter-gather（O(log)/行 + 随机取行），并行化会放大随机 IO 与�
 3. 组数爆炸形状（高基数 GROUP BY × 多线程）的部分状态内存放大系数
    以线程数上界封顶，但绝对值随组数线性增长——与串行同阶，仅常数
    放大，RSS 测试以组数上界形状覆盖。
+
+### 14.9 R5.5：JOIN 与 CTE 路径标签
+
+#### 14.9.1 交付物
+
+1. **JOIN 路由标签**（`execute_select_with_joins`）：4 条快路径与通用
+   hash join 各自打标，JOIN 查询的 EXPLAIN ANALYZE 自此输出
+   `Actual Path` 行：
+   - `join_count_fast_path`（COUNT-only 快路径，免物化 join）
+   - `join_preaggregated_dimension`（预聚合维表 join）
+   - `join_groupby_count_pushdown`（INNER-JOIN GROUP BY COUNT(*)
+     下推）
+   - `join_bounded_full_outer`（有界 FULL OUTER + LIMIT）
+   - `hash_join`（通用 hash join，无快路径命中）
+2. **CTE 路由标签**（`execute_cte`）：
+   - `cte_recursive`（递归 CTE 迭代不动点）
+   - `cte_inline`（单引用 CTE 内联，无物化）
+   - `cte_materialize`（多引用 CTE 物化进共享批次缓存）
+
+   标签在路由确定时记录（先于 body/main 执行），避免 body 查询自身
+   的路由标签在首记录生效规则下遮蔽 CTE 路由。
+3. **客户端 CTE 校验修复**（`python/apexbase/client.py`）：
+   `_validate_table_in_sql` 的 CTE 跳过原只认 `WITH` 开头的语句，
+   `EXPLAIN [ANALYZE] WITH ...`（含递归 CTE 自引用）被误判为未知表；
+   现先跳过 EXPLAIN / EXPLAIN ANALYZE 前缀再判 CTE。引擎侧本就完整
+   支持 WITH RECURSIVE（解析器与执行器均有测试），此修复恢复 Python
+   客户端对该功能的可达性（Bug 修复，见 14.9.3 测试）。
+
+#### 14.9.2 实现明细
+
+| 文件 | 变更 |
+| --- | --- |
+| `apexbase/src/query/executor/joins.rs` | 4 条 join 快路径返回点各加 `record_path` 标签；通用 hash join 路由入口加 `hash_join` 标签（trace 关闭时为空操作，热路径零成本） |
+| `apexbase/src/query/executor/ddl.rs` | `execute_cte`：递归分支起始（anchor 执行前）记 `cte_recursive`；单引用内联分支（main 执行前）记 `cte_inline`；共享批次分支（路由确定后、body 执行前）记 `cte_materialize` |
+| `apexbase/python/apexbase/client.py` | `_validate_table_in_sql`：CTE 跳过判定先跳过 EXPLAIN / EXPLAIN ANALYZE 前缀 |
+
+#### 14.9.3 测试覆盖（Rust + Python 两侧）
+
+- Rust（2 项新增，`executor/tests.rs`，双表 fixture）：
+  - `explain_analyze_reports_join_route_labels`：普通 join 报
+    `hash_join`；内联 join 上的 `COUNT(*)` 报 `join_count_fast_path`。
+  - `explain_analyze_reports_cte_route_labels`：单引用 CTE 报
+    `cte_inline`；多引用 CTE 报 `cte_materialize`；`WITH RECURSIVE`
+    报 `cte_recursive`。
+- Python（1 项新增，5 行双表 fixture）：
+  `test_explain_analyze_reports_join_and_cte_paths`——上述四个形状在
+  已安装 wheel 上验证契约；同时覆盖此前失败的客户端路径
+  （`EXPLAIN ANALYZE` + `WITH RECURSIVE` 自引用的表名校验）。
+
+#### 14.9.4 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功（约 5 分钟）；同口径 `cargo build --release` 195 条 lib 警告，与 R5.2/R5.3 基线一致（数量与建议数均相同），无新增警告 |
+| pytest（完整串行） | 1763 passed（既有 1762 + 新增 1），26.7s |
+| cargo test（完整） | 539 lib + 6 doc passed（lib 含 2 项新增） |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103 项全部执行；中位比值 current/基线 = 0.955（vs `benchmarks/latest_public_baseline.json`，492956b）；2 项 ≥+15%：GROUP BY category ORDER BY count 0.8396/0.5681 ms、ORDER BY expression (LENGTH) 3.3909/2.8754 ms，均经同状态交错 A/B（n=240/侧，8 窗，共享 1M 数据集）推翻：base 0.3757/1.4239 vs current 0.3724/1.4044 ms（-0.88% / -1.37%）。两形状均不经 R5.5 改动路径（无索引表上的普通 GROUP BY / ORDER BY 表达式，trace 关闭时标签为空操作）；原始 JSON 存 `benchmarks/public_bench_current.json`，A/B 证据 `local-perf-results/20260909-033759/` |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时） | 20260909-033833 exit 1（初判 2 项，5 样本终判 1 项：CSV filtered GROUP BY + HAVING +23.02%）；专项交错 A/B（n=240/侧，8 窗，同生成器 200K CSV）：base 3.0966 vs current 3.1508 ms（**+1.75%**，2 个 current 窗出现 6.8/7.3 ms 机器尖峰，与 R3/R5.x 记录的 p90 尖峰族同形）→ 机器状态噪声；该指标走 CSV 直读路径，不经 R5.5 改动路径。证据 `local-perf-results/20260909-033833/`（含 README + 逐项原始 JSON） |
+| 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a） | 20260909-035325 exit 1：QPS 2/2 与量化 8/8 通过；初判 2 项（UNION ALL +21.57%、UNION DISTINCT +44.90%），5 样本终判剩 1 项（UNION ALL (ordered) +18.81%）；专项交错 A/B（n=240/侧，8 窗，共享 1M 数据集）：base 0.4918 vs current 0.4843 ms（**-1.53%**，current 更快）→ 机器状态噪声；集合运算路径不经 R5.5 改动路径。如实记录：本机持续高负载桌面，同机结论以 78 项完整运行 + 逐项同状态交错 A/B 为依据。证据 `local-perf-results/20260909-035325/`（含 README + 逐项原始 JSON） |
+
+#### 14.9.5 残余风险
+
+1. 通用 hash join 内部按 join 子句的顺序执行（含 LATERAL 变体内联
+   展开）不单独打标——它们是 `hash_join` 路由内的内联操作而非独立
+   物理路由；如需更细粒度可后续拆标签。
+2. `cte_inline` 的判定条件（单引用、Select/Union body、无列别名）
+   若未来调整内联策略，标签语义需同步更新。
+3. 客户端表名校验为 best-effort（函数既有定位），EXPLAIN 前缀跳过
+   仅影响 `EXPLAIN [ANALYZE] WITH ...` 语句，其余校验行为不变。
