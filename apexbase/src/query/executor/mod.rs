@@ -109,6 +109,16 @@ thread_local! {
 }
 
 // ============================================================================
+// Thread-local query cancellation token (architecture review R4)
+// Installed once per query by entry points that run on another thread
+// (query scheduler workers); batch pipelines check it at batch boundaries.
+// ============================================================================
+thread_local! {
+    static QUERY_CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        std::cell::RefCell::new(None);
+}
+
+// ============================================================================
 // Thread-local session variables — SET VARIABLE / RESET VARIABLE / $varname
 // ============================================================================
 thread_local! {
@@ -181,6 +191,23 @@ pub fn clear_temp_dir() {
 /// Get the temp directory for the current thread's query context.
 pub fn get_temp_dir() -> Option<std::path::PathBuf> {
     TEMP_DIR.with(|r| r.borrow().clone())
+}
+
+/// Install or clear the current thread's query cancellation token.
+/// Passing `None` clears any previous token.
+pub fn set_query_cancel_token(token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+    QUERY_CANCEL.with(|c| *c.borrow_mut() = token);
+}
+
+/// Returns true when the current query was cancelled by its caller.
+/// Designed to be checked at batch boundaries, not per row.
+#[inline]
+pub fn query_cancelled() -> bool {
+    QUERY_CANCEL.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|t| t.load(std::sync::atomic::Ordering::Relaxed))
+    })
 }
 
 // ============================================================================

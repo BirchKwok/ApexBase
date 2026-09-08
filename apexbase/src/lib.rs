@@ -71,6 +71,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(get_scheduler_status, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(execute_scheduled, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(execute_scheduled_batch, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(submit_scheduled, m)?)?;
+    m.add_class::<ScheduledHandle>()?;
 
     #[cfg(feature = "server")]
     m.add_function(pyo3::wrap_pyfunction!(python::start_pg_server, m)?)?;
@@ -79,12 +81,20 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Initialize the query scheduler with specified number of threads
+/// Initialize the query scheduler with specified number of threads and
+/// an optional bound on queued queries (admission control).
 #[cfg(feature = "python")]
 #[pyfunction]
-fn init_query_scheduler(num_threads: Option<usize>) -> PyResult<()> {
+#[pyo3(signature = (num_threads = None, max_queue = None))]
+fn init_query_scheduler(
+    num_threads: Option<usize>,
+    max_queue: Option<usize>,
+) -> PyResult<()> {
     let threads = num_threads.unwrap_or(4);
-    crate::query::scheduler::init_scheduler(threads);
+    match max_queue {
+        Some(capacity) => crate::query::scheduler::init_scheduler_with_capacity(threads, capacity),
+        None => crate::query::scheduler::init_scheduler(threads),
+    }
     Ok(())
 }
 
@@ -107,24 +117,89 @@ fn get_scheduler_status() -> PyResult<(bool, i32)> {
 /// Returns a tuple of (success: bool, error_message: str)
 #[cfg(feature = "python")]
 #[pyfunction]
-fn execute_scheduled(sql: String, table_path: String) -> PyResult<(bool, String)> {
-    use crate::query::scheduler::{execute_through_scheduler, QueryResult};
+#[pyo3(signature = (sql, table_path, root_dir = None, temp_dir = None))]
+fn execute_scheduled(
+    sql: String,
+    table_path: String,
+    root_dir: Option<String>,
+    temp_dir: Option<String>,
+) -> PyResult<(bool, String)> {
+    use crate::query::scheduler::{execute_through_scheduler, QueryContext};
     use std::path::PathBuf;
 
+    let context = QueryContext {
+        root_dir: root_dir.map(PathBuf::from),
+        temp_dir: temp_dir.map(PathBuf::from),
+    };
     let path = PathBuf::from(table_path);
 
-    // Try to get a receiver from the scheduler
-    match execute_through_scheduler(sql.clone(), path) {
-        Some(receiver) => {
-            // Wait for result
-            match receiver.recv() {
-                Ok(QueryResult::Data(_batch)) => Ok((true, String::new())),
-                Ok(QueryResult::Error(e)) => Ok((false, e)),
-                Ok(QueryResult::Done) => Ok((true, String::new())),
-                Err(_) => Ok((false, "Channel error".to_string())),
-            }
+    // Submit and wait for the result
+    match execute_through_scheduler(sql, path, &context) {
+        Some(query) => Ok(wait_scheduled_result(query)),
+        None => Ok((
+            false,
+            "Scheduler not initialized or queue full".to_string(),
+        )),
+    }
+}
+
+/// Submit a query through the scheduler and return a cancellable handle.
+#[cfg(feature = "python")]
+#[pyclass]
+pub struct ScheduledHandle {
+    inner: Option<crate::query::scheduler::ScheduledQuery>,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl ScheduledHandle {
+    /// Request cancellation; the query observes the token at its next batch boundary.
+    fn cancel(&self) {
+        if let Some(query) = &self.inner {
+            query.cancel();
         }
-        None => Ok((false, "Scheduler not initialized".to_string())),
+    }
+
+    /// Block until the query finishes. Returns (success, error_message).
+    fn wait(&mut self) -> PyResult<(bool, String)> {
+        use crate::query::scheduler::QueryResult;
+
+        let query = self
+            .inner
+            .take()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("already waited"))?;
+        Ok(match query.wait() {
+            Ok(QueryResult::Data(_batch)) => (true, String::new()),
+            Ok(QueryResult::Error(e)) => (false, e),
+            Ok(QueryResult::Done) => (true, String::new()),
+            Err(e) => (false, e),
+        })
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (sql, table_path, root_dir = None, temp_dir = None))]
+fn submit_scheduled(
+    sql: String,
+    table_path: String,
+    root_dir: Option<String>,
+    temp_dir: Option<String>,
+) -> PyResult<ScheduledHandle> {
+    use crate::query::scheduler::{execute_through_scheduler, QueryContext};
+    use std::path::PathBuf;
+
+    let context = QueryContext {
+        root_dir: root_dir.map(PathBuf::from),
+        temp_dir: temp_dir.map(PathBuf::from),
+    };
+    let path = PathBuf::from(table_path);
+
+    match execute_through_scheduler(sql, path, &context) {
+        Some(query) => Ok(ScheduledHandle { inner: Some(query) }),
+        None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Scheduler not initialized or queue full",
+        )),
     }
 }
 
@@ -132,21 +207,30 @@ fn execute_scheduled(sql: String, table_path: String) -> PyResult<(bool, String)
 /// Returns list of (success: bool, error_message: str)
 #[cfg(feature = "python")]
 #[pyfunction]
-fn execute_scheduled_batch(sqls: Vec<String>, table_path: String) -> PyResult<Vec<(bool, String)>> {
-    use crate::query::scheduler::{execute_through_scheduler, QueryResult};
+#[pyo3(signature = (sqls, table_path, root_dir = None, temp_dir = None))]
+fn execute_scheduled_batch(
+    sqls: Vec<String>,
+    table_path: String,
+    root_dir: Option<String>,
+    temp_dir: Option<String>,
+) -> PyResult<Vec<(bool, String)>> {
+    use crate::query::scheduler::{execute_through_scheduler, QueryContext};
     use std::path::PathBuf;
-    use std::sync::mpsc;
 
+    let context = QueryContext {
+        root_dir: root_dir.map(PathBuf::from),
+        temp_dir: temp_dir.map(PathBuf::from),
+    };
     let path = PathBuf::from(table_path);
 
-    // Submit all queries and collect receivers
-    let mut receivers = Vec::new();
-    for sql in &sqls {
-        match execute_through_scheduler(sql.clone(), path.clone()) {
-            Some(receiver) => receivers.push(receiver),
+    // Submit all queries and collect handles
+    let mut handles = Vec::new();
+    for sql in sqls {
+        match execute_through_scheduler(sql, path.clone(), &context) {
+            Some(query) => handles.push(query),
             None => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "Scheduler not initialized",
+                    "Scheduler not initialized or queue full",
                 ))
             }
         }
@@ -154,16 +238,25 @@ fn execute_scheduled_batch(sqls: Vec<String>, table_path: String) -> PyResult<Ve
 
     // Wait for all results
     let mut results = Vec::new();
-    for receiver in receivers {
-        match receiver.recv() {
-            Ok(QueryResult::Data(_batch)) => results.push((true, String::new())),
-            Ok(QueryResult::Error(e)) => results.push((false, e)),
-            Ok(QueryResult::Done) => results.push((true, String::new())),
-            Err(_) => results.push((false, "Channel error".to_string())),
-        }
+    for query in handles {
+        results.push(wait_scheduled_result(query));
     }
 
     Ok(results)
+}
+
+#[cfg(feature = "python")]
+fn wait_scheduled_result(
+    query: crate::query::scheduler::ScheduledQuery,
+) -> (bool, String) {
+    use crate::query::scheduler::QueryResult;
+
+    match query.wait() {
+        Ok(QueryResult::Data(_batch)) => (true, String::new()),
+        Ok(QueryResult::Error(e)) => (false, e),
+        Ok(QueryResult::Done) => (true, String::new()),
+        Err(e) => (false, e),
+    }
 }
 
 /// Storage engine error type

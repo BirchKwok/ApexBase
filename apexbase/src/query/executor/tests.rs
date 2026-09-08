@@ -3046,6 +3046,55 @@ fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
 }
 
 #[test]
+fn batch_group_pipeline_honors_cancellation_token() {
+    use crate::query::sql_parser::SqlStatement;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("batch_cancel.apex");
+    create_batch_scan_fixture(&path);
+
+    let sql = "SELECT city, code, COUNT(*) AS n                 FROM default WHERE score >= 20                 GROUP BY city, code";
+    let stmt = match SqlParser::parse(sql).unwrap() {
+        SqlStatement::Select(stmt) => stmt,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let predicate =
+        ApexExecutor::build_scan_predicate(stmt.where_clause.as_ref().unwrap()).unwrap();
+    let backend = TableStorageBackend::open(&path).unwrap();
+
+    with_batch_scan(true, || {
+        // No token: the pipeline completes normally.
+        assert!(!crate::query::executor::query_cancelled());
+        assert!(
+            ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate)
+                .unwrap()
+                .is_some(),
+            "batch pipeline must complete without a cancellation token"
+        );
+
+        // Pre-set token: the first batch boundary aborts with Interrupted.
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        crate::query::executor::set_query_cancel_token(Some(std::sync::Arc::clone(&token)));
+        let outcome = ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate);
+        crate::query::executor::set_query_cancel_token(None);
+        let err = match outcome {
+            Err(err) => err,
+            Ok(_) => panic!("cancellation surfaces as an error"),
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(err.to_string(), "query cancelled");
+
+        // Token cleared again: the pipeline completes.
+        assert!(
+            ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate)
+                .unwrap()
+                .is_some(),
+            "batch pipeline must complete after the token is cleared"
+        );
+    });
+}
+
+#[test]
 fn batch_scan_pipeline_matches_single_batch_pipeline() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("batch_scan_ab.apex");

@@ -287,3 +287,59 @@ def test_in_memory_analytical_cache_and_string_groups_remain_write_visible():
         ]
     finally:
         client.close()
+
+
+def test_close_and_reopen_reads_flushed_data(tmp_path):
+    """R4: close/reopen semantics — a fresh client must see flushed data."""
+    writer = ApexClient(str(tmp_path))
+    writer.create_table(
+        "reopen", {"name": "string", "score": "int", "category": "string"}
+    )
+    writer.use_table("reopen")
+    writer.store(
+        [
+            {"name": "alpha", "score": 10, "category": "x"},
+            {"name": "beta", "score": 20, "category": "y"},
+        ]
+    )
+    writer.flush()
+    writer.close()
+
+    reopened = ApexClient(str(tmp_path))
+    reopened.use_table("reopen")
+    try:
+        rows = reopened.execute("SELECT * FROM reopen ORDER BY name").to_dict()
+        assert [row["name"] for row in rows] == ["alpha", "beta"]
+    finally:
+        reopened.close()
+
+
+def test_reopen_picks_up_external_changes_after_close(tmp_path):
+    """R4: a client that closed and reopens must observe writes made by
+    another client in the meantime (stale caches must not survive)."""
+    first = ApexClient(str(tmp_path))
+    first.create_table(
+        "extchange", {"name": "string", "score": "int", "category": "string"}
+    )
+    first.use_table("extchange")
+    first.store([{"name": "alpha", "score": 10, "category": "x"}])
+    first.flush()
+    first.execute("SELECT * FROM extchange")  # warm all read caches
+    first.close()
+
+    other = ApexClient(str(tmp_path))
+    other.use_table("extchange")
+    other.store([{"name": "beta", "score": 30, "category": "y"}])
+    other.flush()
+    other.close()
+
+    reactivated = ApexClient(str(tmp_path))
+    reactivated.use_table("extchange")
+    try:
+        rows = reactivated.execute(
+            "SELECT * FROM extchange ORDER BY name"
+        ).to_dict()
+        assert [row["name"] for row in rows] == ["alpha", "beta"]
+        assert [row["score"] for row in rows] == [10, 30]
+    finally:
+        reactivated.close()

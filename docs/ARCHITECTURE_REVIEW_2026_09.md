@@ -435,3 +435,83 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 3. `INTERSECT (ordered)` 在 R1/R2/R3 多次出现采样尖峰，可考虑在门禁脚本中记录为已知易波动指标（不改阈值）。
 4. 批量流仍为串行；并行 morsel 调度仍是后续工作（见 `docs/SCAN_EXECUTION_ARCHITECTURE.md` Current Limits）。
 
+## 13. 实施状态（R4：资源与状态归属）
+
+状态：本轮增量完成（状态清单 + 调度器会话上下文传播 + 队列准入控制 + 查询取消）；
+内存预算与 Flight 分批结果桥接为 R4 余项（§13.5）。阶段最终验收已通过
+（canary 与完整模式均退出码 0）。
+
+### 13.1 交付物
+
+1. **权威状态清单**：`docs/RESOURCE_OWNERSHIP.md`。按 A4 要求为每个
+   进程内状态/缓存明确 owner、key、数据来源、容量、失效时机、关闭
+   时机、跨进程行为；登记缺口 G1（无上限缓存 8 项）、G2（执行器/
+   StorageEngine 双读 backend 缓存）、G3（调度器 thread-local 归属）。
+2. **调度器会话上下文传播**（A4/A5）：`QueryTask` 携带 `root_dir` /
+   `temp_dir`，工作线程执行前安装、结束后 RAII 恢复，与 `Session` 的
+   TLS 语义一致。此前 `QueryTask` 只带 SQL 与表路径，工作线程丢失
+   这两项上下文（跨库限定名与 TEMP TABLE 解析在并行路径上不可用）。
+3. **任务队列准入控制**（A5"服务端限制排队"）：队列默认上限 1024，
+   `init_query_scheduler(num_threads, max_queue)` 可配置；超限提交
+   立即拒绝（不阻塞、不无界增长），调用方收到明确错误。
+4. **查询取消**（A5"取消传播到执行器"）：`ScheduledQuery` 句柄
+   （Python `submit_scheduled` → `cancel()` / `wait()`）；工作线程将
+   取消标记装入线程本地 `QUERY_CANCEL`；R3 分批聚合流水线
+   （`try_batch_group_pipeline`）在每个批次边界检查一次（一次原子读
+   + 一个分支，批次级而非行级），命中返回
+   `Interrupted("query cancelled")`。单批次路径与融合内核不做行级
+   检查（成本/收益不支持）。
+
+### 13.2 实现明细
+
+| 文件 | 变更 |
+| --- | --- |
+| `apexbase/src/query/scheduler.rs` | `QueryContext` / `ScheduledQuery` / 有界队列 / 工作线程上下文安装与恢复；`submit_with_context`、`init_scheduler_with_capacity`、`queued_count` |
+| `apexbase/src/query/executor/mod.rs` | 线程本地 `QUERY_CANCEL` + `set_query_cancel_token` / `query_cancelled` |
+| `apexbase/src/query/executor/batch_group.rs` | 批次循环每批一次取消检查 |
+| `apexbase/src/lib.rs` | `init_query_scheduler(num_threads, max_queue)`、`execute_scheduled[_batch](..., root_dir, temp_dir)`、`submit_scheduled` + `ScheduledHandle`（cancel/wait）；`wait_scheduled_result` 消除三处重复的 recv 映射；trailing-Option 参数改为显式 `#[pyo3(signature)]` |
+| `docs/RESOURCE_OWNERSHIP.md` | 新增：状态清单与所有权结论 |
+
+### 13.3 测试覆盖（Rust + Python 两侧）
+
+- Rust 单元测试（3 项新增，`cargo test` 528 项全过）：
+  - `scheduled_query_propagates_session_context`：无上下文时跨库限定
+    名解析失败、带 `root_dir` 成功（验证工作线程上下文语义）。
+  - `scheduled_queue_rejects_when_full`：flock 阻塞工作线程后验证
+    队列满立即拒绝（不阻塞）、释放后排队任务按序完成。
+  - `batch_group_pipeline_honors_cancellation_token`：预置 token 时
+    首个批次边界返回 `Interrupted("query cancelled")`，清除后恢复正常。
+- Python 契约测试（6 项新增，`pytest` 1756 项全过）：
+  - `test_scheduler_session_contract.py`：上下文传播（root_dir）、
+    队列满拒绝（`submit_scheduled` 句柄 + flock 阻塞）、运行中取消
+    （10M 行 × 20 万分组基数，实测查询 ~2 s，取消窗口余量 >20x）、
+    已完成查询的取消为 no-op。
+  - `test_cache_invalidation_contract.py`：close/reopen 后新客户端
+    读到已 flush 数据；close 后他端写入、重开客户端可见（缓存不得
+    跨 close/reopen 存留）。
+
+### 13.4 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功；195 条 warning < R2/R3 基线 201（R4 变更净减少：移除 2 处未用导入、trailing-Option 改显式 signature 消除 3 条 pyo3 弃用警告） |
+| pytest（完整串行） | 1756 passed（27.25 s） |
+| cargo test（完整） | 528 单元 + 6 文档，全部通过 |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103 项表格 + 6 项向量全部执行。对比基线 `latest_public_baseline.json`（492956b，v1.33.0，落后当前 15 个提交）：中位数比率 0.946；1 项 ≥+15%（EXISTS subquery COUNT 0.757→2.700 ms），同机独立重测中位数 0.66 ms（与基线一致），判为长时 benchmark 运行窗口内的机器状态波动（当时系统 CPU 负载偏高）。另一次运行中 4 项 ≥+15% 的指标（含 GROUP BY category 2.650 ms）同样经独立重测回到基线量级（0.77 ms） |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时） | 首轮 20260908-130951 与次轮 20260908-133854 各判 1–2 项亚毫秒过滤聚合指标回退（+15%～+66%）。聚焦 A/B（同一 200K 行数据集、base 隔离轮子 vs current、`enable_cache=False`、6 窗口 × 15 次交错 = 90 次/侧）：Numeric equality +0.50% / −2.99%、Numeric conjunction +1.08%、NULL profile +9.77% / −2.46%（均低于 15% 阈值）；两次 canary 的"回退"窗口分别含 1.859 ms 与 2.7/24.1 ms（base 侧）孤立尖峰，且 base 与 current 窗口交替出现慢值。两项查询均不经过 R3/R4 批次流水线路径，代码路径两侧一致。判定为采样窗口噪声；未删除样本、未调整阈值，原始数据保留于 `local-perf-results/20260908-130951/focused-ab/` 与 `local-perf-results/20260908-133854/focused-ab-*`。最终干净运行 20260908-135517：**56/56 通过，退出码 0** |
+| 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a） | 20260908-140748：**109 项表格 + 2 项 Q/s + 8 项量化，三段比较全部通过，退出码 0**（三样本初判直接通过，无需五样本扩展）。此前 20260908-114154（警告清理前构建）同样全过，保留 |
+
+### 13.5 残余与后续（R4 余项）
+
+1. **查询内存预算**：批次扫描内存已由 R3 限定为一个行组；高基数
+   GROUP BY 的聚合器状态与全局准入预算需独立设计（A5 顺序：先明确
+   内存所有权 → 本文档清单已交付 → 预算设计）。
+2. **Flight 分批结果桥接**：`do_get` 仍整体物化后单批次流式交付；
+   应桥接 R3 批次流，并评估 `get_flight_info` 与 `do_get` 的一致性与
+   重复执行成本。
+3. **G1/G2/G3**（见 `docs/RESOURCE_OWNERSHIP.md` §2）：无上限缓存
+   加容量上限、双读 backend 缓存合并、调度器进程级共享，均按"每种
+   缓存和每个入口单独迁移"原则在后续阶段逐项处理并独立验收。
+4. 亚毫秒 canary 指标（过滤聚合族）在本机负载下窗口级波动可达
+   ±20%（含 base 侧），建议在门禁脚本中登记为已知易波动族（不改
+   阈值），与 R3 记录的 `INTERSECT (ordered)` 同处理。

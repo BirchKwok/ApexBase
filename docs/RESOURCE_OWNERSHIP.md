@@ -1,0 +1,139 @@
+# 资源与状态归属清单（架构评审 R4）
+
+本文档是 `ARCHITECTURE_REVIEW_2026_09.md` 第 3 节 A4（缓存与
+会话生命周期分散）与 A5（按需存储与查询内存上限未打通）的落地
+交付物：为每个进程内状态/缓存明确 **owner、key、数据来源、容量、
+失效时机、关闭时机、跨进程行为**。
+
+规则（来自评审建议）：
+
+- 每种状态只有一个权威 owner；失效与关闭只能由 owner 触发。
+- 绑定层与 Python 层可以保留带代际（epoch）校验的低开销引用缓存，
+  不持有 mmap 所有权。
+- 不把全部缓存合并成一把全局锁；不删除仍被引用的 mmap 所有者。
+
+## 1. 权威状态清单
+
+### 1.1 查询执行器（`apexbase/src/query/executor/`）
+
+| 状态 | owner | key | 数据来源 | 容量 | 失效时机 | 关闭时机 | 跨进程 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `STORAGE_CACHE` | 执行器 | `PathBuf`（表路径） | 打开的 `TableStorageBackend`（mmap 所有者之一） | 64 条，LRU | 写入后 `invalidate_storage_cache[_dir]`；epoch/mtime 变化时读路径自动重建 | 进程退出（mmap 随进程释放） | 无（进程本地）；跨进程写序列化靠 `TABLE_WRITE_LOCKS` 的 flock |
+| `TABLE_WRITE_LOCKS` | 执行器 | `PathBuf`（表路径） | 每表 `Mutex` + 常驻 `.lock` 文件句柄 | 无上限（随表数增长） | 不失效（锁文件持久存在） | 进程退出 | fs2 `flock_exclusive`，跨进程互斥 |
+| `SQL_PARSE_CACHE` | 执行器 | SQL 文本 | `Vec<SqlStatement>` 解析结果 | **无上限**（见 §2 缺口 G1） | 不失效（SQL 文本不可变） | 进程退出 | 无 |
+| `CTE_BATCH_CACHE` | 执行器 | CTE 临时文件路径 | CTE 子查询的 Arrow 批次 | 无上限（见 G1） | 语句结束时按路径移除 | 进程退出 | 无 |
+| `INDEX_CACHE` | 执行器 | `base_dir/table_name` | `IndexManager`（磁盘索引目录） | 32 容量提示 | 写入后 `invalidate_index_cache[_dir]`；epoch 变化时读路径自动重载 | 进程退出 | 无 |
+| `FTS_MANAGER_CACHE` / `FTS_BACKFILL_TASKS` | 执行器 | 表路径 / (表路径, 列) | FTS 索引管理器、后台回填任务 | 随表数增长（见 G1） | FTS 重建/失效入口 | 进程退出（回填线程为 detached） | 无 |
+| `QUERY_ROOT_DIR` / `TEMP_DIR`（thread-local） | `Session`（façade） | 当前线程 | 调用方传入的 root/temp 目录 | — | `Session` drop 时 RAII 恢复 | 每查询 | 无（线程本地；R4 起调度器工作线程也会收到，见 §3） |
+| `KEEP_DICT_PROJECTION`（thread-local） | 执行器 | 当前线程 | 布尔开关 | — | `with_keep_dict_projection` 结束 | 每查询 | 无 |
+
+### 1.2 查询规划与分类（`apexbase/src/query/`）
+
+| 状态 | owner | key | 数据来源 | 容量 | 失效时机 | 关闭时机 | 跨进程 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `CLASSIFY_CACHE`（query_signature.rs） | 查询签名分类器 | SQL 文本 | `QuerySignature` | 无上限（见 G1） | 不失效 | 进程退出 | 无 |
+| `STATS_CACHE`（planner.rs） | 查询规划器 | 表 key | 表统计 + 观察时间 | 无上限（见 G1） | 写入后 `invalidate_table_stats` | 进程退出 | 无 |
+| `PLAN_FEEDBACK`（planner.rs） | 查询规划器 | SQL 指纹 | 计划反馈 | 无上限（见 G1） | 规划器内部更新 | 进程退出 | 无 |
+| `JIT_FILTER_CACHE`（jit.rs） | JIT 过滤器 | 谓词模式 | 编译后的过滤闭包 | 有界（内部 LRU） | 内部驱逐 | 进程退出 | 无 |
+
+### 1.3 存储层（`apexbase/src/storage/`）
+
+| 状态 | owner | key | 数据来源 | 容量 | 失效时机 | 关闭时机 | 跨进程 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `StorageEngine.cache`（读 backend，LRU） | `StorageEngine`（全局单例） | `PathBuf` | `TableStorageBackend` | `MAX_CACHE_ENTRIES`（64），LRU | `invalidate` / `invalidate_after_append` / `invalidate_dir`；epoch+mtime 读时校验 | 进程退出 | 无 |
+| `StorageEngine.schema_cache` | 同上 | `PathBuf` | 列名集合、行数、epoch | 128 容量提示 | 同上 | 进程退出 | 无 |
+| `StorageEngine.insert_cache` | 同上 | `PathBuf` | 插入模式 backend（热写） | 64，LRU | `invalidate` / `invalidate_dir`（append 后保留热写 backend） | 进程退出 | 无 |
+| `StorageEngine.memory_tables` | 同上 | `PathBuf` | 内存表 backend（权威，非缓存） | 无上限（见 G1） | `drop_memory_table` / `drop_memory_database` | 内存库 drop；进程退出 | 无 |
+| `TABLE_EPOCHS` / `GLOBAL_EPOCH`（epoch.rs） | 存储 epoch 模块 | `PathBuf` | 逻辑写入发布计数 | 随表数增长 | 逻辑写入提交时发布 | 进程退出 | 无（每进程独立计数；跨进程可见性靠文件 mtime+flock） |
+| `GLOBAL_DICT_CACHE` + 字节/时钟计数器（backend.rs） | 存储 backend | `(PathBuf, 列)` | 全局字典（低基数列） | 字节上限 + 时钟驱逐 | `invalidate_global_dict_cache`（写入后） | 进程退出 | 无 |
+| `GLOBAL_COLUMN_NULL_CACHE` | 存储 backend | `(PathBuf, 列)` | NULL 判定 + mtime + epoch | 无上限（见 G1） | mtime/epoch 变化时读路径失效 | 进程退出 | 无 |
+| `GLOBAL_DICT_HIGH_CARD_CACHE` | 存储 backend | `(PathBuf, 列)` | 高基数负缓存 | 无上限（见 G1） | mtime/epoch 变化时读路径失效 | 进程退出 | 无 |
+| `DELTA_*_CACHE`（on_demand/storage_core.rs：字符串索引、数值范围、行数、批次） | on-demand 存储 | `PathBuf` / `(PathBuf, 列)` | delta 文件内容 | 字节/条目上限（内部） | delta 落盘/合并后失效 | 进程退出 | 无 |
+| `CATALOGS`（table_catalog.rs） | 表目录模块 | `PathBuf`（base dir） | 映射的 catalog 文件 | 随库数增长 | 目录变更入口 | 进程退出 | 无 |
+| 每 backend 页缓存（on_demand 内部） | `TableStorageBackend` 实例 | backend 内部 | mmap/页读 | 内部有界 | backend 自身 `invalidate_page_cache` / footer 失效 | backend drop（mmap 释放） | 无 |
+
+### 1.4 绑定层（`apexbase/src/python/bindings/`）
+
+| 状态 | owner | key | 数据来源 | 容量 | 失效时机 | 关闭时机 | 跨进程 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `ApexStorage.entries`（wrapper.rs） | `ApexStorage` 实例 | 表名 | 带 epoch 校验的 backend 引用缓存 | 随表数增长 | epoch 变化时读路径重建 | 实例 drop / `close()`（清空 `cached_backends`） | 无（A4 允许的代际引用缓存） |
+| `cached_backends`（read.rs，实例字段） | `ApexStorage` 实例 | cache key | 同上 | 随表数增长 | 同上 | 实例 `close()` 显式清空 | 无 |
+| `update_by_id_numeric_cache` / `update_by_id_cell_cache` / `replace_exact_row_cache` / `flush_prewarm_tables` | `ApexStorage` 实例 | 表名/复合 key | 热写辅助结构 | 随表数增长 | 失效入口按表清理 | 实例 drop | 无 |
+
+### 1.5 Python 层（`apexbase/python/apexbase/client.py`）
+
+| 状态 | owner | key | 数据来源 | 容量 | 失效时机 | 关闭时机 | 跨进程 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `_query_result_cache` | `ApexClient` 实例 | (路由, SQL, token) | 查询结果（缓存值含数据代际 token） | FIFO 上限（超限弹最旧） | 本地写入后按 token/路由失效（见 `test_cache_invalidation_contract.py`） | 实例 drop | 无 |
+| `_query_result_cacheability` | 同上 | SQL | 可缓存性判定 | 256（超限整体清空） | 同上 | 实例 drop | 无 |
+| `_simple_sql_cache` | 同上 | SQL | 简单 SQL 路由 | 无上限（见 G1） | 本地写入后清空相关项 | 实例 drop | 无 |
+| 模块级 `_auto_scheduler_*` | 模块 | — | 自动调度器开关 | — | `_disable_auto_scheduler` | 进程退出 | 无 |
+
+### 1.6 调度器（`apexbase/src/query/scheduler.rs`）
+
+| 状态 | owner | key | 数据来源 | 容量 | 失效时机 | 关闭时机 | 跨进程 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `SCHEDULER`（thread-local） | 初始化它的线程 | — | `ThreadPoolExecutor`（工作线程池） | 线程数由初始化参数决定 | 不失效 | `Drop`（shutdown 并 join 全部工作线程） | 无。**已知约束**：thread-local 意味着只有初始化线程能提交任务；进程级共享调度器是 R5 候选，不在本轮改动 |
+| 任务队列 `task_queue` | `ThreadPoolExecutor` | — | `VecDeque<QueryTask>` | **本轮起有界**（默认 1024，可配置，见 §3） | 任务出队即释放 | 池 drop | 无 |
+| `QueryTask.cancel` | 提交方（经 `ScheduledQuery` 句柄） | — | `Arc<AtomicBool>` 取消标记 | — | `cancel()` 置位 | 任务完成 | 无（进程内跨线程） |
+
+### 1.7 Flight 服务（`apexbase/src/flight/`、`bin/flight_main.rs`）
+
+每个请求在 `spawn_blocking` 工作线程上构建一次性 `Session`
+（root_dir = 库目录），不持有跨请求状态；TLS 上下文天然按
+工作线程隔离。当前 `do_get` 会整体物化再编码为单批次流，
+分批结果经 Flight 流式交付（"分批结果桥接"）列为 R4 余项（§4）。
+
+## 2. 所有权结论与缺口
+
+- **mmap 所有权**：`StorageEngine.cache` 与执行器 `STORAGE_CACHE`
+  是两套并行的读 backend 缓存（双缓存）。两者都只做 LRU +
+  epoch/mtime 失效，语义一致、互不引用。合并为单一权威缓存会
+  触碰全部查询热路径，本轮**不合并**，记录为 G2，待 R5 规划
+  阶段按"每种缓存单独迁移"的原则处理。
+- **写序列化**：唯一 owner 是执行器 `TABLE_WRITE_LOCKS`
+  （进程内 Mutex + 跨进程 flock）。
+- **可见性发布**：唯一 owner 是 `storage/epoch`
+  （逻辑写入 → epoch 发布 → 缓存读路径校验）。
+- **索引/FTS**：执行器缓存为 owner，磁盘目录为数据源。
+- **Python 结果缓存**：owner 是 client 实例；跨客户端失效依赖
+  数据代际 token（已有契约测试覆盖）。
+- 绑定层的 `entries` / `cached_backends` 符合 A4 允许的
+  "带代际校验的低开销引用缓存"，保留。
+
+### 缺口（G*）
+
+- **G1 无上限缓存**：`SQL_PARSE_CACHE`、`CTE_BATCH_CACHE`、
+  `CLASSIFY_CACHE`、`STATS_CACHE`、`PLAN_FEEDBACK`、
+  `GLOBAL_COLUMN_NULL_CACHE`、`GLOBAL_DICT_HIGH_CARD_CACHE`、
+  Python `_simple_sql_cache`。对嵌入式长进程存在缓慢性增长风险。
+  本轮只登记，不改行为；加容量上限属于行为变化，需独立评审。
+- **G2 双 backend 缓存**：见上文结论。
+- **G3 调度器 thread-local**：见 §1.6 约束。
+
+## 3. 本轮（R4.1–R4.3）代码变更
+
+1. **调度器会话上下文传播**（A4/A5）：`QueryTask` 携带
+   `root_dir` / `temp_dir`；工作线程执行前安装、结束后 RAII
+   恢复，与 `Session` 的 TLS 语义一致。此前工作线程丢失这两项
+   上下文（`QueryTask` 只带 SQL 与表路径）。
+2. **任务队列准入控制**（A5"服务端限制排队"）：队列默认上限
+   1024，`init_query_scheduler(num_threads, max_queue)` 可配置；
+   超限提交立即拒绝（不阻塞），调用方收到明确错误。
+3. **查询取消**（A5"取消传播到执行器"）：`ScheduledQuery` 句柄
+   暴露 `cancel()`；工作线程将取消标记装入线程本地
+   `QUERY_CANCEL`；分批聚合流水线（R3 的
+   `try_batch_group_pipeline`）在每个批次边界检查一次（一次
+   原子读 + 一个分支，位于批次级而非行级），命中即返回
+   `Interrupted("query cancelled")`。单批次路径与融合内核内部
+   不做行级检查（成本/收益不支持；A5 的串行分批前提已满足）。
+
+## 4. 暂缓项（R4 余项 → 后续阶段）
+
+- **查询内存预算**：批次扫描内存已由 R3 限定为一个行组；
+  聚合器状态（高基数 GROUP BY）与全局准入预算需要独立设计
+  （A5 顺序：先明确内存所有权——本文档——再谈预算）。
+- **Flight 分批结果桥接**：`do_get` 流式交付 R3 批次、
+  `get_flight_info` 与 `do_get` 的一致性/成本评估。
+- **G1/G2/G3**：按"每种缓存和每个入口单独迁移"原则，
+  在后续阶段逐项处理，每项独立提交与验收。

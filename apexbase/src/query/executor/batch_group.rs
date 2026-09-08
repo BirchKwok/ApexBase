@@ -715,6 +715,14 @@ impl ApexExecutor {
 
         let mut agg = aggregator;
         loop {
+            // Cancellation is checked at batch boundaries (one atomic load
+            // per row group), never per row (architecture review R4).
+            if crate::query::executor::query_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "query cancelled",
+                ));
+            }
             match stream.next() {
                 Some(Ok(crate::storage::BatchMorselOutcome::Morsel(morsel))) => {
                     let batch = morsel.into_record_batch()?;
