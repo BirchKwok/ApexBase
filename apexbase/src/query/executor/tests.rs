@@ -3543,3 +3543,96 @@ fn explain_analyze_reports_generic_executor_path() {
     );
     assert_eq!(actual_path(&plan), "generic_executor");
 }
+
+// ============================================================================
+// R5.2: plan-driven physical access and plan/execution divergence
+// ============================================================================
+
+fn create_index_divergence_fixture(path: &Path) {
+    // 1000 rows; `heavy` covers 50% of the rows and the remaining half is
+    // spread over 7 tail values (city NDV = 8).
+    const ROWS: usize = 1_000;
+    let storage = OnDemandStorage::create(path).unwrap();
+    let mut cities = Vec::with_capacity(ROWS);
+    let mut scores = Vec::with_capacity(ROWS);
+    for i in 0..ROWS {
+        cities.push(if i % 2 == 0 {
+            "heavy".to_string()
+        } else {
+            format!("t{}", i % 7)
+        });
+        scores.push((i % 97) as f64 * 0.5);
+    }
+    storage
+        .insert_typed(
+            HashMap::new(),
+            HashMap::from([("score".to_string(), scores)]),
+            HashMap::from([("city".to_string(), cities)]),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save().unwrap();
+
+    ApexExecutor::execute("CREATE INDEX idx_city ON default(city)", path).unwrap();
+    ApexExecutor::execute("ANALYZE default", path).unwrap();
+}
+
+#[test]
+fn plan_divergence_first_record_wins_and_is_off_by_default() {
+    crate::query::executor::begin_path_trace();
+    crate::query::executor::record_plan_divergence("first");
+    crate::query::executor::record_plan_divergence("second");
+    assert_eq!(
+        crate::query::executor::finish_plan_divergence(),
+        Some("first")
+    );
+    crate::query::executor::finish_path_trace();
+
+    // Tracing off by default: notes are dropped, no state is left behind.
+    crate::query::executor::record_plan_divergence("off");
+    assert_eq!(crate::query::executor::finish_plan_divergence(), None);
+
+    // begin_path_trace resets the divergence slot.
+    crate::query::executor::begin_path_trace();
+    crate::query::executor::finish_path_trace();
+    assert_eq!(crate::query::executor::finish_plan_divergence(), None);
+}
+
+#[test]
+fn explain_analyze_reports_index_plan_divergence() {
+    let dir = tempdir().unwrap();
+    // The file stem must match the table name used in the statements.
+    let path = dir.path().join("default.apex");
+    create_index_divergence_fixture(&path);
+
+    // The planner prices the skewed `heavy` value at 1/NDV (0.125) and
+    // chooses the index candidate; at execution the MCV-based selectivity
+    // (0.5) makes the full scan cheaper, so the index route is skipped and
+    // the plan/execution divergence is reported.
+    let plan = explain_analyze_plan(
+        &path,
+        "EXPLAIN ANALYZE SELECT * FROM default WHERE city = 'heavy'",
+    );
+    assert!(
+        plan.contains("Chosen Plan: OltpIndexLookup"),
+        "planner must choose the index candidate, got:\n{plan}"
+    );
+    assert!(
+        plan.contains(
+            "Plan Divergence: plan chose index access; index route unavailable at execution; fell back to scan"
+        ),
+        "divergence must be reported, got:\n{plan}"
+    );
+    assert_ne!(actual_path(&plan), "index_accelerated_read");
+
+    // Control: a rare value keeps both cost models on the index route, so
+    // the plan is followed and no divergence is reported.
+    let plan = explain_analyze_plan(
+        &path,
+        "EXPLAIN ANALYZE SELECT * FROM default WHERE city = 't1'",
+    );
+    assert!(plan.contains("Chosen Plan: OltpIndexLookup"));
+    assert_eq!(actual_path(&plan), "index_accelerated_read");
+    assert!(!plan.contains("Plan Divergence"));
+}

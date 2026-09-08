@@ -843,6 +843,7 @@ impl ApexExecutor {
             crate::query::executor::begin_path_trace();
             let result = Self::execute_parsed_multi(stmt.clone(), base_dir, default_table_path);
             let actual_path = crate::query::executor::finish_path_trace();
+            let plan_divergence = crate::query::executor::finish_plan_divergence();
             let result = result?;
             let elapsed = start.elapsed();
             plan_lines.push(format!(
@@ -855,6 +856,9 @@ impl ApexExecutor {
             ));
             if let Some(path) = actual_path {
                 plan_lines.push(format!("  Actual Path: {path}"));
+            }
+            if let Some(note) = plan_divergence {
+                plan_lines.push(format!("  Plan Divergence: {note}"));
             }
             if let Ok(batch) = result.to_record_batch() {
                 plan_lines.push(format!("  Actual Rows: {}", batch.num_rows()));

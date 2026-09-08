@@ -117,11 +117,14 @@ thread_local! {
 thread_local! {
     static PATH_TRACE: std::cell::RefCell<Option<String>> =
         std::cell::RefCell::new(None);
+    static PLAN_DIVERGENCE: std::cell::Cell<Option<&'static str>> =
+        std::cell::Cell::new(None);
 }
 
 /// Start tracing the physical path of queries executed on this thread.
 pub fn begin_path_trace() {
     PATH_TRACE.with(|t| *t.borrow_mut() = Some(String::new()));
+    PLAN_DIVERGENCE.with(|d| d.set(None));
 }
 
 /// Record the winning physical route (first record wins).
@@ -152,6 +155,26 @@ pub fn record_path_detail_f(detail: std::fmt::Arguments<'_>) {
 /// End tracing and return the recorded route, if any.
 pub fn finish_path_trace() -> Option<String> {
     PATH_TRACE.with(|t| t.borrow_mut().take())
+}
+
+/// Record that the planner's physical decision and the executed route
+/// diverged (first record wins; no-op while tracing is off).
+#[inline]
+pub fn record_plan_divergence(note: &'static str) {
+    PATH_TRACE.with(|t| {
+        if t.borrow().is_some() {
+            PLAN_DIVERGENCE.with(|d| {
+                if d.get().is_none() {
+                    d.set(Some(note));
+                }
+            })
+        }
+    });
+}
+
+/// End tracing and return the recorded divergence note, if any.
+pub fn finish_plan_divergence() -> Option<&'static str> {
+    PLAN_DIVERGENCE.with(|d| d.take())
 }
 
 // ============================================================================

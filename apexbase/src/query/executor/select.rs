@@ -674,38 +674,43 @@ return Ok(result);
                                 }
                             }
 
-                            // CBO: Use plan_select_pub() to decide execution strategy.
-                            // Skip expensive index checks when CBO recommends full scan or aggregation.
-                            // Also skip CBO entirely for: (a) no WHERE clause, (b) table has no indexes.
-                            let cbo_skip_index = if stmt.where_clause.is_none() {
-                                true
-                            } else {
-                                let (bd, tname) = base_dir_and_table(storage_path);
-                                let idx_mgr_arc = get_index_manager(&bd, &tname);
-                                let idx_mgr = idx_mgr_arc.lock();
-                                // Fast exit: if table has no indexes, CBO can only say full/filtered scan
-                                if idx_mgr.catalog_is_empty() {
-                                    true
+                            // CBO: the planner's chosen strategy directly drives the physical
+                            // index route (architecture review R5.2). Planning is skipped for:
+                            // (a) no WHERE clause, (b) table has no indexes.
+                            let (plan_uses_index_route, plan_uses_secondary_index) =
+                                if stmt.where_clause.is_none() {
+                                    (false, false)
                                 } else {
-                                    let table_key = storage_path.to_string_lossy();
-                                    let cbo_plan = QueryPlanner::plan_select_details(
-                                        &stmt,
-                                        Some(&*idx_mgr),
-                                        &table_key,
-                                        Self::planner_context(&backend, stmt.where_clause.as_ref()),
-                                    );
-                                    matches!(
-                                        cbo_plan.strategy,
-                                        ExecutionStrategy::OlapFullScan
-                                            | ExecutionStrategy::OlapAggregation
-                                            | ExecutionStrategy::OlapFilteredScan
-                                    )
-                                }
-                            };
+                                    let (bd, tname) = base_dir_and_table(storage_path);
+                                    let idx_mgr_arc = get_index_manager(&bd, &tname);
+                                    let idx_mgr = idx_mgr_arc.lock();
+                                    // Fast exit: if table has no indexes, the plan can only choose a scan
+                                    if idx_mgr.catalog_is_empty() {
+                                        (false, false)
+                                    } else {
+                                        let table_key = storage_path.to_string_lossy();
+                                        let cbo_plan = QueryPlanner::plan_select_details(
+                                            &stmt,
+                                            Some(&*idx_mgr),
+                                            &table_key,
+                                            Self::planner_context(&backend, stmt.where_clause.as_ref()),
+                                        );
+                                        (
+                                            matches!(
+                                                cbo_plan.strategy,
+                                                ExecutionStrategy::OltpIndexLookup { .. }
+                                                    | ExecutionStrategy::OltpPrimaryKey { .. }
+                                            ),
+                                            matches!(
+                                                cbo_plan.strategy,
+                                                ExecutionStrategy::OltpIndexLookup { .. }
+                                            ),
+                                        )
+                                    }
+                                };
 
-                            // FAST PATH INDEX: Check if WHERE clause can use a secondary index
-                            // (skipped when CBO says full scan/aggregation is cheaper)
-                            if !cbo_skip_index {
+                            // FAST PATH INDEX: taken exactly when the plan chose the index route
+                            if plan_uses_index_route {
                                 if let Some(ref where_clause) = stmt.where_clause {
                                     if let Some(result) = Self::try_index_accelerated_read(
                                         &backend,
@@ -716,6 +721,11 @@ return Ok(result);
                                     )? {
                                         crate::query::executor::record_path("index_accelerated_read");
                                         return Ok(result);
+                                    }
+                                    if plan_uses_secondary_index {
+                                        crate::query::executor::record_plan_divergence(
+                                            "plan chose index access; index route unavailable at execution; fell back to scan",
+                                        );
                                     }
                                 }
                             }
