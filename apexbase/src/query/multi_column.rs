@@ -344,6 +344,7 @@ pub fn build_multi_column_result(
     group_col_names: &[String],
     agg_func: Option<crate::query::AggregateFunc>,
     agg_col_name: Option<&str>,
+    agg_alias: Option<&str>,
 ) -> io::Result<RecordBatch> {
     use crate::query::AggregateFunc;
 
@@ -377,8 +378,11 @@ pub fn build_multi_column_result(
             AggregateFunc::Max => "MAX",
         };
 
-        let output_name = agg_col_name
-            .map(|c| format!("{}({})", func_name, c))
+        // The SELECT alias wins over the derived name so ORDER BY and
+        // downstream consumers can resolve the aggregate by its alias.
+        let output_name = agg_alias
+            .map(str::to_string)
+            .or_else(|| agg_col_name.map(|c| format!("{}({})", func_name, c)))
             .unwrap_or_else(|| format!("{}(*)", func_name));
 
         match func {

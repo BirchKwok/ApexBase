@@ -240,7 +240,7 @@ impl ApexExecutor {
     /// GROUP BY, HAVING, ordering, and aggregate choices remain downstream
     /// physical-operator concerns.
     fn build_scan_predicate(expr: &SqlExpr) -> Option<crate::storage::ScanPredicateExpr> {
-        use crate::query::sql_parser::BinaryOperator;
+        use crate::query::sql_parser::{BinaryOperator, UnaryOperator};
         use crate::storage::{
             ScanBound, ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue,
         };
@@ -275,6 +275,33 @@ impl ApexExecutor {
                     Some(ScanValue::String(value.clone()))
                 }
                 SqlExpr::Literal(Value::Bool(value)) => Some(ScanValue::Bool(*value)),
+                // Negative literals parse as UnaryOp(Minus, literal); fold
+                // them so ranges with negative bounds stay inside the typed
+                // scan protocol.
+                SqlExpr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr,
+                } => match expr.as_ref() {
+                    SqlExpr::Literal(Value::Int8(value)) => {
+                        Some(ScanValue::Int(-(*value as i64)))
+                    }
+                    SqlExpr::Literal(Value::Int16(value)) => {
+                        Some(ScanValue::Int(-(*value as i64)))
+                    }
+                    SqlExpr::Literal(Value::Int32(value)) => {
+                        Some(ScanValue::Int(-(*value as i64)))
+                    }
+                    SqlExpr::Literal(Value::Int64(value)) => {
+                        value.checked_neg().map(ScanValue::Int)
+                    }
+                    SqlExpr::Literal(Value::Float32(value)) if value.is_finite() => {
+                        Some(ScanValue::Float(-(*value as f64)))
+                    }
+                    SqlExpr::Literal(Value::Float64(value)) if value.is_finite() => {
+                        Some(ScanValue::Float(-*value))
+                    }
+                    _ => None,
+                },
                 _ => None,
             }
         }
@@ -405,6 +432,14 @@ impl ApexExecutor {
         else {
             return Ok(None);
         };
+
+        // Batched physical pipeline first: row-group-sized morsels with an
+        // incremental group state keep scan memory bounded by one row group.
+        // Any shape or state outside its gate falls through to the
+        // single-batch path below.
+        if let Some(result) = Self::try_batch_group_pipeline(backend, stmt, &predicate)? {
+            return Ok(Some(result));
+        }
 
         let Some(columns) = Self::get_col_refs(stmt) else {
             return Ok(None);

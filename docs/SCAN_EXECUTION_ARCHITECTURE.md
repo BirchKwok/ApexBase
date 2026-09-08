@@ -24,16 +24,21 @@ The protocol is defined in `apexbase/src/storage/scan.rs`:
 
 | Type | Responsibility |
 | --- | --- |
-| `ScanRequest` | Borrowed projection and a conjunction of physical predicates |
-| `ScanPredicate` | Numeric range or string equality; multiple entries mean `AND` |
+| `ScanRequest` | Borrowed projection and an optional typed predicate tree |
+| `ScanPredicate` | One physical leaf: comparison, range, `IN` list, or null check |
 | `ScanBound` | Inclusive or exclusive numeric boundary |
 | `ColumnView` | Immutable Arrow array plus field metadata |
 | `SelectionVector` | Either all rows or explicit `u32` row positions |
 | `Morsel` | Column views, physical row offset/count, and current selection |
+| `BatchMorselStream` | Row-group-sized morsels over a stable persisted read view |
+| `BatchMorselOutcome` | `Morsel` or `Unsupported` (caller must use the single-shot path) |
 
-The current implementation emits one morsel per request. The row-offset and
-selection contract intentionally allows a later scheduler to split scans into
-parallel morsels without changing downstream operator inputs.
+The single-shot request emits one morsel. The batch stream emits one
+row-group-sized morsel per call, each with the complete typed predicate
+already applied, so operators can consume batches incrementally with bounded
+memory. The row-offset and selection contract intentionally allows a later
+scheduler to split scans into parallel morsels without changing downstream
+operator inputs.
 
 ## Lane Selection
 
@@ -79,11 +84,53 @@ The executor removes `WHERE` only after the scan protocol has consumed the
 complete conjunction. `HAVING` stays attached to the grouped statement and is
 therefore evaluated before TopK and limit processing.
 
-Supported predicate forms currently include parentheses, `AND`, `BETWEEN`,
-string equality, numeric equality, and numeric `<`, `<=`, `>`, `>=` in either
-literal/column order. `OR`, arbitrary expressions, unsupported Arrow types,
-and numeric bounds that cannot be represented exactly fall back to the general
-evaluator.
+Supported predicate forms currently include parentheses, `AND`, `OR`,
+`BETWEEN`, `IN`, `IS [NOT] NULL`, string equality, numeric equality, and
+numeric `<`, `<=`, `>`, `>=` in either literal/column order, including
+negative literals (parsed as a unary minus over a literal). Arbitrary
+expressions, unsupported Arrow types, and numeric bounds that cannot be
+represented exactly fall back to the general evaluator.
+
+## Batched Physical Pipeline (R3)
+
+`TableStorageBackend::scan_batches()` exposes the stable row-group stream for
+requests whose read view is the persisted V4 file alone: no delta file, no
+pending DeltaStore cells, no pending V4 rows, and no in-memory table. Any
+other state returns `None` and the caller falls back to the single-shot
+`scan()` for the whole request.
+
+Each batch is one row group of active rows (deletion vectors applied) with the
+projected columns, and the complete typed predicate is re-evaluated on every
+batch, so per-batch selections keep the exact `Morsel::select` semantics and
+concatenated batches reproduce the single-shot row order. A batch whose column
+types the typed protocol cannot evaluate reports `Unsupported`, which also
+falls the whole request back to the single-shot path.
+
+The stream snapshots the footer and the mmap `Arc` at creation, so the file
+view is stable for the whole stream even if a later write replaces the file.
+Before reading a row group, the stream may skip it when the conservative
+zone-map proof shows every row of the group outside the predicate: missing
+zone maps, non-numeric columns, lossy int-to-float coercions, `NotEq`, and
+`IsNull` never skip; `AND` skips when either side is provably disjoint and
+`OR` only when both sides are. Zone maps cover pre-deletion data, which can
+only enlarge the true range, so a proven-empty zone stays empty after deletes.
+
+The first consumer is the serial batched
+Filter -> GROUP BY -> HAVING -> TopK executor slice
+(`query/executor/batch_group.rs`), which consumes row-group-sized batches into
+an incremental group state, keeping scan memory bounded by one row group plus
+the group map regardless of table size. Aggregate semantics mirror the
+single-batch kernel (COUNT is the group row count, SUM/MIN/MAX skip NULLs,
+AVG divides the sum by the group row count, NULL group keys form one group).
+`APEX_BATCH_SCAN=0` disables the batched slice for A/B diagnostics.
+
+Routing note: the batched slice is only reached through
+`try_scan_group_pipeline`. The legacy fused fast kernels dispatch earlier and
+keep the shapes they own; most importantly the fused single-key kernel takes
+any single dictionary-key `GROUP BY` with at most one value aggregate,
+independent of `APEX_BATCH_SCAN`. Multi-key groups, extra value aggregates,
+and predicates outside the fused lane budget are what reach the batched
+slice.
 
 ## Cache And Summary Rules
 
@@ -114,11 +161,12 @@ When adding another operator or predicate:
 
 ## Current Limits
 
-- Predicate lists are conjunctive; there is no boolean expression tree yet.
+- Zone-map pruning over `OR` is conservative: a row group is skipped only
+  when both sides are provably disjoint.
 - Numeric scan bounds use `f64`, so wide integer literals deliberately fall
   back when exact round-tripping is impossible.
 - Selection materialization currently uses Arrow `take`; late materialization
   can move further downstream in a later phase.
-- One request currently yields one morsel; parallel scheduling is future work.
+- The batch stream is serial; parallel morsel scheduling is future work.
 
 These are explicit fallback boundaries, not silent semantic differences.

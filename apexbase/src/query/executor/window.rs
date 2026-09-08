@@ -1515,6 +1515,8 @@ impl ApexExecutor {
             arr.value(a).cmp(&arr.value(b))
         } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
             arr.value(a).partial_cmp(&arr.value(b)).unwrap_or(Ordering::Equal)
+        } else if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+            arr.value(a).cmp(&arr.value(b))
         } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
             arr.value(a).cmp(arr.value(b))
         } else if let Some(arr) = array.as_any().downcast_ref::<

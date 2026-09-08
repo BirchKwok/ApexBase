@@ -2365,6 +2365,7 @@ include!("index_access.rs");
 include!("topk.rs");
 include!("fused_group.rs");
 include!("scan_pipeline.rs");
+include!("batch_group.rs");
 include!("late_materialization.rs");
 include!("fts.rs");
 include!("topk_vector.rs");

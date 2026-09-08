@@ -39,6 +39,11 @@ CANARY_SPECS = (
         "bench_uncached_delta_boolean_scan_group_having_topk",
         "mean",
     ),
+    (
+        "File-table Filter+GROUP+HAVING+TopK (batch)",
+        "bench_batch_scan_group_having_topk",
+        "mean",
+    ),
     ("ORDER BY score LIMIT 100", "bench_order_limit", "mean"),
     ("IS NOT NULL numeric TopK", "bench_not_null_numeric_topk", "mean"),
     ("Filtered numeric TopK", "bench_filtered_numeric_topk", "mean"),
@@ -179,6 +184,8 @@ def run_canary(rows, warmup, iterations, qps_only=False):
                     "bench_uncached_delta_boolean_scan_group_having_topk",
                 }:
                     bench.setup_uncached_delta_scan_pipeline()
+                elif method_name == "bench_batch_scan_group_having_topk":
+                    bench.setup_batch_scan_pipeline()
                 elapsed_ms = _run_metric(
                     bench, method_name, mode, warmup, iterations, setup_method
                 )

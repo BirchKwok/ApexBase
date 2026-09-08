@@ -2810,3 +2810,587 @@ fn test_zone_map_pruning_logic() {
     // BETWEEN 200..300 does NOT overlap [10,100]
     assert!(!zm.may_overlap_int_range(200, 300));
 }
+
+// ============================================================================
+// R3: serial batched Filter -> GROUP BY -> HAVING -> TopK pipeline
+// ============================================================================
+
+/// Serializes tests that toggle APEX_BATCH_SCAN (process-wide env state).
+static BATCH_SCAN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_batch_scan<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    let _guard = BATCH_SCAN_ENV_LOCK.lock().unwrap();
+    std::env::set_var("APEX_BATCH_SCAN", if enabled { "1" } else { "0" });
+    let result = f();
+    std::env::remove_var("APEX_BATCH_SCAN");
+    result
+}
+
+fn run_with_batch_scan(enabled: bool, path: &Path, sql: &str) -> RecordBatch {
+    with_batch_scan(enabled, || {
+        ApexExecutor::execute(sql, path)
+            .unwrap()
+            .to_record_batch()
+            .unwrap()
+    })
+}
+
+/// Wide rows (110-byte pad) force the adaptive 32768-row RG size, so the
+/// 70000-row fixture spans three row groups and exercises the multi-batch
+/// pipeline. Score/amount carry NULLs; values stay exactly representable in
+/// f64 so bit-equal aggregate parity is expected.
+fn create_batch_scan_fixture(path: &Path) {
+    const ROWS: usize = 70_000;
+    let storage = OnDemandStorage::create(path).unwrap();
+    let mut cities = Vec::with_capacity(ROWS);
+    let mut codes = Vec::with_capacity(ROWS);
+    let mut flags = Vec::with_capacity(ROWS);
+    let mut scores = Vec::with_capacity(ROWS);
+    let mut amounts = Vec::with_capacity(ROWS);
+    let mut pads = Vec::with_capacity(ROWS);
+    let mut score_nulls = vec![false; ROWS];
+    let mut amount_nulls = vec![false; ROWS];
+    for i in 0..ROWS {
+        cities.push(format!("city{}", i % 13));
+        codes.push(i as i64 % 7);
+        flags.push(i % 2 == 0);
+        scores.push((i % 97) as f64 * 0.5);
+        score_nulls[i] = i % 23 == 5;
+        amounts.push((i % 500) as i64 - 250);
+        amount_nulls[i] = i % 11 == 10;
+        pads.push("p".repeat(110));
+    }
+    storage
+        .insert_typed_with_nulls(
+            HashMap::from([
+                ("code".to_string(), codes),
+                ("amount".to_string(), amounts),
+            ]),
+            HashMap::from([("score".to_string(), scores)]),
+            HashMap::from([
+                ("city".to_string(), cities),
+                ("pad".to_string(), pads),
+            ]),
+            HashMap::new(),
+            HashMap::from([("flag".to_string(), flags)]),
+            HashMap::from([
+                ("score".to_string(), score_nulls),
+                ("amount".to_string(), amount_nulls),
+            ]),
+        )
+        .unwrap();
+    storage.save().unwrap();
+}
+
+fn normalized_column_values(column: &ArrayRef) -> Vec<String> {
+    use arrow::array::{DictionaryArray, LargeStringArray};
+    use arrow::datatypes::UInt32Type;
+
+    if let Some(arr) = column.as_any().downcast_ref::<Int64Array>() {
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    "null".to_string()
+                } else {
+                    arr.value(i).to_string()
+                }
+            })
+            .collect()
+    } else if let Some(arr) = column.as_any().downcast_ref::<Float64Array>() {
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    "null".to_string()
+                } else {
+                    arr.value(i).to_bits().to_string()
+                }
+            })
+            .collect()
+    } else if let Some(arr) = column.as_any().downcast_ref::<BooleanArray>() {
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    "null".to_string()
+                } else {
+                    arr.value(i).to_string()
+                }
+            })
+            .collect()
+    } else if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    "null".to_string()
+                } else {
+                    arr.value(i).to_string()
+                }
+            })
+            .collect()
+    } else if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    "null".to_string()
+                } else {
+                    arr.value(i).to_string()
+                }
+            })
+            .collect()
+    } else if let Some(arr) = column.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+        let values = arr
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    "null".to_string()
+                } else {
+                    values.value(arr.keys().value(i) as usize).to_string()
+                }
+            })
+            .collect()
+    } else {
+        panic!(
+            "unsupported column type in batch-scan parity test: {}",
+            column.data_type()
+        )
+    }
+}
+
+fn assert_batches_logically_equal(a: &RecordBatch, b: &RecordBatch, sql: &str) {
+    assert_eq!(a.num_columns(), b.num_columns(), "{sql}: column count");
+    assert_eq!(a.num_rows(), b.num_rows(), "{sql}: row count");
+    for i in 0..a.num_columns() {
+        let name = a.schema().field(i).name().to_string();
+        assert_eq!(
+            name,
+            b.schema().field(i).name().to_string(),
+            "{sql}: column {i} name"
+        );
+        assert_eq!(
+            normalized_column_values(a.column(i)),
+            normalized_column_values(b.column(i)),
+            "{sql}: column {name} values"
+        );
+    }
+}
+
+#[test]
+fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
+    use crate::query::sql_parser::SqlStatement;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("batch_pipeline_gate.apex");
+    create_batch_scan_fixture(&path);
+
+    let parse = |sql: &str| -> SelectStatement {
+        match SqlParser::parse(sql).unwrap() {
+            SqlStatement::Select(stmt) => stmt,
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    };
+
+    with_batch_scan(true, || {
+        let backend = TableStorageBackend::open(&path).unwrap();
+
+        // Gated shape: two plain keys, typed WHERE, one aggregate source.
+        let sql = "SELECT city, code, COUNT(*) AS n, SUM(score) AS s                    FROM default WHERE score >= 20 AND code IN (1, 3, 5)                    GROUP BY city, code";
+        let stmt = parse(sql);
+        let predicate =
+            ApexExecutor::build_scan_predicate(stmt.where_clause.as_ref().unwrap()).unwrap();
+        let result =
+            ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate).unwrap();
+        assert!(
+            result.is_some(),
+            "gated shape must be served by the batch pipeline"
+        );
+
+        // Outside the gate: three group keys fall back to the single-batch path.
+        let wide_sql = "SELECT city, code, flag, COUNT(*) AS n                         FROM default WHERE score > 0                         GROUP BY city, code, flag";
+        let wide_stmt = parse(wide_sql);
+        let wide_predicate =
+            ApexExecutor::build_scan_predicate(wide_stmt.where_clause.as_ref().unwrap()).unwrap();
+        assert!(
+            ApexExecutor::try_batch_group_pipeline(&backend, &wide_stmt, &wide_predicate)
+                .unwrap()
+                .is_none(),
+            "three-key GROUP BY must fall back"
+        );
+    });
+
+    // Outside the gate: delta state forces the single-shot fallback.
+    let delta_backend = TableStorageBackend::open(&path).unwrap();
+    delta_backend
+        .insert_rows_to_delta(&[HashMap::from([
+            ("city".to_string(), Value::String("city0".to_string())),
+            ("code".to_string(), Value::Int64(1)),
+            ("flag".to_string(), Value::Bool(true)),
+            ("score".to_string(), Value::Float64(1.0)),
+            ("amount".to_string(), Value::Int64(1)),
+            ("pad".to_string(), Value::String("z".repeat(110))),
+        ])])
+        .unwrap();
+    let wide_sql = "SELECT city, code, COUNT(*) AS n                     FROM default WHERE score >= 20                     GROUP BY city, code";
+    let stmt = parse(wide_sql);
+    let predicate =
+        ApexExecutor::build_scan_predicate(stmt.where_clause.as_ref().unwrap()).unwrap();
+    let result = with_batch_scan(true, || {
+        ApexExecutor::try_batch_group_pipeline(&delta_backend, &stmt, &predicate).unwrap()
+    });
+    assert!(
+        result.is_none(),
+        "delta state must disable the batch pipeline"
+    );
+}
+
+#[test]
+fn batch_scan_pipeline_matches_single_batch_pipeline() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("batch_scan_ab.apex");
+    create_batch_scan_fixture(&path);
+
+    let queries = [
+        // Int key, int source, HAVING over a SELECT aggregate.
+        "SELECT code, COUNT(*) AS n, SUM(amount) AS s, MIN(amount) AS mn, MAX(amount) AS mx          FROM default WHERE amount IS NOT NULL AND code >= 1          GROUP BY code HAVING SUM(amount) > -5000 ORDER BY n DESC, code LIMIT 10",
+        // Two keys (string + int), float source, range + IN.
+        "SELECT city, code, COUNT(*) AS n, AVG(score) AS av, MIN(score) AS mn, MAX(score) AS mx, SUM(score) AS s          FROM default WHERE score >= 20 AND score <= 40 AND code IN (1, 3, 5)          GROUP BY city, code HAVING COUNT(*) > 2 ORDER BY av DESC, city, code LIMIT 20",
+        // IS NULL predicate, no HAVING.
+        "SELECT city, COUNT(*) AS n FROM default WHERE score IS NULL GROUP BY city          ORDER BY n DESC, city LIMIT 5",
+        // OR tree with BETWEEN + IN, OFFSET.
+        "SELECT city, COUNT(*) AS n, AVG(amount) AS av FROM default          WHERE amount BETWEEN -100 AND 100 OR city IN ('city1', 'city7')          GROUP BY city HAVING COUNT(*) > 10 ORDER BY av DESC, city LIMIT 7 OFFSET 1",
+        // Bool group key.
+        "SELECT flag, COUNT(*) AS n FROM default WHERE amount > 0 GROUP BY flag          HAVING COUNT(*) > 100 ORDER BY n DESC, flag LIMIT 5",
+        // Float group key.
+        "SELECT score, COUNT(*) AS n FROM default WHERE score IS NOT NULL AND score >= 30          GROUP BY score ORDER BY n DESC, score LIMIT 5",
+        // Predicate matching no rows: empty results must match too.
+        "SELECT city, COUNT(*) AS n FROM default WHERE code = 99 GROUP BY city ORDER BY n DESC, city LIMIT 3",
+        // Three-key GROUP BY is outside the batch gate: env on must still
+        // match the single-batch result through the fallback wiring.
+        "SELECT city, code, flag, COUNT(*) AS n FROM default          WHERE amount > 0 AND code <= 4 GROUP BY city, code, flag          ORDER BY n DESC, city, code, flag LIMIT 5",
+    ];
+
+    for sql in queries {
+        let off = run_with_batch_scan(false, &path, sql);
+        let on = run_with_batch_scan(true, &path, sql);
+        assert_batches_logically_equal(&off, &on, sql);
+    }
+
+    // Delta state: the batch pipeline must fall back and still match.
+    let backend = TableStorageBackend::open(&path).unwrap();
+    backend
+        .insert_rows_to_delta(&[
+            HashMap::from([
+                ("city".to_string(), Value::String("city3".to_string())),
+                ("code".to_string(), Value::Int64(3)),
+                ("flag".to_string(), Value::Bool(true)),
+                ("score".to_string(), Value::Float64(25.5)),
+                ("amount".to_string(), Value::Int64(10)),
+                ("pad".to_string(), Value::String("d".repeat(110))),
+            ]),
+            HashMap::from([
+                ("city".to_string(), Value::String("city5".to_string())),
+                ("code".to_string(), Value::Int64(5)),
+                ("flag".to_string(), Value::Bool(false)),
+                ("score".to_string(), Value::Float64(35.0)),
+                ("amount".to_string(), Value::Int64(-40)),
+                ("pad".to_string(), Value::String("d".repeat(110))),
+            ]),
+        ])
+        .unwrap();
+    drop(backend);
+    invalidate_storage_cache(&path);
+
+    let sql = queries[1];
+    let off = run_with_batch_scan(false, &path, sql);
+    let on = run_with_batch_scan(true, &path, sql);
+    assert_batches_logically_equal(&off, &on, sql);
+}
+
+#[test]
+fn two_key_string_int_group_by_keeps_min_max_columns() {
+    // Regression: the string-dict + int-range fast kernel only accumulates
+    // COUNT/SUM/AVG; MIN/MAX must fall through to the full incremental kernel
+    // instead of being silently dropped from the result.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("min_max_two_keys.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    storage
+        .insert_typed_with_nulls(
+            HashMap::from([("code".to_string(), vec![1, 1, 2, 1, 1, 3])]),
+            HashMap::from([
+                ("score".to_string(), vec![1.0, 3.0, 0.0, 2.0, 2.0, 5.0]),
+                ("pad".to_string(), vec![0.0; 6]),
+            ]),
+            HashMap::from([
+                (
+                    "city".to_string(),
+                    vec!["A", "A", "A", "B", "B", "C"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                ),
+                (
+                    "filler".to_string(),
+                    vec![0u64; 6]
+                        .iter()
+                        .map(|_| "f".repeat(120))
+                        .collect(),
+                ),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("score".to_string(), vec![
+                false, false, true, false, false, false,
+            ])]),
+        )
+        .unwrap();
+    storage.save().unwrap();
+
+    let sql = "SELECT city, code, COUNT(*) AS n, MIN(score) AS mn, MAX(score) AS mx, AVG(score) AS av, SUM(score) AS s                FROM default WHERE score IS NOT NULL OR code = 2                GROUP BY city, code ORDER BY city, code";
+    let batch = with_batch_scan(true, || {
+        ApexExecutor::execute(sql, &path).unwrap().to_record_batch().unwrap()
+    });
+
+    assert_eq!(batch.num_columns(), 7, "all requested columns must be present");
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["city", "code", "n", "mn", "mx", "av", "s"]
+    );
+    assert_eq!(batch.num_rows(), 4);
+
+    let cities = batch.column_by_name("city").unwrap();
+    let cities = cities.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        (0..4)
+            .map(|i| cities.value(i))
+            .collect::<Vec<_>>(),
+        vec!["A", "A", "B", "C"]
+    );
+
+    let n = batch.column_by_name("n").unwrap();
+    let n = n.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(n.values(), &[2, 1, 2, 1]);
+
+    let mn = batch.column_by_name("mn").unwrap();
+    let mn = mn.as_any().downcast_ref::<Float64Array>().unwrap();
+    assert!(mn.is_null(1), "all-NULL group must yield NULL MIN");
+    assert_eq!(
+        [mn.value(0), mn.value(2), mn.value(3)],
+        [1.0, 2.0, 5.0]
+    );
+
+    let mx = batch.column_by_name("mx").unwrap();
+    let mx = mx.as_any().downcast_ref::<Float64Array>().unwrap();
+    assert!(mx.is_null(1));
+    assert_eq!([mx.value(0), mx.value(2), mx.value(3)], [3.0, 2.0, 5.0]);
+
+    let av = batch.column_by_name("av").unwrap();
+    let av = av.as_any().downcast_ref::<Float64Array>().unwrap();
+    assert_eq!(
+        [av.value(0), av.value(1), av.value(2), av.value(3)],
+        [2.0, 0.0, 2.0, 5.0]
+    );
+
+    let s = batch.column_by_name("s").unwrap();
+    let s = s.as_any().downcast_ref::<Float64Array>().unwrap();
+    assert_eq!([s.value(0), s.value(1), s.value(2), s.value(3)], [4.0, 0.0, 4.0, 5.0]);
+}
+
+#[test]
+fn three_key_group_by_keeps_alias_and_sorts_deterministically() {
+    // Regression: the 3+ key fast path used to drop the aggregate alias
+    // (breaking ORDER BY over it) and its comparator could not order bool
+    // columns, so repeated runs of the same query diverged.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("three_key_alias.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    const ROWS: usize = 3000;
+    let mut cities = Vec::with_capacity(ROWS);
+    let mut codes = Vec::with_capacity(ROWS);
+    let mut flags = Vec::with_capacity(ROWS);
+    for i in 0..ROWS {
+        cities.push(format!("c{}", i % 5));
+        codes.push(i as i64 % 3);
+        flags.push(i % 4 < 2);
+    }
+    storage
+        .insert_typed(
+            HashMap::from([("code".to_string(), codes)]),
+            HashMap::new(),
+            HashMap::from([("city".to_string(), cities)]),
+            HashMap::new(),
+            HashMap::from([("flag".to_string(), flags)]),
+        )
+        .unwrap();
+    storage.save().unwrap();
+
+    let sql = "SELECT city, code, flag, COUNT(*) AS n FROM default GROUP BY city, code, flag ORDER BY n DESC, city, code, flag LIMIT 4";
+    let batch = |sql: &str| -> (Vec<String>, Vec<i64>) {
+        let rb = with_batch_scan(true, || {
+            ApexExecutor::execute(sql, &path).unwrap().to_record_batch().unwrap()
+        });
+        let n = rb
+            .column_by_name("n")
+            .expect("aggregate alias column must be present")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let city_cast = arrow::compute::cast(
+            rb.column_by_name("city").unwrap(),
+            &arrow::datatypes::DataType::Utf8,
+        )
+        .unwrap();
+        let cities = city_cast.as_any().downcast_ref::<StringArray>().unwrap();
+        (
+            (0..rb.num_rows())
+                .map(|i| cities.value(i).to_string())
+                .collect(),
+            (0..rb.num_rows()).map(|i| n.value(i)).collect(),
+        )
+    };
+
+    let (cities, counts) = batch(sql);
+    assert_eq!(cities.len(), 4);
+    // ORDER BY n DESC must hold.
+    for w in counts.windows(2) {
+        assert!(w[0] >= w[1], "ORDER BY n DESC violated: {counts:?}");
+    }
+    // The first 4 groups are the 5x3x2=30 groups with the highest counts;
+    // 3000/30 == 100 exactly, so the top rows are a 4-way tie that the
+    // (city, code, flag) keys fully resolve: c0/0/false comes first.
+    assert_eq!(cities[0], "c0");
+
+    // Repeated executions must be byte-stable.
+    for _ in 0..4 {
+        assert_eq!(batch(sql), (cities.clone(), counts.clone()));
+    }
+}
+
+#[test]
+fn negative_bound_predicates_stay_in_typed_scan_protocol() {
+    use crate::query::sql_parser::{SqlExpr, SqlStatement};
+    use crate::storage::{ScanBound, ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+
+    let parse_where = |sql: &str| -> SqlExpr {
+        match SqlParser::parse(sql).unwrap() {
+            SqlStatement::Select(stmt) => stmt.where_clause.unwrap(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    };
+
+    // Regression: negative literals parse as UnaryOp(Minus, literal) and used
+    // to defeat the typed scan protocol, silently demoting range queries with
+    // negative bounds to the generic path.
+    let pred = ApexExecutor::build_scan_predicate(&parse_where(
+        "SELECT * FROM default WHERE amount >= -100",
+    ))
+    .unwrap();
+    assert_eq!(
+        pred,
+        ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "amount".to_string(),
+            op: ScanComparison::Ge,
+            value: ScanValue::Int(-100),
+        })
+    );
+
+    let pred = ApexExecutor::build_scan_predicate(&parse_where(
+        "SELECT * FROM default WHERE amount BETWEEN -100 AND 100",
+    ))
+    .unwrap();
+    assert_eq!(
+        pred,
+        ScanPredicateExpr::Predicate(ScanPredicate::Between {
+            column: "amount".to_string(),
+            lower: Some(ScanBound::inclusive(ScanValue::Int(-100))),
+            upper: Some(ScanBound::inclusive(ScanValue::Int(100))),
+        })
+    );
+
+    let pred = ApexExecutor::build_scan_predicate(&parse_where(
+        "SELECT * FROM default WHERE score > -1.5",
+    ))
+    .unwrap();
+    assert_eq!(
+        pred,
+        ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "score".to_string(),
+            op: ScanComparison::Gt,
+            value: ScanValue::Float(-1.5),
+        })
+    );
+
+    // Negation applied to a non-literal stays conservative (no fold).
+    assert!(
+        ApexExecutor::build_scan_predicate(&parse_where(
+            "SELECT * FROM default WHERE -amount > 5"
+        ))
+        .is_none()
+    );
+}
+
+#[test]
+fn negative_bound_group_by_keeps_exact_results_in_both_env_states() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("negative_bounds.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    storage
+        .insert_typed(
+            HashMap::from([
+                ("code".to_string(), vec![1_i64, 1, 2, 2, 3]),
+                ("amount".to_string(), vec![-150_i64, -50, 10, 250, -10]),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save().unwrap();
+
+    let sql =
+        "SELECT code, COUNT(*) AS n FROM default WHERE amount >= -100 GROUP BY code ORDER BY code";
+    for enabled in [false, true] {
+        let rb = with_batch_scan(enabled, || {
+            ApexExecutor::execute(sql, &path).unwrap().to_record_batch().unwrap()
+        });
+        let codes = rb
+            .column_by_name("code")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let counts = rb
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let got: Vec<(i64, i64)> = (0..rb.num_rows())
+            .map(|i| (codes.value(i), counts.value(i)))
+            .collect();
+        assert_eq!(got, vec![(1, 1), (2, 2), (3, 1)]);
+    }
+
+    let sql = "SELECT code, COUNT(*) AS n FROM default WHERE amount BETWEEN -100 AND 100 GROUP BY code ORDER BY code";
+    let rb = with_batch_scan(true, || {
+        ApexExecutor::execute(sql, &path).unwrap().to_record_batch().unwrap()
+    });
+    let counts = rb
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        (0..rb.num_rows()).map(|i| counts.value(i)).collect::<Vec<_>>(),
+        vec![1, 1, 1]
+    );
+}

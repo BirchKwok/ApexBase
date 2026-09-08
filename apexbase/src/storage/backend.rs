@@ -1487,6 +1487,92 @@ impl TableStorageBackend {
         crate::storage::Morsel::from_batch(batch, 0).select(request.predicate)
     }
 
+    /// Stream the storage-level scan request as row-group-sized morsels.
+    ///
+    /// Only available when the persisted V4 row groups form the complete,
+    /// stable read view: no delta file, no pending DeltaStore cells, no
+    /// in-memory V4 rows, and not an in-memory table. Every batch carries
+    /// the complete typed predicate selection, so operators can consume
+    /// batches incrementally with bounded memory. `Ok(None)` means the
+    /// request cannot be served as a stable batch view and the caller must
+    /// fall back to the single-shot `scan()`.
+    pub(crate) fn scan_batches<'a>(
+        &'a self,
+        request: &crate::storage::ScanRequest<'a>,
+    ) -> io::Result<Option<crate::storage::BatchMorselStream<'a>>> {
+        if let Some(columns) = request.projection {
+            for column in columns {
+                let clean = column
+                    .trim_matches('"')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(column)
+                    .trim_matches('"');
+                if clean != "_id" && self.get_column_type(clean).is_none() {
+                    return Ok(None);
+                }
+            }
+        }
+        let mut invalid_predicate_column = false;
+        if let Some(predicate) = request.predicate {
+            predicate.visit_columns(&mut |column| {
+                invalid_predicate_column |= !self.scan_predicate_column_supported(column);
+            });
+        }
+        if invalid_predicate_column {
+            return Ok(None);
+        }
+
+        if self.storage.is_in_memory()
+            || self.has_delta()
+            || self.has_pending_deltas()
+            || self.pending_v4_in_memory_rows() > 0
+        {
+            return Ok(None);
+        }
+
+        let include_id = request
+            .projection
+            .map(|columns| {
+                columns.iter().any(|column| {
+                    let clean = column.trim_matches('"');
+                    let clean = clean.rsplit('.').next().unwrap_or(clean);
+                    clean.trim_matches('"') == "_id"
+                })
+            })
+            .unwrap_or(true);
+
+        let projection_names: Option<Vec<&str>> = match request.projection {
+            Some(columns) => {
+                let names: Vec<&str> = columns
+                    .iter()
+                    .copied()
+                    .filter(|column| {
+                        let clean = column.trim_matches('"');
+                        let clean = clean.rsplit('.').next().unwrap_or(clean);
+                        clean.trim_matches('"') != "_id"
+                    })
+                    .collect();
+                Some(names)
+            }
+            None => None,
+        };
+
+        let stream = match self.storage.scan_rg_batches(
+            projection_names.as_deref(),
+            include_id,
+            request.predicate,
+        )? {
+            Some(stream) => stream,
+            None => return Ok(None),
+        };
+
+        Ok(Some(crate::storage::BatchMorselStream::new(
+            stream,
+            request.predicate,
+        )))
+    }
+
     /// Get row count
     pub fn row_count(&self) -> u64 {
         *self.row_count.read()
@@ -6927,5 +7013,234 @@ mod tests {
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
             .expect("batch must contain _id");
         assert_eq!(ids.values(), &[1, 3]);
+    }
+
+    fn logical_scan_rows(batch: &RecordBatch) -> Vec<(i64, i64, Option<f64>, Option<String>)> {
+        use arrow::array::{Array, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::DataType as ArrowDataType;
+
+        let ids = batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ages = batch
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let city = arrow::compute::cast(
+            batch.column_by_name("city").unwrap(),
+            &ArrowDataType::Utf8,
+        )
+        .unwrap();
+        let city = city.as_any().downcast_ref::<StringArray>().unwrap();
+        (0..batch.num_rows())
+            .map(|i| {
+                (
+                    ids.value(i),
+                    ages.value(i),
+                    if scores.is_null(i) {
+                        None
+                    } else {
+                        Some(scores.value(i))
+                    },
+                    if city.is_null(i) {
+                        None
+                    } else {
+                        Some(city.value(i).to_string())
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_batches_stream_matches_single_shot_scan_over_multi_rg_table() {
+        use arrow::array::Int64Array;
+        use crate::storage::{
+            ScanBound, ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue,
+        };
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("batch_scan_equivalence.apex");
+
+        // Wide rows (110-byte pad) force the adaptive 32768-row RG size, so
+        // 70000 rows span three RGs and the batch stream must emit several
+        // morsels.
+        let builder = TableStorageBackend::create(&path).unwrap();
+        builder.add_column("age", DataType::Int64).unwrap();
+        builder.add_column("score", DataType::Float64).unwrap();
+        builder.add_column("city", DataType::String).unwrap();
+        builder.add_column("pad", DataType::String).unwrap();
+        let rows = 70_000;
+        let mut ages = Vec::with_capacity(rows);
+        let mut scores = Vec::with_capacity(rows);
+        let mut cities = Vec::with_capacity(rows);
+        let mut pads = Vec::with_capacity(rows);
+        let mut score_nulls = vec![false; rows];
+        let mut city_nulls = vec![false; rows];
+        for i in 0..rows {
+            ages.push((i % 100) as i64);
+            scores.push((i % 97) as f64 * 0.5);
+            score_nulls[i] = i % 23 == 5;
+            cities.push(format!("c{}", i % 13));
+            city_nulls[i] = i % 41 == 7;
+            pads.push("x".repeat(110));
+        }
+        builder
+            .insert_typed_with_nulls(
+                HashMap::from([("age".to_string(), ages)]),
+                HashMap::from([("score".to_string(), scores)]),
+                HashMap::from([("city".to_string(), cities)]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([
+                    ("score".to_string(), score_nulls),
+                    ("city".to_string(), city_nulls),
+                ]),
+            )
+            .unwrap();
+        builder.save().unwrap();
+        // Physically delete rows spread across all three RGs.
+        assert!(builder.delete(7));
+        assert!(builder.delete(40_001));
+        assert!(builder.delete(70_000));
+        builder.save().unwrap();
+        drop(builder);
+
+        let backend = TableStorageBackend::open(&path).unwrap();
+        assert!(!backend.has_delta());
+        assert!(!backend.has_pending_deltas());
+
+        let predicate = ScanPredicateExpr::And(
+            Box::new(ScanPredicateExpr::Predicate(ScanPredicate::Between {
+                column: "age".to_string(),
+                lower: Some(ScanBound::inclusive(ScanValue::Int(20))),
+                upper: Some(ScanBound::exclusive(ScanValue::Int(80))),
+            })),
+            Box::new(ScanPredicateExpr::Or(
+                Box::new(ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+                    column: "score".to_string(),
+                    op: ScanComparison::Ge,
+                    value: ScanValue::Float(10.0),
+                })),
+                Box::new(ScanPredicateExpr::Predicate(ScanPredicate::IsNull {
+                    column: "city".to_string(),
+                    negated: false,
+                })),
+            )),
+        );
+        let projection: &[&str] = &["_id", "age", "score", "city"];
+        let request = crate::storage::ScanRequest {
+            projection: Some(projection),
+            predicate: Some(&predicate),
+        };
+
+        let single = backend
+            .scan(&request)
+            .unwrap()
+            .expect("single-shot scan must produce a morsel")
+            .into_record_batch()
+            .unwrap();
+        assert!(single.num_rows() > 0);
+
+        let mut stream = backend
+            .scan_batches(&request)
+            .unwrap()
+            .expect("batch stream must be available for a clean V4 file table");
+        let mut batches = Vec::new();
+        while let Some(outcome) = stream.next() {
+            match outcome {
+                Ok(crate::storage::BatchMorselOutcome::Morsel(morsel)) => {
+                    batches.push(morsel.into_record_batch().unwrap());
+                }
+                Ok(crate::storage::BatchMorselOutcome::Unsupported) => {
+                    panic!("typed predicate must be supported by the batch protocol");
+                }
+                Err(error) => panic!("batch stream error: {error}"),
+            }
+        }
+        assert!(
+            batches.len() >= 2,
+            "expected multi-RG batches, got {}",
+            batches.len()
+        );
+
+        // Deleted rows must be excluded by the per-RG deletion vectors.
+        for deleted in [7_i64, 40_001, 70_000] {
+            let leaked = batches.iter().any(|b| {
+                b.column_by_name("_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .map(|ids| ids.iter().any(|v| v == Some(deleted)))
+                    .unwrap_or(false)
+            });
+            assert!(!leaked, "deleted row {deleted} leaked into batch stream");
+        }
+
+        // Concatenated batches must equal the single-shot batch row-for-row,
+        // including NULLs, in logical row order.
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, single.num_rows(), "row count mismatch");
+        let merged =
+            arrow::compute::concat_batches(&single.schema(), &batches).unwrap();
+        assert_eq!(
+            logical_scan_rows(&merged),
+            logical_scan_rows(&single),
+            "batch stream rows differ from the single-shot scan"
+        );
+    }
+
+    #[test]
+    fn scan_batches_requires_a_clean_persisted_read_view() {
+        let request = crate::storage::ScanRequest {
+            projection: None,
+            predicate: None,
+        };
+
+        // In-memory tables have no persisted row groups to stream.
+        let memory =
+            TableStorageBackend::create(Path::new("apexbase_memory:batch-gate-test")).unwrap();
+        assert!(memory.is_in_memory());
+        assert!(memory.scan_batches(&request).unwrap().is_none());
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("batch_gate_delta.apex");
+        let builder = TableStorageBackend::create(&path).unwrap();
+        builder.add_column("v", DataType::Int64).unwrap();
+        builder
+            .insert_rows(&[HashMap::from([("v".to_string(), Value::Int64(1))])])
+            .unwrap();
+        builder.save().unwrap();
+        drop(builder);
+
+        // A freshly opened backend has a loaded footer and no overlay state,
+        // so the row-group stream must be available.
+        let backend = TableStorageBackend::open(&path).unwrap();
+        assert!(!backend.has_delta());
+        assert!(!backend.has_pending_deltas());
+        assert!(backend.pending_v4_in_memory_rows() == 0);
+        assert!(
+            backend.scan_batches(&request).unwrap().is_some(),
+            "clean V4 table must stream"
+        );
+
+        // Delta state is overlay the row-group stream cannot express: the
+        // caller must fall back to the single-shot scan for the whole query.
+        backend
+            .insert_rows_to_delta(&[HashMap::from([("v".to_string(), Value::Int64(2))])])
+            .unwrap();
+        assert!(
+            backend.scan_batches(&request).unwrap().is_none(),
+            "delta state must force the single-shot fallback"
+        );
     }
 }

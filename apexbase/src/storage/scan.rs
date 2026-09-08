@@ -312,6 +312,61 @@ impl Morsel {
     }
 }
 
+/// Outcome of pulling one morsel from a batch scan stream.
+pub(crate) enum BatchMorselOutcome {
+    /// One row-group-sized batch with the complete typed predicate applied.
+    Morsel(Morsel),
+    /// A batch column cannot be evaluated by the typed protocol; the caller
+    /// must fall back to the single-shot scan path for the whole request.
+    Unsupported,
+}
+
+/// Row-group-sized morsel stream over a stable batch read view.
+///
+/// Each batch covers one storage row group of active rows (deletion vectors
+/// already applied). The complete typed predicate is re-evaluated on every
+/// batch, so per-batch selections follow the same exact semantics as the
+/// single-shot `Morsel::select`. `row_offset` advances over the logical
+/// (active) row space, so concatenating the batches reproduces the
+/// single-shot row order.
+pub(crate) struct BatchMorselStream<'a> {
+    inner: Box<dyn Iterator<Item = io::Result<RecordBatch>> + 'a>,
+    predicate: Option<&'a ScanPredicateExpr>,
+    row_offset: usize,
+}
+
+impl<'a> BatchMorselStream<'a> {
+    pub(crate) fn new(
+        inner: impl Iterator<Item = io::Result<RecordBatch>> + 'a,
+        predicate: Option<&'a ScanPredicateExpr>,
+    ) -> Self {
+        Self {
+            inner: Box::new(inner),
+            predicate,
+            row_offset: 0,
+        }
+    }
+}
+
+impl Iterator for BatchMorselStream<'_> {
+    type Item = io::Result<BatchMorselOutcome>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = match self.inner.next() {
+            Some(Ok(batch)) => batch,
+            Some(Err(error)) => return Some(Err(error)),
+            None => return None,
+        };
+        let row_offset = self.row_offset;
+        self.row_offset = self.row_offset.saturating_add(batch.num_rows());
+        match Morsel::from_batch(batch, row_offset).select(self.predicate) {
+            Ok(Some(morsel)) => Some(Ok(BatchMorselOutcome::Morsel(morsel))),
+            Ok(None) => Some(Ok(BatchMorselOutcome::Unsupported)),
+            Err(error) => Some(Err(error)),
+        }
+    }
+}
+
 #[inline]
 fn clean_column_name(column: &str) -> &str {
     column

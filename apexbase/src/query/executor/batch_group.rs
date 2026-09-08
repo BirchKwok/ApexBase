@@ -1,0 +1,796 @@
+// Serial batched Filter -> GROUP BY -> HAVING -> TopK over the stable
+// row-group stream.
+//
+// Consumes row-group-sized morsels into an incremental group state, so scan
+// memory stays bounded by one row group plus the group map regardless of
+// table size. Aggregate semantics mirror the single-batch kernel: COUNT is
+// the group row count, SUM/MIN/MAX skip NULLs, AVG divides the sum by the
+// group row count, and NULL group keys form a single NULL group.
+
+use arrow::array::LargeStringArray;
+
+/// Per-batch view of one group key column.
+enum BatchKeyView<'a> {
+    Int(&'a Int64Array),
+    Float(&'a Float64Array),
+    Bool(&'a BooleanArray),
+    Str(&'a StringArray),
+    LargeStr(&'a LargeStringArray),
+}
+
+impl<'a> BatchKeyView<'a> {
+    fn new(column: &'a ArrayRef) -> Option<Self> {
+        if let Some(arr) = column.as_any().downcast_ref::<Int64Array>() {
+            Some(Self::Int(arr))
+        } else if let Some(arr) = column.as_any().downcast_ref::<Float64Array>() {
+            Some(Self::Float(arr))
+        } else if let Some(arr) = column.as_any().downcast_ref::<BooleanArray>() {
+            Some(Self::Bool(arr))
+        } else if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+            Some(Self::Str(arr))
+        } else if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
+            Some(Self::LargeStr(arr))
+        } else {
+            None
+        }
+    }
+}
+
+/// Interned distinct values of one group key column across all batches.
+/// Slot 0 is always the NULL group.
+enum BatchKeyLane {
+    Int {
+        dict: AHashMap<i64, u32>,
+        values: Vec<Option<i64>>,
+    },
+    Float {
+        dict: AHashMap<u64, u32>,
+        values: Vec<Option<u64>>,
+    },
+    // Slot 0 is the NULL group; slot 1 is false; slot 2 is true. The slot
+    // number is the value, so no per-slot storage is needed.
+    Bool,
+    String {
+        dict: AHashMap<String, u32>,
+        values: Vec<Option<String>>,
+    },
+}
+
+impl BatchKeyLane {
+    fn new_int() -> Self {
+        Self::Int {
+            dict: AHashMap::new(),
+            values: vec![None],
+        }
+    }
+
+    fn new_float() -> Self {
+        Self::Float {
+            dict: AHashMap::new(),
+            values: vec![None],
+        }
+    }
+
+    fn new_bool() -> Self {
+        Self::Bool
+    }
+
+    fn new_string() -> Self {
+        Self::String {
+            dict: AHashMap::new(),
+            values: vec![None],
+        }
+    }
+
+    fn compatible(&self, view: &BatchKeyView) -> bool {
+        matches!(
+            (self, view),
+            (Self::Int { .. }, BatchKeyView::Int(_))
+                | (Self::Float { .. }, BatchKeyView::Float(_))
+                | (Self::Bool { .. }, BatchKeyView::Bool(_))
+                | (Self::String { .. }, BatchKeyView::Str(_))
+                | (Self::String { .. }, BatchKeyView::LargeStr(_))
+        )
+    }
+
+    /// Intern the row value and return its group ID (0 = NULL group).
+    fn id_at(&mut self, view: &BatchKeyView, row: usize) -> u32 {
+        match (self, view) {
+            (Self::Int { dict, values }, BatchKeyView::Int(arr)) => {
+                if arr.is_null(row) {
+                    0
+                } else {
+                    let value = arr.value(row);
+                    *dict.entry(value).or_insert_with(|| {
+                        let id = values.len() as u32;
+                        values.push(Some(value));
+                        id
+                    })
+                }
+            }
+            (Self::Float { dict, values }, BatchKeyView::Float(arr)) => {
+                if arr.is_null(row) {
+                    0
+                } else {
+                    // Intern by bit pattern so NaN keeps one group per bit
+                    // pattern, matching the byte-hash behavior of the
+                    // single-batch kernel.
+                    let bits = arr.value(row).to_bits();
+                    *dict.entry(bits).or_insert_with(|| {
+                        let id = values.len() as u32;
+                        values.push(Some(bits));
+                        id
+                    })
+                }
+            }
+            (Self::Bool, BatchKeyView::Bool(arr)) => {
+                if arr.is_null(row) {
+                    0
+                } else if arr.value(row) {
+                    2
+                } else {
+                    1
+                }
+            }
+            (Self::String { dict, values }, BatchKeyView::Str(arr)) => {
+                if arr.is_null(row) {
+                    0
+                } else {
+                    let value = arr.value(row);
+                    *dict.entry(value.to_string()).or_insert_with(|| {
+                        let id = values.len() as u32;
+                        values.push(Some(value.to_string()));
+                        id
+                    })
+                }
+            }
+            (Self::String { dict, values }, BatchKeyView::LargeStr(arr)) => {
+                if arr.is_null(row) {
+                    0
+                } else {
+                    let value = arr.value(row);
+                    *dict.entry(value.to_string()).or_insert_with(|| {
+                        let id = values.len() as u32;
+                        values.push(Some(value.to_string()));
+                        id
+                    })
+                }
+            }
+            _ => unreachable!("lane compatibility checked at batch start"),
+        }
+    }
+
+    /// Output values in group-ID order for the packed group keys.
+    fn output_int(&self, ids: &[u32]) -> Option<Vec<Option<i64>>> {
+        match self {
+            Self::Int { values, .. } => Some(
+                ids.iter()
+                    .map(|&id| values.get(id as usize).and_then(|slot| *slot))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn output_float(&self, ids: &[u32]) -> Option<Vec<Option<f64>>> {
+        match self {
+            Self::Float { values, .. } => Some(
+                ids.iter()
+                    .map(|&id| {
+                        values
+                            .get(id as usize)
+                            .and_then(|slot| *slot)
+                            .map(f64::from_bits)
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn output_bool(&self, ids: &[u32]) -> Option<Vec<Option<bool>>> {
+        match self {
+            Self::Bool => Some(
+                ids.iter()
+                    .map(|&id| match id {
+                        1 => Some(false),
+                        2 => Some(true),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn output_string(&self, ids: &[u32]) -> Option<Vec<Option<String>>> {
+        match self {
+            Self::String { values, .. } => Some(
+                ids.iter()
+                    .map(|&id| values.get(id as usize).and_then(|slot| slot.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Incremental aggregate state of one group. Field-for-field the same
+/// semantics as the single-batch GroupState (minus first_row).
+#[derive(Clone)]
+struct BatchGroupState {
+    count: i64,
+    sum_int: i64,
+    sum_float: f64,
+    min_int: Option<i64>,
+    max_int: Option<i64>,
+    min_float: Option<f64>,
+    max_float: Option<f64>,
+}
+
+impl BatchGroupState {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            sum_int: 0,
+            sum_float: 0.0,
+            min_int: None,
+            max_int: None,
+            min_float: None,
+            max_float: None,
+        }
+    }
+}
+
+/// Incremental GROUP BY state over row-group-sized batches.
+struct BatchGroupAggregator {
+    group_cols: Vec<String>,
+    key1: Option<BatchKeyLane>,
+    key2: Option<BatchKeyLane>,
+    source_name: Option<String>,
+    source_is_int: Option<bool>,
+    groups: AHashMap<u64, BatchGroupState>,
+}
+
+impl BatchGroupAggregator {
+    /// Parse the statement shape. Returns None when the query is outside
+    /// this kernel's gate (the single-batch path keeps those shapes).
+    fn new(stmt: &SelectStatement) -> Option<Self> {
+        let group_cols: Vec<String> = stmt
+            .group_by
+            .iter()
+            .map(|s| {
+                let trimmed = s.trim_matches('"');
+                match trimmed.rfind('.') {
+                    Some(dot_pos) => trimmed[dot_pos + 1..].to_string(),
+                    None => trimmed.to_string(),
+                }
+            })
+            .collect();
+        if group_cols.is_empty() || group_cols.len() > 2 {
+            return None;
+        }
+
+        let mut source_name = None;
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(name) | SelectColumn::ColumnAlias { column: name, .. } => {
+                    let clean = name.trim_matches('"');
+                    let clean = clean.rsplit('.').next().unwrap_or(clean);
+                    if !group_cols.iter().any(|group| group == clean.trim_matches('"')) {
+                        return None;
+                    }
+                }
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    distinct: false,
+                    ..
+                } => {
+                    match func {
+                        AggregateFunc::Count => {
+                            let star = column.as_deref().map_or(true, |c| {
+                                let clean = c.trim_matches('"');
+                                let clean = clean.rsplit('.').next().unwrap_or(clean);
+                                clean == "*" || clean == "1"
+                            });
+                            if !star {
+                                return None;
+                            }
+                        }
+                        AggregateFunc::Sum
+                        | AggregateFunc::Avg
+                        | AggregateFunc::Min
+                        | AggregateFunc::Max => {
+                            let Some(raw) = column else {
+                                return None;
+                            };
+                            let clean = raw.trim_matches('"');
+                            let clean = clean.rsplit('.').next().unwrap_or(clean);
+                            match &source_name {
+                                Some(existing) if existing != clean => return None,
+                                Some(_) => {}
+                                None => source_name = Some(clean.to_string()),
+                            }
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        Some(Self {
+            group_cols,
+            key1: None,
+            key2: None,
+            source_name,
+            source_is_int: None,
+            groups: AHashMap::new(),
+        })
+    }
+
+    fn resolve_key<'b>(
+        &mut self,
+        slot: usize,
+        batch: &'b RecordBatch,
+    ) -> Option<BatchKeyView<'b>> {
+        let name = &self.group_cols[slot];
+        let column = batch.column_by_name(name)?;
+        let view = BatchKeyView::new(column)?;
+        let lane = match (slot, &mut self.key1, &mut self.key2) {
+            (0, lane @ None, _) => {
+                *lane = match view {
+                    BatchKeyView::Int(_) => Some(BatchKeyLane::new_int()),
+                    BatchKeyView::Float(_) => Some(BatchKeyLane::new_float()),
+                    BatchKeyView::Bool(_) => Some(BatchKeyLane::new_bool()),
+                    BatchKeyView::Str(_) | BatchKeyView::LargeStr(_) => {
+                        Some(BatchKeyLane::new_string())
+                    }
+                };
+                self.key1.as_mut().unwrap()
+            }
+            (1, _, lane @ None) => {
+                *lane = Some(match view {
+                    BatchKeyView::Int(_) => BatchKeyLane::new_int(),
+                    BatchKeyView::Float(_) => BatchKeyLane::new_float(),
+                    BatchKeyView::Bool(_) => BatchKeyLane::new_bool(),
+                    BatchKeyView::Str(_) | BatchKeyView::LargeStr(_) => {
+                        BatchKeyLane::new_string()
+                    }
+                });
+                self.key2.as_mut().unwrap()
+            }
+            _ => {
+                let lane = if slot == 0 {
+                    self.key1.as_mut()?
+                } else {
+                    self.key2.as_mut()?
+                };
+                if !lane.compatible(&view) {
+                    return None;
+                }
+                return Some(view);
+            }
+        };
+        if !lane.compatible(&view) {
+            return None;
+        }
+        Some(view)
+    }
+
+    /// Consume one selected batch. Returns None when a required column is
+    /// missing or unresolvable; the caller falls back to the single-batch
+    /// path for the whole query.
+    fn consume_batch(&mut self, batch: &RecordBatch) -> Option<()> {
+        let view1 = self.resolve_key(0, batch)?;
+        let view2 = if self.group_cols.len() == 2 {
+            Some(self.resolve_key(1, batch)?)
+        } else {
+            None
+        };
+
+        let source_int: Option<&Int64Array> = match &self.source_name {
+            None => None,
+            Some(name) => {
+                let column = batch.column_by_name(name)?;
+                column.as_any().downcast_ref::<Int64Array>()
+            }
+        };
+        let source_float: Option<&Float64Array> = if source_int.is_none() {
+            match &self.source_name {
+                None => None,
+                Some(name) => {
+                    let column = batch.column_by_name(name)?;
+                    let Some(arr) = column.as_any().downcast_ref::<Float64Array>() else {
+                        return None;
+                    };
+                    Some(arr)
+                }
+            }
+        } else {
+            None
+        };
+        let is_int_source = source_int.is_some();
+        match self.source_is_int {
+            Some(previous) if previous != is_int_source => return None,
+            _ => self.source_is_int = Some(is_int_source),
+        }
+
+        let num_rows = batch.num_rows();
+        match (source_int, source_float) {
+            (Some(int_arr), None) => {
+                for row in 0..num_rows {
+                    let id1 = self.lane_id(0, &view1, row);
+                    let key = match &view2 {
+                        Some(view2) => ((id1 as u64) << 32) | self.lane_id(1, view2, row) as u64,
+                        None => (id1 as u64) << 32,
+                    };
+                    let state = self.groups.entry(key).or_insert_with(BatchGroupState::new);
+                    state.count += 1;
+                    if !int_arr.is_null(row) {
+                        let value = int_arr.value(row);
+                        state.sum_int = state.sum_int.wrapping_add(value);
+                        state.min_int = Some(state.min_int.map_or(value, |m| m.min(value)));
+                        state.max_int = Some(state.max_int.map_or(value, |m| m.max(value)));
+                    }
+                }
+            }
+            (None, Some(float_arr)) => {
+                for row in 0..num_rows {
+                    let id1 = self.lane_id(0, &view1, row);
+                    let key = match &view2 {
+                        Some(view2) => ((id1 as u64) << 32) | self.lane_id(1, view2, row) as u64,
+                        None => (id1 as u64) << 32,
+                    };
+                    let state = self.groups.entry(key).or_insert_with(BatchGroupState::new);
+                    state.count += 1;
+                    if !float_arr.is_null(row) {
+                        let value = float_arr.value(row);
+                        state.sum_float += value;
+                        state.min_float = Some(state.min_float.map_or(value, |m| m.min(value)));
+                        state.max_float = Some(state.max_float.map_or(value, |m| m.max(value)));
+                    }
+                }
+            }
+            (None, None) => {
+                for row in 0..num_rows {
+                    let id1 = self.lane_id(0, &view1, row);
+                    let key = match &view2 {
+                        Some(view2) => ((id1 as u64) << 32) | self.lane_id(1, view2, row) as u64,
+                        None => (id1 as u64) << 32,
+                    };
+                    let state = self.groups.entry(key).or_insert_with(BatchGroupState::new);
+                    state.count += 1;
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn lane_id(&mut self, slot: usize, view: &BatchKeyView, row: usize) -> u32 {
+        let lane = if slot == 0 {
+            self.key1.as_mut().unwrap()
+        } else {
+            self.key2.as_mut().unwrap()
+        };
+        lane.id_at(view, row)
+    }
+
+    /// Finalize groups into the result batch (before HAVING/ORDER BY/LIMIT,
+    /// which the caller applies with the shared operators).
+    fn finish(&mut self, stmt: &SelectStatement) -> io::Result<RecordBatch> {
+        let states: Vec<(u64, BatchGroupState)> = self.groups.drain().collect();
+        let id1s: Vec<u32> = states.iter().map(|(key, _)| (*key >> 32) as u32).collect();
+        let id2s: Vec<u32> = states.iter().map(|(key, _)| *key as u32).collect();
+
+        let mut fields: Vec<Field> = Vec::with_capacity(stmt.columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(name) | SelectColumn::ColumnAlias { column: name, .. } => {
+                    let clean = name.trim_matches('"');
+                    let clean = clean.rsplit('.').next().unwrap_or(clean);
+                    let clean = clean.trim_matches('"');
+                    let output_name = match column {
+                        SelectColumn::ColumnAlias { alias, .. } => alias.as_str(),
+                        _ => clean,
+                    };
+                    let slot = self
+                        .group_cols
+                        .iter()
+                        .position(|group| group == clean)
+                        .ok_or_else(|| err_input("SELECT column is not a GROUP BY key"))?;
+                    let lane = if slot == 0 {
+                        self.key1.as_ref().unwrap()
+                    } else {
+                        self.key2.as_ref().unwrap()
+                    };
+                    let ids = if slot == 0 { &id1s } else { &id2s };
+                    let (arrow_dt, array): (ArrowDataType, ArrayRef) =
+                        if let Some(values) = lane.output_int(ids) {
+                            (ArrowDataType::Int64, Arc::new(Int64Array::from(values)))
+                        } else if let Some(values) = lane.output_float(ids) {
+                            (ArrowDataType::Float64, Arc::new(Float64Array::from(values)))
+                        } else if let Some(values) = lane.output_bool(ids) {
+                            (ArrowDataType::Boolean, Arc::new(BooleanArray::from(values)))
+                        } else {
+                            let values = lane.output_string(ids).unwrap();
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(values)))
+                        };
+                    fields.push(Field::new(output_name, arrow_dt, true));
+                    arrays.push(array);
+                }
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    alias,
+                    ..
+                } => {
+                    let fn_name = match func {
+                        AggregateFunc::Count => "COUNT",
+                        AggregateFunc::Sum => "SUM",
+                        AggregateFunc::Avg => "AVG",
+                        AggregateFunc::Min => "MIN",
+                        AggregateFunc::Max => "MAX",
+                    };
+                    let output_name = alias.clone().unwrap_or_else(|| {
+                        if let Some(c) = column {
+                            format!("{}({})", fn_name, c)
+                        } else {
+                            format!("{}(*)", fn_name)
+                        }
+                    });
+                    match func {
+                        AggregateFunc::Count => {
+                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                            arrays.push(Arc::new(Int64Array::from(
+                                states.iter().map(|(_, s)| s.count).collect::<Vec<_>>(),
+                            )));
+                        }
+                        AggregateFunc::Sum => {
+                            if self.source_is_int.unwrap_or(false) {
+                                // Same field nullability as the single-batch
+                                // kernel family: SUM is declared nullable even
+                                // though the value is always present.
+                                fields
+                                    .push(Field::new(&output_name, ArrowDataType::Int64, true));
+                                arrays.push(Arc::new(Int64Array::from(
+                                    states.iter().map(|(_, s)| s.sum_int).collect::<Vec<_>>(),
+                                )));
+                            } else {
+                                fields.push(
+                                    Field::new(&output_name, ArrowDataType::Float64, true),
+                                );
+                                arrays.push(Arc::new(Float64Array::from(
+                                    states.iter().map(|(_, s)| s.sum_float).collect::<Vec<_>>(),
+                                )));
+                            }
+                        }
+                        AggregateFunc::Avg => {
+                            let avgs: Vec<Option<f64>> = states
+                                .iter()
+                                .map(|(_, s)| {
+                                    if s.count > 0 {
+                                        Some(if self.source_is_int.unwrap_or(false) {
+                                            s.sum_int as f64 / s.count as f64
+                                        } else {
+                                            s.sum_float / s.count as f64
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
+                            arrays.push(Arc::new(Float64Array::from(avgs)));
+                        }
+                        AggregateFunc::Min => {
+                            if self.source_is_int.unwrap_or(false) {
+                                fields.push(Field::new(&output_name, ArrowDataType::Int64, true));
+                                arrays.push(Arc::new(Int64Array::from(
+                                    states.iter().map(|(_, s)| s.min_int).collect::<Vec<_>>(),
+                                )));
+                            } else {
+                                fields.push(
+                                    Field::new(&output_name, ArrowDataType::Float64, true),
+                                );
+                                arrays.push(Arc::new(Float64Array::from(
+                                    states.iter().map(|(_, s)| s.min_float).collect::<Vec<_>>(),
+                                )));
+                            }
+                        }
+                        AggregateFunc::Max => {
+                            if self.source_is_int.unwrap_or(false) {
+                                fields.push(Field::new(&output_name, ArrowDataType::Int64, true));
+                                arrays.push(Arc::new(Int64Array::from(
+                                    states.iter().map(|(_, s)| s.max_int).collect::<Vec<_>>(),
+                                )));
+                            } else {
+                                fields.push(
+                                    Field::new(&output_name, ArrowDataType::Float64, true),
+                                );
+                                arrays.push(Arc::new(Float64Array::from(
+                                    states.iter().map(|(_, s)| s.max_float).collect::<Vec<_>>(),
+                                )));
+                            }
+                        }
+                    }
+                }
+                _ => return Err(err_input("unsupported batch GROUP BY output")),
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))
+    }
+}
+
+impl ApexExecutor {
+    /// Serial batched Filter -> GROUP BY -> HAVING -> TopK over the stable
+    /// row-group stream. Bounded-scan-memory counterpart of
+    /// `try_scan_group_pipeline`; returns `Ok(None)` to fall back to the
+    /// single-batch path when the query shape, the table state, or a batch
+    /// column is outside this kernel's gate.
+    fn try_batch_group_pipeline(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+        predicate: &crate::storage::ScanPredicateExpr,
+    ) -> io::Result<Option<ApexResult>> {
+        if !Self::batch_scan_enabled() {
+            return Ok(None);
+        }
+        if stmt.where_clause.is_none()
+            || !stmt.joins.is_empty()
+            || stmt.distinct
+            || stmt.distinct_on.is_some()
+            || stmt.group_by_exprs.iter().any(Option::is_some)
+            || stmt
+                .columns
+                .iter()
+                .any(|column| matches!(column, SelectColumn::WindowFunction { .. }))
+        {
+            return Ok(None);
+        }
+
+        // Same HAVING extra-aggregate injection as execute_group_by so the
+        // HAVING expression can reference aggregates not in the SELECT list.
+        let select_col_count = stmt.columns.len();
+        let mut owned_stmt = None;
+        let extra_agg_count = if let Some(having_expr) = &stmt.having {
+            let extras = Self::collect_having_extra_aggs(having_expr, &stmt.columns);
+            if !extras.is_empty() {
+                let count = extras.len();
+                let mut s = stmt.clone();
+                for (func, col) in extras {
+                    let fn_name = match func {
+                        AggregateFunc::Count => "COUNT",
+                        AggregateFunc::Sum => "SUM",
+                        AggregateFunc::Avg => "AVG",
+                        AggregateFunc::Min => "MIN",
+                        AggregateFunc::Max => "MAX",
+                    };
+                    let alias = format!("{}({})", fn_name, col.as_deref().unwrap_or("*"));
+                    s.columns.push(SelectColumn::Aggregate {
+                        func,
+                        column: col,
+                        distinct: false,
+                        alias: Some(alias),
+                    });
+                }
+                owned_stmt = Some(s);
+                count
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let effective_stmt = owned_stmt.as_ref().unwrap_or(stmt);
+
+        let Some(aggregator) = BatchGroupAggregator::new(effective_stmt) else {
+            return Ok(None);
+        };
+        // Re-verify with the shared gate so injected HAVING aggregates are
+        // covered by the same rules as the single-batch path.
+        if !Self::can_use_incremental_aggregation(effective_stmt) {
+            return Ok(None);
+        }
+
+        let Some(columns) = Self::get_col_refs(stmt) else {
+            return Ok(None);
+        };
+        let column_refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        let Some(projection) = Self::filter_columns_for_backend(backend, &column_refs) else {
+            return Ok(None);
+        };
+        let request = crate::storage::ScanRequest {
+            projection: Some(&projection),
+            predicate: Some(predicate),
+        };
+        let Some(mut stream) = backend.scan_batches(&request)? else {
+            return Ok(None);
+        };
+
+        let mut agg = aggregator;
+        loop {
+            match stream.next() {
+                Some(Ok(crate::storage::BatchMorselOutcome::Morsel(morsel))) => {
+                    let batch = morsel.into_record_batch()?;
+                    if agg.consume_batch(&batch).is_none() {
+                        return Ok(None);
+                    }
+                }
+                Some(Ok(crate::storage::BatchMorselOutcome::Unsupported)) => {
+                    return Ok(None);
+                }
+                Some(Err(error)) => return Err(error),
+                None => break,
+            }
+        }
+
+        let mut result = ApexResult::Data(agg.finish(effective_stmt)?);
+
+        // HAVING applies after aggregation, before TopK — the same order as
+        // the single-batch path.
+        if let Some(having_expr) = &effective_stmt.having {
+            if let ApexResult::Data(batch) = &result {
+                let mask = Self::evaluate_predicate(batch, having_expr)?;
+                let filtered = compute::filter_record_batch(batch, &mask)
+                    .map_err(|e| err_data(e.to_string()))?;
+                result = ApexResult::Data(filtered);
+            }
+        }
+        if !effective_stmt.order_by.is_empty() {
+            if let ApexResult::Data(batch) = result {
+                let resolved = Self::resolve_order_by_cols(
+                    &effective_stmt.columns,
+                    &effective_stmt.order_by,
+                );
+                let k = effective_stmt
+                    .limit
+                    .map(|limit| limit + effective_stmt.offset.unwrap_or(0));
+                let sorted = Self::apply_order_by_topk(&batch, &resolved, k)?;
+                result = ApexResult::Data(sorted);
+            }
+        }
+        if let ApexResult::Data(batch) = result {
+            let limited = Self::apply_limit_offset(
+                &batch,
+                effective_stmt.limit,
+                effective_stmt.offset,
+            )?;
+            result = ApexResult::Data(limited);
+        }
+
+        // Strip the HAVING-only aggregate columns injected above.
+        if extra_agg_count > 0 {
+            if let ApexResult::Data(batch) = result {
+                let keep = select_col_count.min(batch.num_columns());
+                let new_schema = Arc::new(Schema::new(
+                    batch.schema().fields()[..keep]
+                        .iter()
+                        .map(|f| f.as_ref().clone())
+                        .collect::<Vec<_>>(),
+                ));
+                let new_arrays: Vec<ArrayRef> = (0..keep).map(|i| batch.column(i).clone()).collect();
+                result = ApexResult::Data(
+                    RecordBatch::try_new(new_schema, new_arrays)
+                        .map_err(|e| err_data(e.to_string()))?,
+                );
+            }
+        }
+
+        Ok(Some(result))
+    }
+
+    /// The batched scan pipeline is enabled by default; `APEX_BATCH_SCAN=0`
+    /// disables it for A/B diagnostics (architecture review R3).
+    fn batch_scan_enabled() -> bool {
+        match std::env::var_os("APEX_BATCH_SCAN") {
+            Some(value) => value != "0",
+            None => true,
+        }
+    }
+}

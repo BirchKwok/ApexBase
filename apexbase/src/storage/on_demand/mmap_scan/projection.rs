@@ -270,9 +270,7 @@ impl OnDemandStorage {
         row_limit: Option<usize>,
         dict_encode_strings: bool,
     ) -> io::Result<Option<RecordBatch>> {
-        use arrow::array::{BooleanArray, Int64Array, PrimitiveArray, StringArray};
-        use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
-        use arrow::datatypes::{DataType as ArrowDataType, Field, Float64Type, Int64Type, Schema};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
         let footer = match self.get_or_load_footer()? {
@@ -370,7 +368,6 @@ impl OnDemandStorage {
                 continue;
             }
 
-            let rg_rows = rg_meta.row_count as usize;
             let rg_active = rg_meta.active_rows() as usize;
             if active_rows_seen + rg_active <= effective_start {
                 active_rows_seen += rg_active;
@@ -385,143 +382,147 @@ impl OnDemandStorage {
                 continue;
             }
 
-            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
-            if rg_end > mmap_ref.len() {
-                return Err(err_data("RG extends past EOF"));
-            }
-            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            Self::read_rg_into_accumulators(
+                mmap_ref,
+                rg_idx,
+                rg_meta,
+                &footer,
+                &col_indices,
+                active_skip,
+                rows_to_take,
+                &mut all_ids,
+                &mut col_accumulators,
+                &mut null_accumulators,
+            )?;
+            rows_collected += rows_to_take;
+            active_rows_seen += rg_active;
+        }
 
-            // Check compression flag at RG header byte 28
-            let compress_flag = if rg_bytes.len() >= 32 {
-                rg_bytes[28]
+        drop(mmap_guard);
+        drop(file_guard);
+
+        // Build Arrow RecordBatch from accumulated data
+        let batch = self.build_arrow_batch(
+            schema,
+            &col_indices,
+            include_id,
+            rows_collected,
+            all_ids,
+            col_accumulators,
+            null_accumulators,
+            dict_encode_strings,
+        )?;
+
+        Ok(Some(batch))
+    }
+
+    /// Read the active rows of one row group into shared accumulators.
+    ///
+    /// `active_skip` and `rows_to_take` select a window over the RG's active
+    /// rows; both the RCIX fast path and the sequential path append exactly
+    /// that many rows to every column accumulator. Row IDs are always
+    /// collected so the pending DeltaStore overlay can locate rows.
+    fn read_rg_into_accumulators(
+        mmap_ref: &[u8],
+        rg_idx: usize,
+        rg_meta: &RowGroupMeta,
+        footer: &V4Footer,
+        col_indices: &[usize],
+        active_skip: usize,
+        rows_to_take: usize,
+        all_ids: &mut Vec<i64>,
+        col_accumulators: &mut [ColumnData],
+        null_accumulators: &mut [Vec<bool>],
+    ) -> io::Result<()> {
+        let schema = &footer.schema;
+        let col_count = schema.column_count();
+        let rg_rows = rg_meta.row_count as usize;
+
+        let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+        if rg_end > mmap_ref.len() {
+            return Err(err_data("RG extends past EOF"));
+        }
+        let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+
+        // Check compression flag at RG header byte 28
+        let compress_flag = if rg_bytes.len() >= 32 {
+            rg_bytes[28]
+        } else {
+            RG_COMPRESS_NONE
+        };
+        let encoding_version = if rg_bytes.len() >= 32 {
+            rg_bytes[29]
+        } else {
+            0
+        };
+        let has_deletes = rg_meta.deletion_count > 0;
+        let null_bitmap_len = (rg_rows + 7) / 8;
+
+        // === RCIX fast path: O(1) direct seeks for no-compression, no-deletes ===
+        // Skips sequential column scanning — jumps directly to each column via footer index.
+        // For LIMIT 100 with 65536-row RG: touches ~800B of IDs + targeted column pages
+        // instead of scanning 512KB IDs + full column sequence.
+        if compress_flag == RG_COMPRESS_NONE
+            && !has_deletes
+            && encoding_version >= 1
+            && rg_idx < footer.col_offsets.len()
+            && !footer.col_offsets[rg_idx].is_empty()
+        {
+            let rg_body_abs = (rg_meta.offset + 32) as usize;
+            let col_offsets = &footer.col_offsets[rg_idx];
+
+            // Read only the requested IDs; contiguous row groups reconstruct
+            // them from min_id without touching a physical ID section.
+            let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
+            if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+                all_ids.extend(
+                    (0..rows_to_take)
+                        .map(|i| (rg_meta.min_id + (active_skip + i) as u64) as i64),
+                );
             } else {
-                RG_COMPRESS_NONE
-            };
-            let encoding_version = if rg_bytes.len() >= 32 {
-                rg_bytes[29]
-            } else {
-                0
-            };
-            let has_deletes = rg_meta.deletion_count > 0;
-            let null_bitmap_len = (rg_rows + 7) / 8;
-
-            // === RCIX fast path: O(1) direct seeks for no-compression, no-deletes ===
-            // Skips sequential column scanning — jumps directly to each column via footer index.
-            // For LIMIT 100 with 65536-row RG: touches ~800B of IDs + targeted column pages
-            // instead of scanning 512KB IDs + full column sequence.
-            if compress_flag == RG_COMPRESS_NONE
-                && !has_deletes
-                && encoding_version >= 1
-                && rg_idx < footer.col_offsets.len()
-                && !footer.col_offsets[rg_idx].is_empty()
-            {
-                let rg_body_abs = (rg_meta.offset + 32) as usize;
-                let col_offsets = &footer.col_offsets[rg_idx];
-
-                // Read only the requested IDs; contiguous row groups reconstruct
-                // them from min_id without touching a physical ID section.
-                let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
-                if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
-                    all_ids.extend(
-                        (0..rows_to_take)
-                            .map(|i| (rg_meta.min_id + (active_skip + i) as u64) as i64),
-                    );
-                } else {
-                    let id_start = rg_body_abs + active_skip * 8;
-                    let id_end = id_start + rows_to_take * 8;
-                    if id_end <= mmap_ref.len() {
-                        let id_bytes = &mmap_ref[id_start..id_end];
-                        for i in 0..rows_to_take {
-                            let id = u64::from_le_bytes(
-                                id_bytes[i * 8..(i + 1) * 8].try_into().unwrap(),
-                            );
-                            all_ids.push(id as i64);
-                        }
+                let id_start = rg_body_abs + active_skip * 8;
+                let id_end = id_start + rows_to_take * 8;
+                if id_end <= mmap_ref.len() {
+                    let id_bytes = &mmap_ref[id_start..id_end];
+                    for i in 0..rows_to_take {
+                        let id = u64::from_le_bytes(
+                            id_bytes[i * 8..(i + 1) * 8].try_into().unwrap(),
+                        );
+                        all_ids.push(id as i64);
                     }
                 }
+            }
 
-                // Direct column reads via RCIX — no sequential scan of preceding columns
-                // OPTIMIZATION: parallelize column reads for large RGs with multiple columns
-                if rows_to_take >= 50_000 && col_indices.len() >= 2 {
-                    use rayon::prelude::*;
-                    let create_default = Self::create_default_column;
-                    let rg_col_results: Vec<io::Result<(ColumnData, Vec<bool>)>> = col_indices
-                        .par_iter()
-                        .map(|&col_idx| {
-                            if col_idx >= col_offsets.len() {
-                                let col_type = schema.columns[col_idx].1;
-                                let default_col = create_default(col_type, rows_to_take);
-                                let nulls = vec![true; rows_to_take];
-                                return Ok((default_col, nulls));
-                            }
-                            let col_abs = rg_body_abs + col_offsets[col_idx] as usize;
-                            if col_abs + null_bitmap_len > mmap_ref.len() {
-                                let col_type = schema.columns[col_idx].1;
-                                return Ok((
-                                    create_default(col_type, rows_to_take),
-                                    vec![true; rows_to_take],
-                                ));
-                            }
-                            let null_bytes = &mmap_ref[col_abs..col_abs + null_bitmap_len];
-                            let data_abs = col_abs + null_bitmap_len;
-                            if data_abs >= mmap_ref.len() {
-                                let col_type = schema.columns[col_idx].1;
-                                return Ok((
-                                    create_default(col_type, rows_to_take),
-                                    vec![true; rows_to_take],
-                                ));
-                            }
-                            let col_type = schema.columns[col_idx].1;
-                            let (col_data, _) = if active_skip == 0 && rows_to_take < rg_rows {
-                                read_column_encoded_partial(
-                                    &mmap_ref[data_abs..],
-                                    col_type,
-                                    rows_to_take,
-                                )?
-                            } else {
-                                read_column_encoded(&mmap_ref[data_abs..], col_type)?
-                            };
-                            let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
-                                col_data.decode_string_dict()
-                            } else {
-                                col_data
-                            };
-                            let col_data = if active_skip > 0 || rows_to_take < col_data.len() {
-                                col_data.slice_range(active_skip, active_skip + rows_to_take)
-                            } else {
-                                col_data
-                            };
-                            let mut nulls = Vec::with_capacity(rows_to_take);
-                            for i in 0..rows_to_take {
-                                let row = active_skip + i;
-                                nulls.push((null_bytes[row / 8] >> (row % 8)) & 1 == 1);
-                            }
-                            Ok((col_data, nulls))
-                        })
-                        .collect();
-                    for (out_pos, result) in rg_col_results.into_iter().enumerate() {
-                        let (col_data, nulls) = result?;
-                        col_accumulators[out_pos].append(&col_data);
-                        null_accumulators[out_pos].extend(nulls);
-                    }
-                } else {
-                    for (out_pos, &col_idx) in col_indices.iter().enumerate() {
+            // Direct column reads via RCIX — no sequential scan of preceding columns
+            // OPTIMIZATION: parallelize column reads for large RGs with multiple columns
+            if rows_to_take >= 50_000 && col_indices.len() >= 2 {
+                use rayon::prelude::*;
+                let create_default = Self::create_default_column;
+                let rg_col_results: Vec<io::Result<(ColumnData, Vec<bool>)>> = col_indices
+                    .par_iter()
+                    .map(|&col_idx| {
                         if col_idx >= col_offsets.len() {
                             let col_type = schema.columns[col_idx].1;
-                            let default_col = Self::create_default_column(col_type, rows_to_take);
-                            col_accumulators[out_pos].append(&default_col);
-                            null_accumulators[out_pos]
-                                .extend(std::iter::repeat(true).take(rows_to_take));
-                            continue;
+                            let default_col = create_default(col_type, rows_to_take);
+                            let nulls = vec![true; rows_to_take];
+                            return Ok((default_col, nulls));
                         }
                         let col_abs = rg_body_abs + col_offsets[col_idx] as usize;
                         if col_abs + null_bitmap_len > mmap_ref.len() {
-                            continue;
+                            let col_type = schema.columns[col_idx].1;
+                            return Ok((
+                                create_default(col_type, rows_to_take),
+                                vec![true; rows_to_take],
+                            ));
                         }
                         let null_bytes = &mmap_ref[col_abs..col_abs + null_bitmap_len];
                         let data_abs = col_abs + null_bitmap_len;
                         if data_abs >= mmap_ref.len() {
-                            continue;
+                            let col_type = schema.columns[col_idx].1;
+                            return Ok((
+                                create_default(col_type, rows_to_take),
+                                vec![true; rows_to_take],
+                            ));
                         }
                         let col_type = schema.columns[col_idx].1;
                         let (col_data, _) = if active_skip == 0 && rows_to_take < rg_rows {
@@ -543,187 +544,251 @@ impl OnDemandStorage {
                         } else {
                             col_data
                         };
-                        col_accumulators[out_pos].append(&col_data);
+                        let mut nulls = Vec::with_capacity(rows_to_take);
                         for i in 0..rows_to_take {
                             let row = active_skip + i;
-                            null_accumulators[out_pos]
-                                .push((null_bytes[row / 8] >> (row % 8)) & 1 == 1);
+                            nulls.push((null_bytes[row / 8] >> (row % 8)) & 1 == 1);
                         }
-                    }
+                        Ok((col_data, nulls))
+                    })
+                    .collect();
+                for (out_pos, result) in rg_col_results.into_iter().enumerate() {
+                    let (col_data, nulls) = result?;
+                    col_accumulators[out_pos].append(&col_data);
+                    null_accumulators[out_pos].extend(nulls);
                 }
-
-                rows_collected += rows_to_take;
-                active_rows_seen += rg_active;
-                continue; // skip sequential scan path below
-            }
-            // === End RCIX fast path ===
-
-            // Get the body bytes (after 32-byte RG header), decompressing if needed
-            let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
-            let mut pos: usize = 0;
-
-            // Read IDs
-            let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
-            let id_byte_len = rg_id_section_len(rg_rows, id_encoding);
-            if pos + id_byte_len > body.len() {
-                return Err(err_data("RG IDs truncated"));
-            }
-            pos += id_byte_len;
-
-            // Read deletion vector
-            let del_vec_len = (rg_rows + 7) / 8;
-            if pos + del_vec_len > body.len() {
-                return Err(err_data("RG deletion vector truncated"));
-            }
-            let del_bytes = &body[pos..pos + del_vec_len];
-            pos += del_vec_len;
-
-            // Always collect active IDs from this RG (needed for DeltaMerger overlay)
-            {
-                let mut skipped = 0usize;
-                let mut taken = 0;
-                for i in 0..rg_rows {
-                    if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
-                        continue; // deleted
-                    }
-                    if skipped < active_skip {
-                        skipped += 1;
+            } else {
+                for (out_pos, &col_idx) in col_indices.iter().enumerate() {
+                    if col_idx >= col_offsets.len() {
+                        let col_type = schema.columns[col_idx].1;
+                        let default_col = Self::create_default_column(col_type, rows_to_take);
+                        col_accumulators[out_pos].append(&default_col);
+                        null_accumulators[out_pos]
+                            .extend(std::iter::repeat(true).take(rows_to_take));
                         continue;
                     }
-                    let id = rg_id_at(body, rg_rows, rg_meta.min_id, id_encoding, i)
-                        .ok_or_else(|| err_data("RG ID section truncated"))?;
-                    all_ids.push(id as i64);
-                    taken += 1;
-                    if taken >= rows_to_take {
-                        break;
+                    let col_abs = rg_body_abs + col_offsets[col_idx] as usize;
+                    if col_abs + null_bitmap_len > mmap_ref.len() {
+                        continue;
+                    }
+                    let null_bytes = &mmap_ref[col_abs..col_abs + null_bitmap_len];
+                    let data_abs = col_abs + null_bitmap_len;
+                    if data_abs >= mmap_ref.len() {
+                        continue;
+                    }
+                    let col_type = schema.columns[col_idx].1;
+                    let (col_data, _) = if active_skip == 0 && rows_to_take < rg_rows {
+                        read_column_encoded_partial(
+                            &mmap_ref[data_abs..],
+                            col_type,
+                            rows_to_take,
+                        )?
+                    } else {
+                        read_column_encoded(&mmap_ref[data_abs..], col_type)?
+                    };
+                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                        col_data.decode_string_dict()
+                    } else {
+                        col_data
+                    };
+                    let col_data = if active_skip > 0 || rows_to_take < col_data.len() {
+                        col_data.slice_range(active_skip, active_skip + rows_to_take)
+                    } else {
+                        col_data
+                    };
+                    col_accumulators[out_pos].append(&col_data);
+                    for i in 0..rows_to_take {
+                        let row = active_skip + i;
+                        null_accumulators[out_pos]
+                            .push((null_bytes[row / 8] >> (row % 8)) & 1 == 1);
                     }
                 }
             }
 
-            // Parse columns — read requested, skip others
-            // Build mapping: disk col_idx → output position in col_accumulators
-            // This ensures correct data placement regardless of column ordering
-            // between the footer schema and the requested column list.
-            let col_idx_to_out: HashMap<usize, usize> = col_indices
-                .iter()
-                .enumerate()
-                .map(|(out_pos, &col_idx)| (col_idx, out_pos))
-                .collect();
-            // Track which output columns got data from this RG
-            let mut rg_filled: Vec<bool> = vec![false; col_indices.len()];
-            for col_idx in 0..col_count {
-                // Schema evolution: RG may have fewer columns than footer schema.
-                // If we've exhausted the RG data, remaining columns get defaults.
-                if pos + null_bitmap_len > body.len() {
+            return Ok(());
+        }
+        // === End RCIX fast path ===
+
+        // Get the body bytes (after 32-byte RG header), decompressing if needed
+        let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+        let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
+        let mut pos: usize = 0;
+
+        // Read IDs
+        let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
+        let id_byte_len = rg_id_section_len(rg_rows, id_encoding);
+        if pos + id_byte_len > body.len() {
+            return Err(err_data("RG IDs truncated"));
+        }
+        pos += id_byte_len;
+
+        // Read deletion vector
+        let del_vec_len = (rg_rows + 7) / 8;
+        if pos + del_vec_len > body.len() {
+            return Err(err_data("RG deletion vector truncated"));
+        }
+        let del_bytes = &body[pos..pos + del_vec_len];
+        pos += del_vec_len;
+
+        // Always collect active IDs from this RG (needed for DeltaMerger overlay)
+        {
+            let mut skipped = 0usize;
+            let mut taken = 0;
+            for i in 0..rg_rows {
+                if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                    continue; // deleted
+                }
+                if skipped < active_skip {
+                    skipped += 1;
+                    continue;
+                }
+                let id = rg_id_at(body, rg_rows, rg_meta.min_id, id_encoding, i)
+                    .ok_or_else(|| err_data("RG ID section truncated"))?;
+                all_ids.push(id as i64);
+                taken += 1;
+                if taken >= rows_to_take {
                     break;
                 }
-                let null_bytes = &body[pos..pos + null_bitmap_len];
-                pos += null_bitmap_len;
+            }
+        }
 
-                let col_type = schema.columns[col_idx].1;
+        // Parse columns — read requested, skip others
+        // Build mapping: disk col_idx → output position in col_accumulators
+        // This ensures correct data placement regardless of column ordering
+        // between the footer schema and the requested column list.
+        let col_idx_to_out: HashMap<usize, usize> = col_indices
+            .iter()
+            .enumerate()
+            .map(|(out_pos, &col_idx)| (col_idx, out_pos))
+            .collect();
+        // Track which output columns got data from this RG
+        let mut rg_filled: Vec<bool> = vec![false; col_indices.len()];
+        for col_idx in 0..col_count {
+            // Schema evolution: RG may have fewer columns than footer schema.
+            // If we've exhausted the RG data, remaining columns get defaults.
+            if pos + null_bitmap_len > body.len() {
+                break;
+            }
+            let null_bytes = &body[pos..pos + null_bitmap_len];
+            pos += null_bitmap_len;
 
-                if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
-                    // OPTIMIZATION: For LIMIT queries without deletes, use partial column read
-                    // to avoid allocating/copying full column data (e.g., 1M rows → only 100)
-                    if !has_deletes
-                        && active_skip == 0
-                        && rows_to_take < rg_rows
-                        && encoding_version >= 1
-                    {
-                        let (col_data, consumed) =
-                            read_column_encoded_partial(&body[pos..], col_type, rows_to_take)?;
-                        pos += consumed;
-                        let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
-                            col_data.decode_string_dict()
-                        } else {
-                            col_data
-                        };
-                        col_accumulators[out_pos].append(&col_data);
-                        for i in 0..rows_to_take {
-                            let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
+            let col_type = schema.columns[col_idx].1;
+
+            if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
+                // OPTIMIZATION: For LIMIT queries without deletes, use partial column read
+                // to avoid allocating/copying full column data (e.g., 1M rows → only 100)
+                if !has_deletes
+                    && active_skip == 0
+                    && rows_to_take < rg_rows
+                    && encoding_version >= 1
+                {
+                    let (col_data, consumed) =
+                        read_column_encoded_partial(&body[pos..], col_type, rows_to_take)?;
+                    pos += consumed;
+                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                        col_data.decode_string_dict()
+                    } else {
+                        col_data
+                    };
+                    col_accumulators[out_pos].append(&col_data);
+                    for i in 0..rows_to_take {
+                        let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
+                        null_accumulators[out_pos].push(is_null);
+                    }
+                } else {
+                    // Full column read path
+                    let (col_data, consumed) = if encoding_version >= 1 {
+                        read_column_encoded(&body[pos..], col_type)?
+                    } else {
+                        ColumnData::from_bytes_typed(&body[pos..], col_type)?
+                    };
+                    pos += consumed;
+
+                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                        col_data.decode_string_dict()
+                    } else {
+                        col_data
+                    };
+
+                    if has_deletes {
+                        let active_indices: Vec<usize> = (0..rg_rows)
+                            .filter(|&i| (del_bytes[i / 8] >> (i % 8)) & 1 == 0)
+                            .skip(active_skip)
+                            .take(rows_to_take)
+                            .collect();
+                        let filtered = col_data.filter_by_indices(&active_indices);
+                        col_accumulators[out_pos].append(&filtered);
+
+                        for &old_idx in &active_indices {
+                            let ob = old_idx / 8;
+                            let obit = old_idx % 8;
+                            let is_null =
+                                ob < null_bytes.len() && (null_bytes[ob] >> obit) & 1 == 1;
                             null_accumulators[out_pos].push(is_null);
                         }
                     } else {
-                        // Full column read path
-                        let (col_data, consumed) = if encoding_version >= 1 {
-                            read_column_encoded(&body[pos..], col_type)?
-                        } else {
-                            ColumnData::from_bytes_typed(&body[pos..], col_type)?
-                        };
-                        pos += consumed;
-
-                        let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
-                            col_data.decode_string_dict()
-                        } else {
-                            col_data
-                        };
-
-                        if has_deletes {
-                            let active_indices: Vec<usize> = (0..rg_rows)
-                                .filter(|&i| (del_bytes[i / 8] >> (i % 8)) & 1 == 0)
-                                .skip(active_skip)
-                                .take(rows_to_take)
-                                .collect();
-                            let filtered = col_data.filter_by_indices(&active_indices);
-                            col_accumulators[out_pos].append(&filtered);
-
-                            for &old_idx in &active_indices {
-                                let ob = old_idx / 8;
-                                let obit = old_idx % 8;
-                                let is_null =
-                                    ob < null_bytes.len() && (null_bytes[ob] >> obit) & 1 == 1;
+                        if active_skip > 0 || rows_to_take < rg_rows {
+                            let range_data =
+                                col_data.slice_range(active_skip, active_skip + rows_to_take);
+                            col_accumulators[out_pos].append(&range_data);
+                            for i in 0..rows_to_take {
+                                let row = active_skip + i;
+                                let is_null = (null_bytes[row / 8] >> (row % 8)) & 1 == 1;
                                 null_accumulators[out_pos].push(is_null);
                             }
                         } else {
-                            if active_skip > 0 || rows_to_take < rg_rows {
-                                let range_data =
-                                    col_data.slice_range(active_skip, active_skip + rows_to_take);
-                                col_accumulators[out_pos].append(&range_data);
-                                for i in 0..rows_to_take {
-                                    let row = active_skip + i;
-                                    let is_null = (null_bytes[row / 8] >> (row % 8)) & 1 == 1;
-                                    null_accumulators[out_pos].push(is_null);
-                                }
-                            } else {
-                                col_accumulators[out_pos].append(&col_data);
-                                for i in 0..rg_rows {
-                                    let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
-                                    null_accumulators[out_pos].push(is_null);
-                                }
+                            col_accumulators[out_pos].append(&col_data);
+                            for i in 0..rg_rows {
+                                let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
+                                null_accumulators[out_pos].push(is_null);
                             }
                         }
                     }
-                    rg_filled[out_pos] = true;
+                }
+                rg_filled[out_pos] = true;
+            } else {
+                // Skip this column (no allocation, encoding-aware)
+                let consumed = if encoding_version >= 1 {
+                    skip_column_encoded(&body[pos..], col_type)?
                 } else {
-                    // Skip this column (no allocation, encoding-aware)
-                    let consumed = if encoding_version >= 1 {
-                        skip_column_encoded(&body[pos..], col_type)?
-                    } else {
-                        ColumnData::skip_bytes_typed(&body[pos..], col_type)?
-                    };
-                    pos += consumed;
-                }
+                    ColumnData::skip_bytes_typed(&body[pos..], col_type)?
+                };
+                pos += consumed;
             }
-            // Fill default values for columns that weren't in this RG (schema evolution)
-            for (out_pos, filled) in rg_filled.iter().enumerate() {
-                if !filled {
-                    let col_type = schema.columns[col_indices[out_pos]].1;
-                    let default_col = Self::create_default_column(col_type, rows_to_take);
-                    col_accumulators[out_pos].append(&default_col);
-                    // All rows are null for this missing column
-                    null_accumulators[out_pos].extend(std::iter::repeat(true).take(rows_to_take));
-                }
-            }
-            rows_collected += rows_to_take;
-            active_rows_seen += rg_active;
         }
+        // Fill default values for columns that weren't in this RG (schema evolution)
+        for (out_pos, filled) in rg_filled.iter().enumerate() {
+            if !filled {
+                let col_type = schema.columns[col_indices[out_pos]].1;
+                let default_col = Self::create_default_column(col_type, rows_to_take);
+                col_accumulators[out_pos].append(&default_col);
+                // All rows are null for this missing column
+                null_accumulators[out_pos].extend(std::iter::repeat(true).take(rows_to_take));
+            }
+        }
+        Ok(())
+    }
 
-        drop(mmap_guard);
-        drop(file_guard);
+    /// Build an Arrow RecordBatch from rows accumulated across row groups.
+    ///
+    /// `all_ids` must carry the physical row ID of every output row; when a
+    /// pending DeltaStore is present it is overlaid on the result.
+    fn build_arrow_batch(
+        &self,
+        schema: &OnDemandSchema,
+        col_indices: &[usize],
+        include_id: bool,
+        active_count: usize,
+        all_ids: Vec<i64>,
+        col_accumulators: Vec<ColumnData>,
+        null_accumulators: Vec<Vec<bool>>,
+        dict_encode_strings: bool,
+    ) -> io::Result<RecordBatch> {
+        use arrow::array::{BooleanArray, Int64Array, PrimitiveArray, StringArray};
+        use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Float64Type, Int64Type, Schema};
+        use std::sync::Arc;
 
-        // Build Arrow RecordBatch from accumulated data
-        let active_count = rows_collected;
         let mut fields: Vec<Field> = Vec::with_capacity(col_indices.len() + 1);
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_indices.len() + 1);
 
@@ -1116,10 +1181,22 @@ impl OnDemandStorage {
         if !ds.is_empty() && batch.num_rows() > 0 {
             let merged =
                 crate::storage::delta::DeltaMerger::merge(&batch, &ds, &row_ids_for_delta)?;
-            return Ok(Some(merged));
+            return Ok(merged);
         }
+        Ok(batch)
+    }
 
-        Ok(Some(batch))
+    /// Stream row-group-sized `RecordBatch`es directly from the V4 mmap.
+    ///
+    /// Returns `Ok(None)` when the file has no persisted row groups. See
+    /// `RgBatchStream` for the stable read view contract.
+    pub(crate) fn scan_rg_batches<'a>(
+        &'a self,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+        predicate: Option<&'a crate::storage::ScanPredicateExpr>,
+    ) -> io::Result<Option<RgBatchStream<'a>>> {
+        RgBatchStream::new(self, column_names, include_id, predicate)
     }
 
     pub(super) fn read_column_auto(
@@ -4945,5 +5022,285 @@ impl OnDemandStorage {
         arrow::record_batch::RecordBatch::try_new(batch_schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
             .map(Some)
+    }
+}
+
+    /// Row-group-sized streaming scan over the V4 mmap.
+    ///
+    /// Yields one `RecordBatch` per row group: active rows only (deletion
+    /// vectors applied), projected columns, pending DeltaStore cells
+    /// overlaid. The persisted row groups are a complete, stable read view
+    /// for the whole stream; callers must ensure no overlay rows exist
+    /// beyond the file (no delta file, no in-memory V4 rows).
+    pub(crate) struct RgBatchStream<'a> {
+        storage: &'a OnDemandStorage,
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        footer: V4Footer,
+        col_indices: Vec<usize>,
+        include_id: bool,
+        predicate: Option<&'a crate::storage::ScanPredicateExpr>,
+        next_rg: usize,
+    }
+
+impl<'a> RgBatchStream<'a> {
+    pub(crate) fn new(
+        storage: &'a OnDemandStorage,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+        predicate: Option<&'a crate::storage::ScanPredicateExpr>,
+    ) -> io::Result<Option<Self>> {
+        let footer = match storage.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_count = schema.column_count();
+        let col_indices: Vec<usize> = match column_names {
+            Some(names) => names
+                .iter()
+                .filter(|&&n| n != "_id")
+                .filter_map(|&name| schema.get_index(name))
+                .collect(),
+            None => (0..col_count).collect(),
+        };
+        let total_active: usize = footer
+            .row_groups
+            .iter()
+            .map(|rg| rg.active_rows() as usize)
+            .sum();
+        if total_active == 0 {
+            return Ok(None);
+        }
+        let file_guard = storage.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for mmap batch scan"))?;
+        let mmap = storage.mmap_cache.write().get_mmap_arc(file)?;
+        drop(file_guard);
+        Ok(Some(Self {
+            storage,
+            mmap,
+            footer,
+            col_indices,
+            include_id,
+            predicate,
+            next_rg: 0,
+        }))
+    }
+}
+
+impl Iterator for RgBatchStream<'_> {
+    type Item = io::Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let rg_idx = self.next_rg;
+            if rg_idx >= self.footer.row_groups.len() {
+                return None;
+            }
+            self.next_rg += 1;
+            let rg_meta = &self.footer.row_groups[rg_idx];
+            let rg_active = rg_meta.active_rows() as usize;
+            if rg_meta.row_count == 0 || rg_active == 0 {
+                continue;
+            }
+            if let Some(predicate) = self.predicate {
+                if zone_map_rg_disjoint(rg_idx, &self.footer, predicate) {
+                    continue;
+                }
+            }
+            let mut all_ids: Vec<i64> = Vec::new();
+            let mut col_accumulators: Vec<ColumnData> = self
+                .col_indices
+                .iter()
+                .map(|&ci| {
+                    let ct = self.footer.schema.columns[ci].1;
+                    ColumnData::new(if ct == ColumnType::StringDict {
+                        ColumnType::String
+                    } else {
+                        ct
+                    })
+                })
+                .collect();
+            let mut null_accumulators: Vec<Vec<bool>> =
+                vec![Vec::new(); self.col_indices.len()];
+            let mmap_ref: &[u8] = &self.mmap;
+            if let Err(error) = OnDemandStorage::read_rg_into_accumulators(
+                mmap_ref,
+                rg_idx,
+                rg_meta,
+                &self.footer,
+                &self.col_indices,
+                0,
+                rg_active,
+                &mut all_ids,
+                &mut col_accumulators,
+                &mut null_accumulators,
+            ) {
+                return Some(Err(error));
+            }
+            return Some(self.storage.build_arrow_batch(
+                &self.footer.schema,
+                &self.col_indices,
+                self.include_id,
+                rg_active,
+                all_ids,
+                col_accumulators,
+                null_accumulators,
+                false,
+            ));
+        }
+    }
+}
+
+// ============================================================================
+// Zone-map RG pruning for the typed batch scan predicate
+// ============================================================================
+
+#[derive(Copy, Clone)]
+enum ZoneRange {
+    Int(i64, i64),
+    Float(f64, f64),
+}
+
+/// True when no value in the zone can satisfy `column op value`.
+/// Int-to-float comparisons are only used below 2^53 where the conversion
+/// is exact; everything else conservatively reports "cannot prove".
+fn zone_compare_disjoint(range: ZoneRange, op: crate::storage::ScanComparison, value: &crate::storage::ScanValue) -> bool {
+    const EXACT_INT: u64 = 1_u64 << 53;
+    use crate::storage::ScanComparison;
+    match (range, value) {
+        (ZoneRange::Int(mn, mx), crate::storage::ScanValue::Int(v)) => match op {
+            ScanComparison::Eq => *v < mn || *v > mx,
+            ScanComparison::NotEq => mn == mx && mn == *v,
+            ScanComparison::Lt => mn >= *v,
+            ScanComparison::Le => mn > *v,
+            ScanComparison::Gt => mx <= *v,
+            ScanComparison::Ge => mx < *v,
+        },
+        (ZoneRange::Float(mn, mx), crate::storage::ScanValue::Float(v)) => {
+            if !v.is_finite() {
+                return false;
+            }
+            match op {
+                ScanComparison::Eq => *v < mn || *v > mx,
+                ScanComparison::NotEq => false,
+                ScanComparison::Lt => mn >= *v,
+                ScanComparison::Le => mn > *v,
+                ScanComparison::Gt => mx <= *v,
+                ScanComparison::Ge => mx < *v,
+            }
+        }
+        (ZoneRange::Float(mn, mx), crate::storage::ScanValue::Int(v))
+            if v.unsigned_abs() <= EXACT_INT =>
+        {
+            let v = *v as f64;
+            match op {
+                ScanComparison::Eq => v < mn || v > mx,
+                ScanComparison::NotEq => false,
+                ScanComparison::Lt => mn >= v,
+                ScanComparison::Le => mn > v,
+                ScanComparison::Gt => mx <= v,
+                ScanComparison::Ge => mx < v,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Zone range that cannot contain any value of `lower..=upper`.
+fn zone_between_disjoint(range: ZoneRange, lower: Option<&crate::storage::ScanBound>, upper: Option<&crate::storage::ScanBound>) -> bool {
+    const EXACT_INT: u64 = 1_u64 << 53;
+    // Prove the zone sits strictly below the lower bound or strictly above
+    // the upper bound; mixed/lossy types conservatively do not skip.
+    if let Some(bound) = lower {
+        if bound.inclusive {
+            return match (range, &bound.value) {
+                (ZoneRange::Int(_, mx), crate::storage::ScanValue::Int(v)) => mx < *v,
+                (ZoneRange::Float(_, mx), crate::storage::ScanValue::Float(v)) => {
+                    v.is_finite() && mx < *v
+                }
+                (ZoneRange::Float(_, mx), crate::storage::ScanValue::Int(v))
+                    if v.unsigned_abs() <= EXACT_INT =>
+                    mx < *v as f64,
+                _ => false,
+            };
+        }
+    }
+    if let Some(bound) = upper {
+        if bound.inclusive {
+            return match (range, &bound.value) {
+                (ZoneRange::Int(mn, _), crate::storage::ScanValue::Int(v)) => mn > *v,
+                (ZoneRange::Float(mn, _), crate::storage::ScanValue::Float(v)) => {
+                    v.is_finite() && mn > *v
+                }
+                (ZoneRange::Float(mn, _), crate::storage::ScanValue::Int(v))
+                    if v.unsigned_abs() <= EXACT_INT =>
+                    mn > *v as f64,
+                _ => false,
+            };
+        }
+    }
+    false
+}
+
+fn zone_predicate_disjoint(
+    rg_idx: usize,
+    footer: &V4Footer,
+    predicate: &crate::storage::ScanPredicate,
+) -> bool {
+    use crate::storage::ScanPredicate;
+    let Some(rg_zmaps) = footer.zone_maps.get(rg_idx) else {
+        return false;
+    };
+    let clean = predicate.column().trim_matches('"');
+    let clean = clean.rsplit('.').next().unwrap_or(clean).trim_matches('"');
+    let Some(col_idx) = footer.schema.get_index(clean) else {
+        return false;
+    };
+    let Some(zm) = rg_zmaps.iter().find(|zm| zm.col_idx as usize == col_idx) else {
+        return false;
+    };
+    let range = if zm.is_float {
+        ZoneRange::Float(
+            f64::from_bits(zm.min_bits as u64),
+            f64::from_bits(zm.max_bits as u64),
+        )
+    } else {
+        ZoneRange::Int(zm.min_bits, zm.max_bits)
+    };
+    match predicate {
+        ScanPredicate::Compare { op, value, .. } => zone_compare_disjoint(range, *op, value),
+        ScanPredicate::Between { lower, upper, .. } => {
+            zone_between_disjoint(range, lower.as_ref(), upper.as_ref())
+        }
+        ScanPredicate::In { values, .. } => {
+            values.iter().all(|value| zone_compare_disjoint(range, crate::storage::ScanComparison::Eq, value))
+        }
+        ScanPredicate::IsNull { .. } => false,
+    }
+}
+
+/// Conservative per-RG zone-map pruning for the typed scan predicate.
+///
+/// Returns true only when every row of the RG is provably outside the
+/// predicate. Zone maps cover pre-deletion data, which can only enlarge the
+/// true value range, so a proven-empty zone stays empty after deletions.
+/// Missing zone maps, non-numeric columns, and lossy type combinations
+/// never skip.
+fn zone_map_rg_disjoint(
+    rg_idx: usize,
+    footer: &V4Footer,
+    predicate: &crate::storage::ScanPredicateExpr,
+) -> bool {
+    use crate::storage::ScanPredicateExpr;
+    match predicate {
+        ScanPredicateExpr::Predicate(leaf) => zone_predicate_disjoint(rg_idx, footer, leaf),
+        ScanPredicateExpr::And(left, right) => {
+            zone_map_rg_disjoint(rg_idx, footer, left) || zone_map_rg_disjoint(rg_idx, footer, right)
+        }
+        ScanPredicateExpr::Or(left, right) => {
+            zone_map_rg_disjoint(rg_idx, footer, left) && zone_map_rg_disjoint(rg_idx, footer, right)
+        }
     }
 }

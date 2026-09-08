@@ -372,3 +372,66 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 1. 路由分发仍保留 count/distinct、字符串/数值过滤、mmap 扫描快路径族的派发；R3 扩展扫描协议后，该族可沿新协议边界继续拆分。
 2. `topk.rs`（标量 top-k）与 `topk_vector.rs`（向量 top-k）按执行形态分列；若 R6 引入向量组合计划再统一重组。
 3. 本阶段未触碰 `mmap_scan/`、`aggregation/`、`dml/` 内部结构，也未修改 backend 委托接口；"逐步清理 backend 委托职责"在 R3 共享扫描协议落地时一并处理。
+
+## 12. 实施状态（R3：串行分批执行）
+
+状态：已完成，阶段最终验收通过。完整模式首轮（五样本终判 4 项回退）经聚焦 A/B 判定为采样噪声后，由随后从头执行、退出码为 0 的完整门禁作为阶段完成依据（与 R2 首轮的处理路径一致）；所有原始报告保留。
+
+### 12.1 实现明细
+
+**存储侧**（`storage/scan.rs`、`storage/on_demand/mmap_scan/projection.rs`、`storage/backend.rs`）：
+
+- `RgBatchStream`：按行组迭代稳定读视图。创建时快照 footer 与 mmap `Arc`，流内视图稳定；每行组一个 `RecordBatch`（活动行、删除向量生效、输出普通字符串数组，不做字典编码）。
+- 保守 zone-map 行组裁剪：缺 zone-map、非数值列、有损 int→float 转换、`NotEq`、`IsNull` 永不剪；`AND` 任一可证不相交即剪、`OR` 需两侧均可证；zone-map 覆盖删除前数据，只会扩大真实范围，故"证空"在删除后仍为空。
+- `BatchMorselStream`：对每个行组批次重放完整 `Morsel::select` 类型化谓词语义；`Unsupported` 列类型整体回落单批路径。
+- `TableStorageBackend::scan_batches()`：仅当读视图为纯持久化 V4（无 delta 文件、无 pending DeltaStore、无 pending V4 行、非内存表）时开放，其余状态返回 `None` 回落 `scan()`。
+
+**执行器侧**（`query/executor/batch_group.rs` 新增 796 行、`scan_pipeline.rs` 接线）：
+
+- `try_batch_group_pipeline`：门控内的增量分组内核（≤2 键：int/float/bool/string；COUNT/SUM/AVG/MIN/MAX；NULL 键单组；聚合语义对齐单批内核族），HAVING 额外聚合注入、HAVING→TopK→LIMIT 顺序与单批路径一致。
+- `try_scan_group_pipeline` 先试批量管道，门控外（形状/表状态/列类型）回落单批；`APEX_BATCH_SCAN=0` 可整体关闭批量切片做 A/B 诊断。
+- 路由事实（本轮探针实测确认）：批量切片只经 `try_scan_group_pipeline` 到达；旧 fused 快内核先派发并保留其形状（单字典键 GROUP BY + ≤1 个值聚合，与 `APEX_BATCH_SCAN` 无关）。多键、多值聚合、fused lane 预算外谓词才到达批量切片；这也是内存有界测试与 A/B 矩阵采用 2 键/多聚合形状的原因。
+- 谓词协议补全：负数字面量（解析为 `UnaryOp(Minus, literal)`）折叠进 `build_scan_predicate`，使负边界范围保持类型化协议内（此前整条扫描管道被静默降级到通用路径）；非字面量取负保持保守回落。
+- canary 新指标：`File-table Filter+GROUP+HAVING+TopK (batch)`（`bench_batch_scan_group_having_topk`：delta 无关的基表文件副本 + 4 组轮换参数），扩展性能门禁覆盖面。
+
+**既有 bug 修复（被 R3 测试暴露，均含回归测试）**：
+
+1. 2 键（string+int）快路径静默丢弃 SELECT 中的 MIN/MAX 列 → `min_max_in_select` 门控回落完整增量内核（`aggregation/grouped.rs`）。
+2. 3+ 键快路径 `build_multi_column_result` 丢弃 SELECT 别名（输出 `COUNT(*)` 而非别名）→ ORDER BY 别名解析失败、跨进程结果非确定性 → 增加 `agg_alias` 参数（`multi_column.rs` 及调用方）。
+3. `compare_array_values`（`window.rs`）缺 Boolean 分支 → bool ORDER BY 全部判等 → 已补。
+4. 批量内核自身三处缺陷（新代码，测试暴露）：SUM 字段 nullability、Bool 分组键 slot 编码、单键打包移位（`(id1 as u64) << 32`，3 处）。
+
+### 12.2 测试覆盖
+
+| 层 | 测试 | 覆盖点 |
+| --- | --- | --- |
+| Rust 存储 | `scan_batches_stream_matches_single_shot_scan_over_multi_rg_table` | 70k 行/3 行组/删除/NULL/谓词，分批拼接 == 单批 |
+| Rust 存储 | `scan_batches_requires_a_clean_persisted_read_view` | delta/pending 状态保守拒绝 |
+| Rust 执行器 | `batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate` | 门控内形状、3 键回落、delta 回落 |
+| Rust 执行器 | `batch_scan_pipeline_matches_single_batch_pipeline` | 8 查询 env A/B + delta 回落（`BATCH_SCAN_ENV_LOCK` 串行化） |
+| Rust 执行器 | `two_key_string_int_group_by_keeps_min_max_columns` | MIN/MAX 丢弃回归 |
+| Rust 执行器 | `three_key_group_by_keeps_alias_and_sorts_deterministically` | 别名 + bool 排序确定性回归 |
+| Rust 执行器 | `negative_bound_predicates_stay_in_typed_scan_protocol`、`negative_bound_group_by_keeps_exact_results_in_both_env_states` | 负数边界谓词结构 + 显式值正确性 |
+| Python | `test/test_batch_scan_pipeline.py`：7 查询 A/B 矩阵（5 形状探针确认走批量路径，含负边界 OR 树）、delta 回落、峰值 RSS 有界（1.2M 行/40 组/2 键查询，分进程 ru_maxrss，断言 batch < 0.85×single）、负数边界显式值 | 多批/单批一致性、扫描内存有界、回落 |
+
+### 12.3 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功（4m40s）；同 features 下 201 条 warning = R2 release 基线，零净增 |
+| 完整串行 pytest（release 重装后冷态首跑） | 1750 passed，0 failed/0 skipped（22.5s） |
+| 完整 cargo test | 525 单元 + 6 文档 passed |
+| 公开 benchmark 干净轮（1M 行，2 预热 5 计时） | 103/103 项执行且全部胜出 + 向量 6/6 + 量化 6/6 胜出 |
+| 公开 benchmark 存档轮（`benchmarks/results/r3_public_20260907.json`） | 102/103 + 向量 6/6 + 量化 6/6；与最新基线（`latest_public_baseline.json`）15 个工作负载组对比：13 组持平或改善（-20.3% ~ +1.2%），Set Operations 组 +101.7% 为该轮整体抬升（同构建的干净轮为 4.38 ms vs 该轮 8.93 ms，四项 set-op 指标整组 1.2~3.2x 抬升），唯一 slower 项 UNION DISTINCT (ordered) 仅慢于 DuckDB 20µs；回退判定以同机门禁为准 |
+| 本地同机 canary（base=origin/main，200K 行） | 通过，56 指标，报告 `local-perf-results/20260907-201334/`；新批量指标 6.703 → 7.291 ms（+8.76%，阈值内），为本切片以扫描内存换吞吐的实测成本 |
+| 本地同机完整模式首轮（base=origin/main，1M 行） | 初判 3 样本 6 项回退 → 自动扩五样本 → 终判 4 项回退（GROUP BY category ×2、INTERSECT (ordered)、NOT filter），退出 1；报告 `local-perf-results/20260907-202720/` |
+| 聚焦 A/B（同 1M 行库、两侧 release wheel，4 窗口 × 每侧 10 次） | 4 项终判回退指标全部收窄到 +3.2% / -0.7% 以内（远低于 15% 相对阈值）；两侧分布均含 20~40x 的 p90 孤立尖峰；判定为首轮采样窗口噪声；且 4 形状均不经过 R3 新代码（3 项无 WHERE、NOT filter 走未改动的 fused NOT-COUNT 内核）；证据 `local-perf-results/20260907-221225/focused-ab/` |
+| 本地同机完整模式重跑（base=origin/main，同参数） | 通过：初判直接通过，109/109 主指标 + Q/s 2/2 + 量化向量 8/8，退出 0；报告 `local-perf-results/20260907-221225/`（阶段完成依据） |
+
+### 12.4 残余与后续
+
+1. 批量切片存在实测吞吐成本（canary 新指标 +8.76%，200K 行），为扫描内存有界性的设计代价；若后续要收回该成本，优化方向是行组批次的固定构造开销，而非放宽内存界。
+2. 批量切片只覆盖 `try_scan_group_pipeline` 形状；fused 快内核保留其单键形状（路由事实已写入架构文档），两族边界清晰但重叠形状以 fused 优先。
+3. `INTERSECT (ordered)` 在 R1/R2/R3 多次出现采样尖峰，可考虑在门禁脚本中记录为已知易波动指标（不改阈值）。
+4. 批量流仍为串行；并行 morsel 调度仍是后续工作（见 `docs/SCAN_EXECUTION_ARCHITECTURE.md` Current Limits）。
+

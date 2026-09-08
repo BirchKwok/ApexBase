@@ -2797,7 +2797,19 @@ impl ApexExecutor {
                 ) = (string_dict_result, int_range_result)
                 {
                     let total_size = str_size * (int_range + 1);
-                    if total_size <= 100_000 {
+                    // This kernel accumulates only COUNT/SUM/AVG over one
+                    // source column; MIN/MAX must fall through to the full
+                    // incremental kernel or the columns would be dropped.
+                    let min_max_in_select = stmt.columns.iter().any(|column| {
+                        matches!(
+                            column,
+                            SelectColumn::Aggregate {
+                                func: AggregateFunc::Min | AggregateFunc::Max,
+                                ..
+                            }
+                        )
+                    });
+                    if total_size <= 100_000 && !min_max_in_select {
                         // Find aggregate column
                         let mut agg_col_int: Option<&Int64Array> = None;
                         let mut agg_col_float: Option<&Float64Array> = None;
@@ -3078,17 +3090,20 @@ impl ApexExecutor {
             };
 
             // Extract aggregate function info
-            let (agg_func, agg_col_name) = stmt
+            let (agg_func, agg_col_name, agg_alias) = stmt
                 .columns
                 .iter()
                 .find_map(|col| {
-                    if let SelectColumn::Aggregate { func, column, .. } = col {
-                        Some((func.clone(), column.as_deref()))
+                    if let SelectColumn::Aggregate {
+                        func, column, alias, ..
+                    } = col
+                    {
+                        Some((func.clone(), column.as_deref(), alias.as_deref()))
                     } else {
                         None
                     }
                 })
-                .unwrap_or((crate::query::AggregateFunc::Count, None));
+                .unwrap_or((crate::query::AggregateFunc::Count, None, None));
 
             // Execute optimized multi-column group by
             match execute_multi_column_group_by(batch, group_cols, agg_col_name) {
@@ -3099,6 +3114,7 @@ impl ApexExecutor {
                         group_cols,
                         Some(agg_func),
                         agg_col_name,
+                        agg_alias,
                     )?;
 
                     // Apply HAVING if present

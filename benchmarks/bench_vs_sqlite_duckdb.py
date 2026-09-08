@@ -2299,6 +2299,9 @@ class ApexBaseBench:
         self._scan_pipeline_query_index = 0
         self._scan_pipeline_boolean_query_index = 0
         self._scan_pipeline_ready = False
+        self._uncached_batch_scan_client = None
+        self._batch_scan_query_index = 0
+        self._batch_scan_ready = False
 
     def _query_all(self, sql):
         return self.client.execute(sql, show_internal_id=True).to_dict()
@@ -2347,6 +2350,11 @@ class ApexBaseBench:
         if self._uncached_scan_client:
             self._uncached_scan_client.close()
             self._uncached_scan_client = None
+        self._batch_scan_query_index = 0
+        self._batch_scan_ready = False
+        if self._uncached_batch_scan_client:
+            self._uncached_batch_scan_client.close()
+            self._uncached_batch_scan_client = None
 
     def cold_start_setup(self):
         """Close and reopen client — clears all Python/Rust-side caches (arrow_batch_cache etc.)."""
@@ -2504,6 +2512,50 @@ class ApexBaseBench:
             "FROM __perf_scan_pipeline "
             "WHERE (city IN ('Beijing', 'Shanghai', 'Guangzhou') "
             "OR age IN (33, 44, 55)) AND score >= ? "
+            "GROUP BY city HAVING COUNT(*) > ? "
+            "ORDER BY n DESC, city LIMIT 5",
+            params=params,
+            show_internal_id=True,
+        ).to_dict()
+
+    def setup_batch_scan_pipeline(self):
+        """Copy the persisted base table with no delta overlay.
+
+        The stable row-group read view without any overlay is exactly what
+        the serial batched Filter -> GROUP BY -> HAVING -> TopK pipeline
+        requires (architecture review R3); the single-source aggregate shape
+        keeps the query inside that pipeline's gate.
+        """
+        if self._batch_scan_ready:
+            return
+        self.client.flush()
+        source = os.path.join(self.db_dir, "default.apex")
+        target = os.path.join(self.db_dir, "__perf_batch_scan.apex")
+        self.client.create_table("__perf_batch_scan")
+        shutil.copy2(source, target)
+        self.client.use_table("default")
+        if self._uncached_batch_scan_client:
+            self._uncached_batch_scan_client.close()
+        self._uncached_batch_scan_client = open_apex_benchmark_client(self.db_dir)
+        self._uncached_batch_scan_client.use_table("__perf_batch_scan")
+        self._batch_scan_query_index = 0
+        self._batch_scan_ready = True
+
+    def bench_batch_scan_group_having_topk(self):
+        """Measure the row-group batch pipeline on a delta-free table."""
+        if not self._batch_scan_ready:
+            raise RuntimeError("setup_batch_scan_pipeline must run first")
+        parameter_sets = (
+            (20, 35, 20.0, 0),
+            (25, 40, 30.0, 100),
+            (30, 50, 40.0, 250),
+            (35, 60, 50.0, 500),
+        )
+        params = parameter_sets[self._batch_scan_query_index % len(parameter_sets)]
+        self._batch_scan_query_index += 1
+        return self._uncached_batch_scan_client.execute(
+            "SELECT city, COUNT(*) AS n, AVG(score) AS av, MAX(score) AS mx "
+            "FROM __perf_batch_scan WHERE age > ? AND age <= ? AND score >= ? "
             "GROUP BY city HAVING COUNT(*) > ? "
             "ORDER BY n DESC, city LIMIT 5",
             params=params,

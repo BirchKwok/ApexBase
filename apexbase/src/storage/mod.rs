@@ -20,7 +20,8 @@ pub(crate) mod scan;
 pub mod table_catalog;
 
 pub(crate) use scan::{
-    Morsel, ScanBound, ScanComparison, ScanPredicate, ScanPredicateExpr, ScanRequest, ScanValue,
+    BatchMorselOutcome, BatchMorselStream, Morsel, ScanBound, ScanComparison, ScanPredicate,
+    ScanPredicateExpr, ScanRequest, ScanValue,
 };
 
 /// First user-visible row ID. ApexBase uses 1-based `_id` values.
