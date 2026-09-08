@@ -220,3 +220,63 @@ def test_explain_analyze_time_calibration_updates_plan_cost():
             assert "Feedback Recorded: yes" in second
         finally:
             client.close()
+
+
+def test_explain_analyze_reports_join_and_cte_paths():
+    """R5.5: JOIN and CTE routes report their physical path in
+    EXPLAIN ANALYZE (these routes previously had no Actual Path line)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        client.create_table(
+            "orders", {"id": "int", "user_id": "int", "amount": "int"}
+        )
+        client.use_table("orders")
+        client.store(
+            {
+                "id": [1, 2, 3, 4, 5],
+                "user_id": [1, 2, 1, 3, 2],
+                "amount": [10, 20, 30, 40, 50],
+            }
+        )
+        client.flush()
+        client.create_table("users", {"id": "int", "city": "string"})
+        client.use_table("users")
+        client.store({"id": [1, 2, 3, 9], "city": ["a", "b", "c", "x"]})
+        client.flush()
+        try:
+            # General hash-join route.
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE SELECT orders.amount, users.city "
+                "FROM orders JOIN users ON orders.user_id = users.id",
+            )
+            assert _actual_path(plan) == "hash_join"
+
+            # Single-use CTE is inlined (no materialization).
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE WITH top AS "
+                "(SELECT amount FROM orders WHERE amount > 25) SELECT * FROM top",
+            )
+            assert _actual_path(plan) == "cte_inline"
+
+            # Multi-reference CTE is materialized into the shared batch cache.
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE WITH top AS "
+                "(SELECT amount FROM orders WHERE amount > 25) "
+                "SELECT (SELECT COUNT(*) FROM top) AS n, "
+                "(SELECT MAX(amount) FROM top) AS m",
+            )
+            assert _actual_path(plan) == "cte_materialize"
+
+            # Recursive CTE runs the iterative fixpoint loop.
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE WITH RECURSIVE fact(n) AS "
+                "(SELECT 1 UNION ALL SELECT n + 1 FROM fact WHERE n < 5) "
+                "SELECT n FROM fact",
+            )
+            assert _actual_path(plan) == "cte_recursive"
+        finally:
+            client.close()
