@@ -843,6 +843,7 @@ impl ApexExecutor {
             crate::query::executor::begin_path_trace();
             let result = Self::execute_parsed_multi(stmt.clone(), base_dir, default_table_path);
             let actual_path = crate::query::executor::finish_path_trace();
+            let index_ran = actual_path.as_deref() == Some("index_accelerated_read");
             let plan_divergence = crate::query::executor::finish_plan_divergence();
             let result = result?;
             let elapsed = start.elapsed();
@@ -877,12 +878,31 @@ impl ApexExecutor {
                                 &table_path.to_string_lossy(),
                                 Self::planner_context(&backend, select.where_clause.as_ref()),
                             );
+                            let executed_cost = if crate::query::planner::is_index_cost_class(
+                                &plan.strategy,
+                            ) == index_ran {
+                                plan.cost.total
+                            } else {
+                                plan
+                                    .candidates
+                                    .iter()
+                                    .find(|candidate| {
+                                        crate::query::planner::is_index_cost_class(
+                                            &candidate.strategy,
+                                        ) == index_ran
+                                    })
+                                    .map(|candidate| candidate.cost.total)
+                                    .unwrap_or(plan.cost.total)
+                            };
                             crate::query::planner::record_plan_feedback(
                                 &table_path.to_string_lossy(),
                                 select,
                                 &plan.strategy,
                                 plan.cost.output_rows,
                                 batch.num_rows() as f64,
+                                index_ran,
+                                executed_cost,
+                                elapsed.as_micros() as f64,
                             );
                             plan_lines.push("  Feedback Recorded: yes".to_string());
                         }

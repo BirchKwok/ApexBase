@@ -110,6 +110,14 @@ struct PlanFeedback {
     estimated_rows: f64,
     actual_rows: f64,
     samples: u64,
+    /// Running model-cost / measured-time averages per cost class, recorded
+    /// for the class that actually executed (architecture review R5.3).
+    scan_cost_avg: f64,
+    scan_time_avg_us: f64,
+    scan_samples: u64,
+    index_cost_avg: f64,
+    index_time_avg_us: f64,
+    index_samples: u64,
 }
 
 static PLAN_FEEDBACK: Lazy<RwLock<HashMap<u64, PlanFeedback>>> =
@@ -168,22 +176,41 @@ fn feedback_key(table_key: &str, select: &SelectStatement) -> u64 {
     hasher.finish()
 }
 
-/// Record runtime cardinality feedback for EXPLAIN ANALYZE and future
-/// executions of the same normalized AST shape.
+/// True when the strategy belongs to the index cost class.
+pub fn is_index_cost_class(strategy: &ExecutionStrategy) -> bool {
+    matches!(
+        strategy,
+        ExecutionStrategy::OltpIndexLookup { .. } | ExecutionStrategy::OltpPrimaryKey { .. }
+    )
+}
+
+/// Record runtime feedback for EXPLAIN ANALYZE and future executions of the
+/// same normalized AST shape: row estimates (row-dimension calibration) and
+/// model cost vs measured time for the cost class that actually executed
+/// (time-dimension calibration, architecture review R5.3).
 pub fn record_plan_feedback(
     table_key: &str,
     select: &SelectStatement,
     strategy: &ExecutionStrategy,
     estimated_rows: f64,
     actual_rows: f64,
+    executed_index_class: bool,
+    executed_cost: f64,
+    actual_time_us: f64,
 ) {
     let key = feedback_key(table_key, select);
     let mut cache = PLAN_FEEDBACK.write();
     let entry = cache.entry(key).or_insert_with(|| PlanFeedback {
         strategy: strategy.clone(),
-        estimated_rows,
-        actual_rows,
+        estimated_rows: 0.0,
+        actual_rows: 0.0,
         samples: 0,
+        scan_cost_avg: 0.0,
+        scan_time_avg_us: 0.0,
+        scan_samples: 0,
+        index_cost_avg: 0.0,
+        index_time_avg_us: 0.0,
+        index_samples: 0,
     });
     entry.strategy = strategy.clone();
     entry.estimated_rows = (entry.estimated_rows * entry.samples as f64 + estimated_rows)
@@ -191,6 +218,23 @@ pub fn record_plan_feedback(
     entry.actual_rows =
         (entry.actual_rows * entry.samples as f64 + actual_rows) / (entry.samples as f64 + 1.0);
     entry.samples = entry.samples.saturating_add(1);
+    if executed_index_class {
+        entry.index_cost_avg =
+            (entry.index_cost_avg * entry.index_samples as f64 + executed_cost)
+                / (entry.index_samples as f64 + 1.0);
+        entry.index_time_avg_us =
+            (entry.index_time_avg_us * entry.index_samples as f64 + actual_time_us)
+                / (entry.index_samples as f64 + 1.0);
+        entry.index_samples = entry.index_samples.saturating_add(1);
+    } else {
+        entry.scan_cost_avg =
+            (entry.scan_cost_avg * entry.scan_samples as f64 + executed_cost)
+                / (entry.scan_samples as f64 + 1.0);
+        entry.scan_time_avg_us =
+            (entry.scan_time_avg_us * entry.scan_samples as f64 + actual_time_us)
+                / (entry.scan_samples as f64 + 1.0);
+        entry.scan_samples = entry.scan_samples.saturating_add(1);
+    }
 }
 
 fn stats_sidecar_path(table_key: &str) -> std::path::PathBuf {
@@ -715,6 +759,7 @@ impl QueryPlanner {
         let mut plan = Self::plan_select_with_stats(select, index_manager, stats.as_ref(), context);
         if !plan.candidates.is_empty() {
             if let Some(feedback) = PLAN_FEEDBACK.read().get(&feedback_key(table_key, select)) {
+                let mut corrected = false;
                 if feedback.samples > 0 && feedback.estimated_rows > 0.0 {
                     let correction =
                         (feedback.actual_rows / feedback.estimated_rows).clamp(0.25, 4.0);
@@ -723,6 +768,34 @@ impl QueryPlanner {
                             candidate.cost.total *= correction;
                         }
                     }
+                    corrected = true;
+                }
+                // Time-dimension calibration (architecture review R5.3):
+                // rescale each candidate from the model-cost unit into the
+                // measured-time unit of the cost class that actually
+                // executed, so scan and index candidates are compared on a
+                // common (microsecond) scale.
+                for candidate in &mut plan.candidates {
+                    let (samples, cost_avg, time_avg_us) =
+                        if is_index_cost_class(&candidate.strategy) {
+                            (
+                                feedback.index_samples,
+                                feedback.index_cost_avg,
+                                feedback.index_time_avg_us,
+                            )
+                        } else {
+                            (
+                                feedback.scan_samples,
+                                feedback.scan_cost_avg,
+                                feedback.scan_time_avg_us,
+                            )
+                        };
+                    if samples > 0 && cost_avg > 0.0 && time_avg_us > 0.0 {
+                        candidate.cost.total /= cost_avg / time_avg_us;
+                        corrected = true;
+                    }
+                }
+                if corrected {
                     if let Some(chosen) = plan.candidates.iter().min_by(|left, right| {
                         left.cost
                             .total

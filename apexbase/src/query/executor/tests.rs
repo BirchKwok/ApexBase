@@ -3636,3 +3636,201 @@ fn explain_analyze_reports_index_plan_divergence() {
     assert_eq!(actual_path(&plan), "index_accelerated_read");
     assert!(!plan.contains("Plan Divergence"));
 }
+
+// ============================================================================
+// R5.3: time-dimension cost calibration (EXPLAIN ANALYZE feedback loop)
+// ============================================================================
+
+use crate::query::planner::{
+    ExecutionStrategy, PlannerContext, QueryPlan, is_index_cost_class, record_plan_feedback,
+};
+use crate::query::sql_parser::{SqlParser, SqlStatement};
+
+fn planned_select(path: &Path, sql: &str) -> QueryPlan {
+    let select = match SqlParser::parse(sql).unwrap() {
+        SqlStatement::Select(select) => select,
+        _ => panic!("expected SELECT"),
+    };
+    let (base_dir, table_name) = base_dir_and_table(path);
+    let index_mgr = get_index_manager(&base_dir, &table_name);
+    let index_guard = index_mgr.lock();
+    crate::query::planner::QueryPlanner::plan_select_details(
+        &select,
+        Some(&*index_guard),
+        &path.to_string_lossy(),
+        PlannerContext::default(),
+    )
+}
+
+#[test]
+fn time_calibration_flips_index_to_scan() {
+    let dir = tempdir().unwrap();
+    // The file stem must match the table name used in the statements.
+    let path = dir.path().join("default.apex");
+    create_index_divergence_fixture(&path);
+    let sql = "SELECT * FROM default WHERE city = 'heavy'";
+
+    // The model prices the skewed value at 1/NDV and chooses the index.
+    let first = planned_select(&path, sql);
+    assert!(
+        matches!(first.strategy, ExecutionStrategy::OltpIndexLookup { .. }),
+        "model must choose the index candidate before feedback:\n{first:?}"
+    );
+    assert!(!first.feedback_applied);
+
+    // Simulate a measured run where the index route actually executed but
+    // turned out far slower than the model expected.
+    let index_cost = first
+        .candidates
+        .iter()
+        .find(|candidate| is_index_cost_class(&candidate.strategy))
+        .expect("index candidate")
+        .cost
+        .total;
+    let select = match SqlParser::parse(sql).unwrap() {
+        SqlStatement::Select(select) => select,
+        _ => panic!("expected SELECT"),
+    };
+    record_plan_feedback(
+        &path.to_string_lossy(),
+        &select,
+        &first.strategy,
+        first.cost.output_rows,
+        500.0,
+        true,
+        index_cost,
+        1_000_000.0,
+    );
+
+    let second = planned_select(&path, sql);
+    assert!(
+        !is_index_cost_class(&second.strategy),
+        "measured index time must flip the plan to the scan class:\n{second:?}"
+    );
+    assert!(second.feedback_applied);
+}
+
+fn create_index_time_calibration_fixture(path: &Path) {
+    // 1000 rows split 50/50 over two city values (NDV = 2), indexed.  The
+    // model then prices the index candidate (1/NDV selectivity) above the
+    // plain scan, so the first plan chooses the scan.
+    const ROWS: usize = 1_000;
+    let storage = OnDemandStorage::create(path).unwrap();
+    let mut cities = Vec::with_capacity(ROWS);
+    let mut scores = Vec::with_capacity(ROWS);
+    for i in 0..ROWS {
+        cities.push(if i % 2 == 0 {
+            "a".to_string()
+        } else {
+            "b".to_string()
+        });
+        scores.push((i % 97) as f64 * 0.5);
+    }
+    storage
+        .insert_typed(
+            HashMap::new(),
+            HashMap::from([("score".to_string(), scores)]),
+            HashMap::from([("city".to_string(), cities)]),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save().unwrap();
+
+    ApexExecutor::execute("CREATE INDEX idx_city ON default(city)", path).unwrap();
+    ApexExecutor::execute("ANALYZE default", path).unwrap();
+}
+
+#[test]
+fn time_calibration_flips_scan_to_index() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    create_index_time_calibration_fixture(&path);
+    let sql = "SELECT * FROM default WHERE city = 'a'";
+
+    // The model prices the low-NDV index candidate above the scan.
+    let first = planned_select(&path, sql);
+    assert!(
+        !is_index_cost_class(&first.strategy),
+        "model must choose the scan class before feedback:\n{first:?}"
+    );
+    assert!(!first.feedback_applied);
+
+    // Simulate a measured scan that is far slower than the model expected,
+    // making the (relatively cheap) index route worthwhile.
+    let scan_cost = first
+        .candidates
+        .iter()
+        .find(|candidate| !is_index_cost_class(&candidate.strategy))
+        .expect("scan candidate")
+        .cost
+        .total;
+    let select = match SqlParser::parse(sql).unwrap() {
+        SqlStatement::Select(select) => select,
+        _ => panic!("expected SELECT"),
+    };
+    record_plan_feedback(
+        &path.to_string_lossy(),
+        &select,
+        &first.strategy,
+        first.cost.output_rows,
+        500.0,
+        false,
+        scan_cost,
+        1_000_000.0,
+    );
+
+    let second = planned_select(&path, sql);
+    assert!(
+        is_index_cost_class(&second.strategy),
+        "measured scan time must flip the plan to the index class:\n{second:?}"
+    );
+    assert!(second.feedback_applied);
+}
+
+#[test]
+fn time_calibration_ignores_zero_cost_samples() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    create_index_divergence_fixture(&path);
+    let sql = "SELECT * FROM default WHERE city = 'heavy'";
+
+    let first = planned_select(&path, sql);
+    assert!(
+        matches!(first.strategy, ExecutionStrategy::OltpIndexLookup { .. }),
+        "model must choose the index candidate before feedback:\n{first:?}"
+    );
+
+    // Degraded samples (zero cost, zero time) must not rescale candidates
+    // or corrupt their costs.
+    let select = match SqlParser::parse(sql).unwrap() {
+        SqlStatement::Select(select) => select,
+        _ => panic!("expected SELECT"),
+    };
+    record_plan_feedback(
+        &path.to_string_lossy(),
+        &select,
+        &first.strategy,
+        first.cost.output_rows,
+        first.cost.output_rows,
+        true,
+        0.0,
+        0.0,
+    );
+
+    let second = planned_select(&path, sql);
+    assert!(second.feedback_applied);
+    assert!(
+        matches!(second.strategy, ExecutionStrategy::OltpIndexLookup { .. }),
+        "zero samples must not flip the plan:\n{second:?}"
+    );
+    let index_cost = |plan: &QueryPlan| {
+        plan.candidates
+            .iter()
+            .find(|candidate| is_index_cost_class(&candidate.strategy))
+            .expect("index candidate")
+            .cost
+            .total
+    };
+    assert_eq!(index_cost(&second), index_cost(&first));
+}
