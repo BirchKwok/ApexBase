@@ -115,3 +115,58 @@ def test_plain_explain_does_not_report_actual_path():
             assert "Actual Path" not in plan
         finally:
             client.close()
+
+
+def test_explain_analyze_reports_plan_divergence_for_skewed_index():
+    """R5.2: the planner's index choice is plan-driven; when the index route
+    turns out to be unexecutable at runtime, EXPLAIN ANALYZE reports the
+    plan/execution divergence."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        client.create_table("users", {"score": "float", "city": "string"})
+        client.use_table("users")
+        rows = 10_000
+        chunk = 5_000
+        for start in range(0, rows, chunk):
+            end = min(start + chunk, rows)
+            client.store(
+                {
+                    "score": [(i % 97) * 0.5 for i in range(start, end)],
+                    # 50% of the rows carry one skewed value, the rest spread
+                    # over 7 tail values (city NDV = 8).
+                    "city": [
+                        "heavy" if i % 2 == 0 else f"t{i % 7}"
+                        for i in range(start, end)
+                    ],
+                }
+            )
+        client.flush()
+        try:
+            client.execute("CREATE INDEX idx_city ON users(city)")
+            client.execute("ANALYZE users")
+
+            # Skewed value: the planner prices it at 1/NDV and chooses the
+            # index, but the MCV-based execution selectivity (0.5) makes the
+            # full scan cheaper, so the index route is not usable.
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE SELECT * FROM users WHERE city = 'heavy'",
+            )
+            assert "Chosen Plan: OltpIndexLookup" in plan
+            assert (
+                "Plan Divergence: plan chose index access; index route "
+                "unavailable at execution; fell back to scan" in plan
+            )
+            assert _actual_path(plan) != "index_accelerated_read"
+
+            # Rare value: both cost models agree on the index route and it is
+            # actually used, so no divergence is reported.
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE SELECT * FROM users WHERE city = 't1'",
+            )
+            assert "Chosen Plan: OltpIndexLookup" in plan
+            assert "Plan Divergence" not in plan
+            assert _actual_path(plan) == "index_accelerated_read"
+        finally:
+            client.close()
