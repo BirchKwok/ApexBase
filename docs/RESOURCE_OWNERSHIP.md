@@ -35,7 +35,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `CLASSIFY_CACHE`（query_signature.rs） | 查询签名分类器 | SQL 文本 | `QuerySignature` | 无上限（见 G1） | 不失效 | 进程退出 | 无 |
 | `STATS_CACHE`（planner.rs） | 查询规划器 | 表 key | 表统计 + 观察时间 | 无上限（见 G1） | 写入后 `invalidate_table_stats` | 进程退出 | 无 |
-| `PLAN_FEEDBACK`（planner.rs） | 查询规划器 | SQL 指纹 | 计划反馈 | 无上限（见 G1） | 规划器内部更新 | 进程退出 | 无 |
+| `PLAN_FEEDBACK`（planner.rs） | 查询规划器 | (表 key, 查询形状) | 计划反馈：行维度估计/实际行数滑动均值 + 按实际执行成本类（scan/index）的模型成本与实测时间滑动均值（R5.3 时间校准） | 无上限（见 G1） | 仅 EXPLAIN ANALYZE 记录 | 进程退出 | 无（内存态，重启丢失） |
 | `JIT_FILTER_CACHE`（jit.rs） | JIT 过滤器 | 谓词模式 | 编译后的过滤闭包 | 有界（内部 LRU） | 内部驱逐 | 进程退出 | 无 |
 
 ### 1.3 存储层（`apexbase/src/storage/`）

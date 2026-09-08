@@ -518,9 +518,9 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 
 ## 14. 实施状态（R5：规划与并行）
 
-状态：R5.1（EXPLAIN ANALYZE 报告实际物理路径）与 R5.2（CBO 驱动物理访问
-与规划/执行分歧报告）完成；成本校准、morsel 并行评估、JOIN 路径标签为
-R5 余项（§14.5）。
+状态：R5.1（EXPLAIN ANALYZE 报告实际物理路径）、R5.2（CBO 驱动物理访问
+与规划/执行分歧报告）与 R5.3（成本校准：时间维度，§14.7）完成；morsel
+并行评估、JOIN 路径标签为 R5 余项（§14.5）。
 
 ### 14.1 交付物
 
@@ -638,8 +638,13 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
    直接执行的键/范围/残余谓词与物化信息；shape 快路径仍在 CBO 之前
    执行（优先级语义不变），全路由 plan 驱动待成本校准（余项 2）后
    再推进。
-2. **成本校准**：`estimated_cost` 与实测（Actual Time / Actual Path）
-   闭环校准；EXPLAIN ANALYZE 的 Actual Path 为此提供训练/验证数据源。
+2. **成本校准**（时间维度已完成，见 §14.7）：`estimated_cost` 与实测
+   （Actual Time / Actual Path）闭环校准已落地——EXPLAIN ANALYZE 按
+   （表, 查询形状）记录实际执行的成本类（scan/index）的模型成本与
+   实测时间，再规划时将该类候选折算到微秒量级并重选最小候选。
+   余项：校准状态驻留内存（`PLAN_FEEDBACK`），进程重启即丢失，不
+   跨会话持久化；无样本的候选类保持模型成本量级（短暂混合量级
+   窗口，见 §14.7.4）。
 3. **morsel 并行评估**：R3 已限定串行分批（内存与正确性前提）；
    并行需先有成本模型与超订阅控制证据，不默认启用。
 4. **JOIN 路径标签**：`execute_select_with_joins` 及 CTE 物化路径
@@ -699,3 +704,77 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
 | 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103 项全部执行；中位比值 current/base = 0.992（vs `benchmarks/latest_public_baseline.json`，492956b）；7 项 ≥+15%：5 项专项重测在基线水平或更快，2 项重测偏高的（Filter name 0.3853 / Filtered aggregation 0.7737 ms）经同状态交错 A/B（n=240/侧）推翻：base 0.4282/0.6417 vs current 0.4291/0.6532 ms（+0.22% / +1.79%，两 wheel 读数同度抬高 = 机器状态）；原始 JSON 存 `benchmarks/public_bench_current.json` |
 | 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时） | 20260908-224041 exit 1（初判 2 项，5 样本终判剩 1 项：Derived ratio GROUP BY +20.34%）；专项交错 A/B（n=240/侧，共享 200K 数据集）：base 0.4639 vs current 0.4416 ms（**-4.79%**，R5.2 更快，4/8 窗领先）→ 机器状态噪声，该指标在 R5.1 验收中亦被标记并以同法推翻 |
 | 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a） | 20260908-225550 exit 1（初判 2 项，5 样本终判剩 1 项：NOT filter +18.31%）；专项交错 A/B（n=240/侧，共享 1M bench 布局数据集）：base 1.3346 vs current 1.2929 ms（**-3.13%**，7/8 窗 R5.2 更快）→ 机器状态漂移。guard 套件不创建任何索引，全部 guard 指标在 CBO 块走 `catalog_is_empty` 快退出，R5.2 改动对该路径不可达。如实记录：本机为持续高负载桌面（约 8 小时构建/基准），完整模式未产生干净 exit 0；同机结论以 78 项完整运行 + 逐项同状态交错 A/B 为依据 |
+
+### 14.7 R5.3：成本校准（时间维度）
+
+#### 14.7.1 交付物
+
+1. **按成本类的时间校准状态**：`PLAN_FEEDBACK`（planner.rs，内存，
+   以 (表 key, 查询形状) 为键）在既有行维度滑动均值（估计/实际行数）
+   之上，为每个成本类（scan / index）增加模型成本与实测时间的滑动
+   均值；记录对象是**实际执行**的成本类。仅 EXPLAIN ANALYZE 写入，
+   常规查询零状态。
+2. **规划期校准**（`plan_select_details`）：当形状存在反馈条目时——
+   (a) 行维度校正（既有逻辑，clamp(0.25, 4.0)，施加于实际执行策略
+   的候选）；(b) 每个候选按所属类自身的成本/时间比折算为微秒量级：
+   `cost.total /= (class_cost_avg / class_time_avg_us)`——类内排序不
+   变，跨类比较转为实测时间量级上的比较。任一校正生效即重选最小候
+   选并置 `feedback_applied`（EXPLAIN 输出 `Feedback: applied` 行）。
+3. **记录侧**（`executor/ddl.rs` EXPLAIN ANALYZE analyze 分支）：由
+   物理路径（`Actual Path`）判定实际执行的成本类
+   （`index_accelerated_read` → index 类，否则 → scan 类），记录该类
+   的再规划成本与 elapsed（µs）。归类跟随实际路径而非计划策略，R5.2
+   的规划/执行分歧样本（计划索引、执行扫描）同样被计入正确的类。
+4. **成本量级语义**：校准后，有样本类的候选其 EXPLAIN
+   `estimated_cost` 为微秒量级；无样本类的候选保持模型成本量级（短暂
+   混合量级窗口，见 14.7.4 残余风险）。
+
+#### 14.7.2 实现明细
+
+| 文件 | 变更 |
+| --- | --- |
+| `apexbase/src/query/planner.rs` | `PlanFeedback` 增加按类成本/时间均值（scan_cost_avg / scan_time_avg_us / scan_samples、index 同构）；`record_plan_feedback` 增加 3 参数（executed_index_class、executed_cost、actual_time_us），按实际执行的类更新均值；新增 `is_index_cost_class`（OltpIndexLookup / OltpPrimaryKey 归 index 类）；`plan_select_details` 反馈块在行校正之外增加按类时间折算并重选（行校正逻辑不变） |
+| `apexbase/src/query/executor/ddl.rs` | EXPLAIN ANALYZE analyze 分支：`finish_path_trace()` 后立即取 `index_ran`（`actual_path` 随后被 `if let` 消费）；`executed_cost` 取实际执行类的再规划成本（再规划与执行不一致时取该类首个候选，回退 `plan.cost.total`）；8 参调用记录 elapsed µs |
+| `docs/RESOURCE_OWNERSHIP.md` | §1.1 更新 `PLAN_FEEDBACK` 描述（行维度 + 按类时间校准状态） |
+
+#### 14.7.3 测试覆盖（Rust + Python 两侧）
+
+- Rust（3 项新增，`executor/tests.rs`）：
+  - `time_calibration_flips_index_to_scan`：1000 行偏斜 fixture
+    （heavy=50%，NDV=8）+ 索引 + ANALYZE——模型按 1/NDV 选索引
+    （394.6）；记录 index 类实测 1e6 µs 后再规划翻转为 scan 类，
+    `feedback_applied` 置位。
+  - `time_calibration_flips_scan_to_index`：1000 行 50/50 fixture
+    （NDV=2）——模型选 scan（1000 < 1566.5）；记录 scan 类实测
+    1e6 µs 后再规划翻转为 index 类。
+  - `time_calibration_ignores_zero_cost_samples`：零成本/零时间样本
+    不触发折算、候选成本不被破坏（防 0/0 与非有限值）。
+- Python（1 项新增，10K 行偏斜 fixture）：
+  `test_explain_analyze_time_calibration_updates_plan_cost`——同形状
+  第二次 EXPLAIN ANALYZE 出现 `Feedback: applied` 行，且
+  `Chosen Plan` 的 `estimated_cost` 与第一次不同（确定性断言；候选
+  胜负取决于实测时间量级，不断言方向）。
+
+#### 14.7.4 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功（约 5 分钟）；同口径 `cargo build --release` HEAD（R5.2）与工作区（R5.3）均为 195 条 lib 警告且数量、建议数一致；改动文件（planner.rs / executor/ddl.rs）重编译无任何警告 → 无新增警告 |
+| pytest（完整串行） | 1762 passed（既有 1761 + 新增 1），27.8s |
+| cargo test（完整） | 537 lib + 6 doc passed（lib 含 3 项新增） |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103 项全部执行；中位比值 current/基线 = 0.947（vs `benchmarks/latest_public_baseline.json`，492956b）；3 项 ≥+15%：INTERSECT (ordered) 2.4979/1.1805 ms、EXCEPT (ordered) 1.5024/1.1775 ms、Filtered LIMIT 100 (age>30) 0.0704/0.0537 ms，均经同状态交错 A/B（n=240/侧，8 窗，共享 1M 数据集）推翻：base 0.5983/0.6035/0.0831 vs current 0.5754/0.5701/0.0832 ms（-3.82% / -5.54% / +0.12%）。三项查询均为无索引表上的集合运算/range-LIMIT，benchmark 进程不运行 EXPLAIN ANALYZE，`PLAN_FEEDBACK` 恒为空，R5.3 校准路径对其不可达；原始 JSON 存 `benchmarks/public_bench_current.json` |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时） | 20260909-014004 exit 1（3 样本初判，5 样本终判 2 项：Derived ratio GROUP BY +19.68%，NULL profile (2 cols) +19.45%）；专项交错 A/B（n=240/侧，共享 200K 数据集）：base 0.3613/0.0674 vs current 0.3654/0.0689 ms（+1.13% / +2.26%）→ 机器状态噪声（亚毫秒族；Derived ratio GROUP BY 在 R5.1/R5.2 验收中亦被标记并以同法推翻）。原始 JSON + README 存 `local-perf-results/20260909-014004/` |
+| 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a） | 20260909-015607 **exit 0**：109 项同机比较 + 2 项 QPS + 8 项量化全部通过，0 项回退（3+3 样本初判即无回退，无需 5 样本扩展）。R5 系列在本机首次干净完整通过（R5.1/R5.2 完整模式均 exit 1，flag 经同法 A/B 推翻）。报告存 `local-perf-results/20260909-015607/` |
+
+**残余风险（如实记录）**：
+
+1. 校准状态驻留内存且按形状分键，进程重启即丢失；跨会话无持久化
+   （与既有 `PLAN_FEEDBACK` 行维度反馈同生命周期，见
+   `docs/RESOURCE_OWNERSHIP.md` §1.1）。
+2. 混合量级窗口：某形状只有一类有样本时，无样本类候选保持模型成本
+   量级，跨类比较为"微秒 vs 模型单位"（模型单位与本工作负载实测
+   时间同数量级，偏置有界；该形状再次执行 EXPLAIN ANALYZE 后另一类
+   获得样本，窗口收敛）。
+3. 计划稳定在胜出类后，该类记录的再规划成本已含校准，滑动均值收敛
+   到模型与实测的有界邻域（几何均值方向），不振荡；跨类比较精度受
+   无样本类模型误差限制。校准为启发式闭环，不改变任何查询语义。
