@@ -8,6 +8,7 @@ Covers, against the installed release wheel:
 4. Shapes outside every fast path report the generic executor route.
 """
 
+import re
 import tempfile
 
 from apexbase import ApexClient
@@ -46,6 +47,12 @@ def _plan_text(client, sql):
 def _actual_path(plan):
     line = plan.split("Actual Path:", 1)[1].splitlines()[0]
     return line.strip()
+
+
+def _estimated_cost(plan):
+    match = re.search(r"Chosen Plan: .*estimated_cost=([\d.]+)", plan)
+    assert match, f"missing estimated_cost in plan:\n{plan}"
+    return float(match.group(1))
 
 
 def test_explain_analyze_reports_simple_read_paths():
@@ -168,5 +175,48 @@ def test_explain_analyze_reports_plan_divergence_for_skewed_index():
             assert "Chosen Plan: OltpIndexLookup" in plan
             assert "Plan Divergence" not in plan
             assert _actual_path(plan) == "index_accelerated_read"
+        finally:
+            client.close()
+
+
+def test_explain_analyze_time_calibration_updates_plan_cost():
+    """R5.3: EXPLAIN ANALYZE records the measured time of the cost class
+    that actually executed; the next EXPLAIN ANALYZE of the same shape
+    reports calibrated costs and the applied feedback."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        client.create_table("users", {"score": "float", "city": "string"})
+        client.use_table("users")
+        rows = 10_000
+        chunk = 5_000
+        for start in range(0, rows, chunk):
+            end = min(start + chunk, rows)
+            client.store(
+                {
+                    "score": [(i % 97) * 0.5 for i in range(start, end)],
+                    # 50% of the rows carry one skewed value, the rest spread
+                    # over 7 tail values (city NDV = 8).
+                    "city": [
+                        "heavy" if i % 2 == 0 else f"t{i % 7}"
+                        for i in range(start, end)
+                    ],
+                }
+            )
+        client.flush()
+        try:
+            client.execute("CREATE INDEX idx_city ON users(city)")
+            client.execute("ANALYZE users")
+
+            sql = "EXPLAIN ANALYZE SELECT * FROM users WHERE city = 'heavy'"
+            first = _plan_text(client, sql)
+
+            second = _plan_text(client, sql)
+            assert "Feedback: applied" in second
+            # The calibrated second plan must price the chosen candidate
+            # differently from the uncalibrated first plan (measured time
+            # enters the cost comparison; the winning candidate may stay
+            # the same, but the cost scale changes).
+            assert _estimated_cost(second) != _estimated_cost(first)
+            assert "Feedback Recorded: yes" in second
         finally:
             client.close()
