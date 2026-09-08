@@ -714,6 +714,7 @@ impl ApexExecutor {
         };
 
         let mut agg = aggregator;
+        let mut batch_count: u64 = 0;
         loop {
             // Cancellation is checked at batch boundaries (one atomic load
             // per row group), never per row (architecture review R4).
@@ -725,6 +726,7 @@ impl ApexExecutor {
             }
             match stream.next() {
                 Some(Ok(crate::storage::BatchMorselOutcome::Morsel(morsel))) => {
+                    batch_count += 1;
                     let batch = morsel.into_record_batch()?;
                     if agg.consume_batch(&batch).is_none() {
                         return Ok(None);
@@ -790,6 +792,8 @@ impl ApexExecutor {
             }
         }
 
+        crate::query::executor::record_path("batched_scan_pipeline");
+        crate::query::executor::record_path_detail_f(format_args!("(batches={batch_count})"));
         Ok(Some(result))
     }
 

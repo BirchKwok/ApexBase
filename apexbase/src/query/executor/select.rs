@@ -8,6 +8,18 @@ enum OrLeafPredicate {
     StringIn(String, Vec<String>),  // (col, values)
 }
 
+/// Records the generic executor route on drop when no fast path has claimed
+/// the query first (architecture review R5: EXPLAIN ANALYZE physical path
+/// trace).  `record_path` only writes an empty trace, so an earlier or nested
+/// record wins.
+struct GenericRouteGuard;
+
+impl Drop for GenericRouteGuard {
+    fn drop(&mut self) {
+        crate::query::executor::record_path("generic_executor");
+    }
+}
+
 impl ApexExecutor {
     /// Execute SELECT statement with base_dir for proper subquery table resolution
     fn execute_select_with_base_dir(
@@ -17,6 +29,9 @@ impl ApexExecutor {
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
         let (_, table_name) = crate::query::executor::base_dir_and_table_pub(storage_path);
+        // Records the generic route if no fast path below claims the query
+        // (architecture review R5: EXPLAIN ANALYZE physical path trace).
+        let _path_guard = GenericRouteGuard;
         Self::resolve_fts_scores_in_statement(&mut stmt, base_dir, &table_name)?;
 
         // Resolve MATCH()/FUZZY_MATCH() once to compressed runtime bitmaps.
@@ -33,6 +48,7 @@ impl ApexExecutor {
 
         // FAST PATH: sparse-read deep OFFSET (ORDER BY low-card numeric, string LIMIT/OFFSET).
         if let Ok(Some(result)) = Self::try_fast_deep_offset(&stmt, storage_path) {
+            crate::query::executor::record_path("fast_deep_offset");
             return Ok(result);
         }
 
@@ -48,6 +64,7 @@ impl ApexExecutor {
                 names,
                 stmt.where_clause.as_ref(),
             )?;
+            crate::query::executor::record_path("topk_explode");
             return Ok(ApexResult::Data(result));
         }
 
@@ -61,6 +78,7 @@ impl ApexExecutor {
                 | Some(FromItem::DirectFile { .. })
         );
         if !from_is_table_fn && Self::is_pure_count_star(&stmt) {
+            crate::query::executor::record_path("count_star_metadata");
             let count = if let Some(batch) = get_cached_cte_batch(storage_path) {
                 batch.num_rows() as i64
             } else if !crate::storage::engine::engine().table_exists(storage_path)
@@ -103,6 +121,7 @@ impl ApexExecutor {
             None
         };
         let batch = if let Some(batch) = cached_cte_batch {
+            crate::query::executor::record_path("cte_batch");
             batch
         } else {
             match &stmt.from {
@@ -112,13 +131,17 @@ impl ApexExecutor {
                     k,
                     metric,
                     ..
-                }) => Self::execute_topk_distance(storage_path, col, query, *k, metric)?,
+                }) => {
+                    crate::query::executor::record_path("topk_distance");
+                    Self::execute_topk_distance(storage_path, col, query, *k, metric)?
+                },
                 Some(FromItem::TableFunction {
                     func,
                     file,
                     options,
                     ..
                 }) => {
+                    crate::query::executor::record_path("table_function");
                     if func.eq_ignore_ascii_case("READ_CSV") {
                         if let Some(result) = Self::try_fast_csv_aggregation(
                             &stmt, file, options,
@@ -154,6 +177,7 @@ impl ApexExecutor {
                     Self::read_table_function(func, file, &opts, row_limit)?
                 }
                 Some(FromItem::DirectFile { file, .. }) => {
+                    crate::query::executor::record_path("direct_file");
                     let lower = file.to_lowercase();
                     if lower.ends_with(".csv") || lower.ends_with(".tsv") {
                         let options = if lower.ends_with(".tsv") {
@@ -254,6 +278,7 @@ impl ApexExecutor {
                         if let Some(result) =
                             Self::try_fast_cached_distinct_projection(&backend, &stmt)?
                         {
+                            crate::query::executor::record_path("fast_distinct_projection");
                             return Ok(result);
                         }
 
@@ -315,12 +340,14 @@ impl ApexExecutor {
                                 if let Some(result) =
                                     Self::try_fast_numeric_filter_order_topk(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_numeric_filter_topk");
+return Ok(result);
                                 }
                                 if let Some(result) =
                                     Self::try_fast_not_null_order_topk(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_not_null_topk");
+return Ok(result);
                                 }
                             }
 
@@ -336,19 +363,23 @@ impl ApexExecutor {
                                 if let Some(result) =
                                     Self::try_fast_count_distinct_scalars(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_count_distinct_scalars");
+return Ok(result);
                                 }
                                 if let Some(result) =
                                     Self::try_fast_numeric_case_aggregation(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_numeric_case_aggregation");
+return Ok(result);
                                 }
                                 if let Some(result) =
                                     Self::try_fast_null_count_aggregation(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_null_count_aggregation");
+return Ok(result);
                                 }
                                 if let Some(result) = Self::try_mmap_aggregation(&backend, &stmt)? {
+                                    crate::query::executor::record_path("mmap_aggregation");
                                     return Ok(result);
                                 }
                             }
@@ -365,7 +396,8 @@ impl ApexExecutor {
                                 if let Some(result) =
                                     Self::try_fast_not_filter_count(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_not_filter_count");
+return Ok(result);
                                 }
                             }
 
@@ -400,6 +432,7 @@ impl ApexExecutor {
                                             )?;
                                             let filtered =
                                                 Self::apply_filter(&batch, where_clause)?;
+                                            crate::query::executor::record_path("filtered_aggregation");
                                             return Self::execute_aggregation(&filtered, &stmt);
                                         }
                                     }
@@ -407,28 +440,33 @@ impl ApexExecutor {
                                     if let Some(result) =
                                         Self::try_fast_filtered_string_agg(&backend, &stmt)?
                                     {
-                                        return Ok(result);
+                                                                                crate::query::executor::record_path("fast_filtered_string_agg");
+return Ok(result);
                                     }
                                 }
                                 if let Some(result) =
                                     Self::try_fast_filtered_numeric_agg(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_filtered_numeric_agg");
+return Ok(result);
                                 }
                                 if let Some(result) =
                                     Self::try_fast_in_subquery_count(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_in_subquery_count");
+return Ok(result);
                                 }
                                 if let Some(result) =
                                     Self::try_fast_dict_scalar_count(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_dict_scalar_count");
+return Ok(result);
                                 }
                                 if let Some(result) =
                                     Self::try_fast_exists_count(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_exists_count");
+return Ok(result);
                                 }
                             }
 
@@ -445,7 +483,8 @@ impl ApexExecutor {
                                 if let Some(result) =
                                     Self::try_fast_numeric_filter_group_by(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_numeric_filter_group_by");
+return Ok(result);
                                 }
                             }
 
@@ -464,7 +503,8 @@ impl ApexExecutor {
                                 if let Some(result) =
                                     Self::try_fast_fused_group_by(&backend, &stmt)?
                                 {
-                                    return Ok(result);
+                                                                        crate::query::executor::record_path("fast_fused_group_by");
+return Ok(result);
                                 }
                             }
 
@@ -481,6 +521,7 @@ impl ApexExecutor {
                                 if let Some(filtered) =
                                     Self::try_fast_string_filter_no_limit(&backend, &stmt)?
                                 {
+                                    crate::query::executor::record_path("filtered_aggregation");
                                     return Self::execute_aggregation(&filtered, &stmt);
                                 }
                             }
@@ -512,6 +553,7 @@ impl ApexExecutor {
                                                     &grouped_stmt,
                                                 )?
                                             {
+                                                crate::query::executor::record_path("fast_native_string_group_by");
                                                 return Ok(result);
                                             }
                                             let col_refs = Self::get_col_refs(&grouped_stmt);
@@ -570,6 +612,7 @@ impl ApexExecutor {
                                                     &filter_value,
                                                     true,
                                                 )?;
+                                            crate::query::executor::record_path("storage_string_eq_group_by");
                                             return Self::execute_group_by(
                                                 &filtered,
                                                 &grouped_stmt,
@@ -619,6 +662,7 @@ impl ApexExecutor {
                                         if let Some(row_batch) =
                                             backend.read_row_by_id_to_arrow(id)?
                                         {
+                                            crate::query::executor::record_path("id_point_lookup");
                                             let projected = Self::apply_projection_with_storage(
                                                 &row_batch,
                                                 &stmt.columns,
@@ -670,6 +714,7 @@ impl ApexExecutor {
                                         base_dir,
                                         storage_path,
                                     )? {
+                                        crate::query::executor::record_path("index_accelerated_read");
                                         return Ok(result);
                                     }
                                 }
@@ -680,6 +725,7 @@ impl ApexExecutor {
                                 if let Some(id) = Self::extract_id_equality_filter(where_clause) {
                                     if !backend.has_pending_deltas() && !backend.has_delta() {
                                         if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
+                                            crate::query::executor::record_path("id_point_lookup");
                                             batch
                                         } else {
                                             // Not in memory — fall through to general mmap → Arrow → WHERE filter path
@@ -1225,11 +1271,13 @@ impl ApexExecutor {
                                     if let Some(result) =
                                         Self::try_fast_cached_transform_group_by(&backend, &stmt)?
                                     {
+                                        crate::query::executor::record_path("fast_transform_group_by");
                                         return Ok(result);
                                     }
                                     if let Some(result) =
                                         Self::try_fast_cached_ratio_group_by(&backend, &stmt)?
                                     {
+                                        crate::query::executor::record_path("fast_ratio_group_by");
                                         return Ok(result);
                                     }
                                     // V4 FAST PATH: integral GROUP BY keys with the
@@ -1237,6 +1285,7 @@ impl ApexExecutor {
                                     if let Some(result) =
                                         Self::try_fast_numeric_group_by(&backend, &stmt)?
                                     {
+                                        crate::query::executor::record_path("fast_numeric_group_by");
                                         return Ok(result);
                                     }
                                     // Mmap-native string groups for COUNT/DISTINCT/CASE/MAX,
@@ -1244,17 +1293,20 @@ impl ApexExecutor {
                                     if let Some(result) =
                                         Self::try_fast_native_string_group_by(&backend, &stmt)?
                                     {
+                                        crate::query::executor::record_path("fast_native_string_group_by");
                                         return Ok(result);
                                     }
                                     if let Some(result) =
                                         Self::try_fast_cached_numeric_case_group_by(&backend, &stmt)?
                                     {
+                                        crate::query::executor::record_path("fast_numeric_case_group_by");
                                         return Ok(result);
                                     }
                                     // V4 FAST PATH: Cached GROUP BY
                                     if let Some(result) =
                                         Self::try_fast_cached_group_by(&backend, &stmt)?
                                     {
+                                        crate::query::executor::record_path("fast_cached_group_by");
                                         return Ok(result);
                                     }
                                     // V4 FAST PATH: COUNT(CASE WHEN range THEN 1 END)
@@ -1262,6 +1314,7 @@ impl ApexExecutor {
                                     if let Some(result) =
                                         Self::try_fast_cached_case_count(&backend, &stmt)?
                                     {
+                                        crate::query::executor::record_path("fast_cached_case_count");
                                         return Ok(result);
                                     }
                                     // Fallback: dict-encoded Arrow path
@@ -1275,6 +1328,7 @@ impl ApexExecutor {
                                     if let Some(result) =
                                         Self::try_fast_order_by_length(&backend, &stmt, storage_path)?
                                     {
+                                        crate::query::executor::record_path("fast_order_by_length");
                                         return Ok(result);
                                     }
                                     let _row_limit = if can_pushdown_limit {

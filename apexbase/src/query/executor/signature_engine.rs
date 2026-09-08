@@ -206,6 +206,18 @@ impl ApexExecutor {
             }
         };
 
+        // Pre-parse reads bypass the SELECT executor, so record their route
+        // here (architecture review R5: EXPLAIN ANALYZE physical path trace).
+        if batch.is_some() {
+            crate::query::executor::record_path(match read.predicate {
+                ReadPredicate::All => "preparse_scan",
+                ReadPredicate::Id(_) => "preparse_id_point_lookup",
+                ReadPredicate::Ids(_) => "preparse_id_set_lookup",
+                ReadPredicate::StringEq { .. } => "preparse_string_filter_scan",
+                ReadPredicate::NumericRange { .. } => "preparse_numeric_range_scan",
+                ReadPredicate::Like { .. } => "preparse_like_scan",
+            });
+        }
         Ok(batch.map(ApexResult::Data))
     }
 }

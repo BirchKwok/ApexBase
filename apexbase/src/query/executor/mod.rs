@@ -109,6 +109,52 @@ thread_local! {
 }
 
 // ============================================================================
+// Thread-local physical path trace (architecture review R5)
+// Enabled only by EXPLAIN ANALYZE on its execution thread. Records the
+// physical route a query actually takes; route decision points record at
+// most once per query, never per row.
+// ============================================================================
+thread_local! {
+    static PATH_TRACE: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Start tracing the physical path of queries executed on this thread.
+pub fn begin_path_trace() {
+    PATH_TRACE.with(|t| *t.borrow_mut() = Some(String::new()));
+}
+
+/// Record the winning physical route (first record wins).
+#[inline]
+pub fn record_path(label: &str) {
+    PATH_TRACE.with(|t| {
+        if let Some(trace) = t.borrow_mut().as_mut() {
+            if trace.is_empty() {
+                trace.push_str(label);
+            }
+        }
+    });
+}
+
+/// Append formatted details (e.g. the batch count) to the recorded route.
+/// Callers use `format_args!`, so nothing is allocated while tracing is off.
+#[inline]
+pub fn record_path_detail_f(detail: std::fmt::Arguments<'_>) {
+    PATH_TRACE.with(|t| {
+        if let Some(trace) = t.borrow_mut().as_mut() {
+            if !trace.is_empty() {
+                trace.push_str(&detail.to_string());
+            }
+        }
+    });
+}
+
+/// End tracing and return the recorded route, if any.
+pub fn finish_path_trace() -> Option<String> {
+    PATH_TRACE.with(|t| t.borrow_mut().take())
+}
+
+// ============================================================================
 // Thread-local query cancellation token (architecture review R4)
 // Installed once per query by entry points that run on another thread
 // (query scheduler workers); batch pipelines check it at batch boundaries.
@@ -1465,6 +1511,7 @@ impl ApexExecutor {
                     let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
                     let batch = RecordBatch::try_new(schema, vec![array])
                         .map_err(|e| err_data(e.to_string()))?;
+                    record_path("count_star_metadata");
                     return Ok(ApexResult::Data(batch));
                 }
                 // Fall through to full parse if backend open fails

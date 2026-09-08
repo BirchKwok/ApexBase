@@ -132,7 +132,10 @@ impl ApexExecutor {
                     limit,
                     offset,
                 ) {
-                    Ok(Some(result)) => Ok(Some(ApexResult::Data(result))),
+                    Ok(Some(result)) => {
+                        crate::query::executor::record_path("fused_filter_group_order");
+                        Ok(Some(ApexResult::Data(result)))
+                    }
                     Ok(None) => Self::try_scan_group_pipeline(backend, stmt),
                     Err(e) => Err(e),
                 }
@@ -230,6 +233,7 @@ impl ApexExecutor {
                 let result =
                     RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
 
+                crate::query::executor::record_path("fused_between_group_agg");
                 Ok(Some(ApexResult::Data(result)))
             }
         }
@@ -462,7 +466,9 @@ impl ApexExecutor {
         // HAVING remains attached and is applied after aggregation, before TopK.
         let mut physical_stmt = stmt.clone();
         physical_stmt.where_clause = None;
-        Self::execute_group_by(&filtered, &physical_stmt).map(Some)
+        let result = Self::execute_group_by(&filtered, &physical_stmt)?;
+        crate::query::executor::record_path("scan_group_pipeline");
+        Ok(Some(result))
     }
 
     /// Apply a low-cost dictionary transform (currently SQL SUBSTR) once per

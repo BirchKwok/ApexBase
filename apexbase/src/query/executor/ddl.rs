@@ -839,7 +839,11 @@ impl ApexExecutor {
         // EXPLAIN ANALYZE: actually run the query and report timing
         if analyze {
             let start = std::time::Instant::now();
-            let result = Self::execute_parsed_multi(stmt.clone(), base_dir, default_table_path)?;
+            // Trace the physical route actually taken (architecture review R5).
+            crate::query::executor::begin_path_trace();
+            let result = Self::execute_parsed_multi(stmt.clone(), base_dir, default_table_path);
+            let actual_path = crate::query::executor::finish_path_trace();
+            let result = result?;
             let elapsed = start.elapsed();
             plan_lines.push(format!(
                 "  Execution Time: {:.3}ms",
@@ -849,6 +853,9 @@ impl ApexExecutor {
                 "  Actual Time: {:.3}ms",
                 elapsed.as_secs_f64() * 1000.0
             ));
+            if let Some(path) = actual_path {
+                plan_lines.push(format!("  Actual Path: {path}"));
+            }
             if let Ok(batch) = result.to_record_batch() {
                 plan_lines.push(format!("  Actual Rows: {}", batch.num_rows()));
 

@@ -3443,3 +3443,103 @@ fn negative_bound_group_by_keeps_exact_results_in_both_env_states() {
         vec![1, 1, 1]
     );
 }
+
+// ============================================================================
+// R5.1: EXPLAIN ANALYZE reports the physical path actually taken
+// ============================================================================
+
+fn explain_analyze_plan(path: &Path, sql: &str) -> String {
+    let rb = ApexExecutor::execute(sql, path)
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+    let arr = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("plan column");
+    arr.value(0).to_string()
+}
+
+fn actual_path(plan: &str) -> &str {
+    plan.lines()
+        .find_map(|line| line.trim().strip_prefix("Actual Path:").map(str::trim))
+        .expect("plan must contain an Actual Path line")
+}
+
+#[test]
+fn path_trace_first_record_wins_and_is_off_by_default() {
+    crate::query::executor::begin_path_trace();
+    crate::query::executor::record_path("route_a");
+    crate::query::executor::record_path("route_b");
+    crate::query::executor::record_path_detail_f(format_args!("(batches=3)"));
+    let trace = crate::query::executor::finish_path_trace().unwrap();
+    assert_eq!(trace, "route_a(batches=3)");
+
+    // Tracing off by default: records are dropped, no state is left behind.
+    crate::query::executor::record_path("route_off");
+    crate::query::executor::record_path_detail_f(format_args!("(x=1)"));
+    assert!(crate::query::executor::finish_path_trace().is_none());
+}
+
+#[test]
+fn explain_analyze_reports_batched_scan_pipeline_path() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("explain_batch_path.apex");
+    create_batch_scan_fixture(&path);
+
+    with_batch_scan(true, || {
+        let plan = explain_analyze_plan(
+            &path,
+            "EXPLAIN ANALYZE SELECT city, code, COUNT(*) AS n
+             FROM default WHERE score >= 20
+             GROUP BY city, code",
+        );
+        let actual = actual_path(&plan);
+        let Some(rest) = actual.strip_prefix("batched_scan_pipeline(batches=") else {
+            panic!("expected the batched scan pipeline path, got: {actual}");
+        };
+        let batches: u64 = rest.trim_end_matches(')').parse().unwrap();
+        assert!(
+            batches >= 2,
+            "the multi-row-group fixture must consume multiple batches: {actual}"
+        );
+    });
+}
+
+#[test]
+fn explain_analyze_reports_metadata_and_point_lookup_paths() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("explain_preparse.apex");
+    create_batch_scan_fixture(&path);
+
+    // COUNT(*) is served by the row-count metadata read.
+    let plan = explain_analyze_plan(&path, "EXPLAIN ANALYZE SELECT COUNT(*) FROM default");
+    assert_eq!(actual_path(&plan), "count_star_metadata");
+
+    // Columnar scan with LIMIT runs through the generic executor route.
+    let plan = explain_analyze_plan(&path, "EXPLAIN ANALYZE SELECT city FROM default LIMIT 3");
+    assert_eq!(actual_path(&plan), "generic_executor");
+
+    // O(1) point lookup on _id.
+    let plan = explain_analyze_plan(
+        &path,
+        "EXPLAIN ANALYZE SELECT city, code FROM default WHERE _id = 7",
+    );
+    assert_eq!(actual_path(&plan), "id_point_lookup");
+}
+
+#[test]
+fn explain_analyze_reports_generic_executor_path() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("explain_generic.apex");
+    create_test_storage(&path);
+
+    // A projection + filter shape outside every fast path falls to the
+    // generic executor route.
+    let plan = explain_analyze_plan(
+        &path,
+        "EXPLAIN ANALYZE SELECT name, age FROM default WHERE score > 80 AND age < 40 ORDER BY age",
+    );
+    assert_eq!(actual_path(&plan), "generic_executor");
+}
