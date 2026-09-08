@@ -167,6 +167,6 @@ When adding another operator or predicate:
   back when exact round-tripping is impossible.
 - Selection materialization currently uses Arrow `take`; late materialization
   can move further downstream in a later phase.
-- The batch stream is serial; parallel morsel scheduling is future work.
+- The batch stream is serial; parallel morsel scheduling is future work (design/assessment: ARCHITECTURE_REVIEW_2026_09.md §14.8 — opt-in phase A not yet implemented, default stays serial).
 
 These are explicit fallback boundaries, not silent semantic differences.
