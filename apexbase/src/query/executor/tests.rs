@@ -3834,3 +3834,90 @@ fn time_calibration_ignores_zero_cost_samples() {
     };
     assert_eq!(index_cost(&second), index_cost(&first));
 }
+
+
+// ============================================================================
+// R5.5: route labels for JOIN and CTE execution paths
+// ============================================================================
+
+fn join_cte_fixture(base: &Path) {
+    // The default table path must exist for the executor entry point.
+    exec_multi("CREATE TABLE default (id INT)", base).unwrap();
+    exec_multi(
+        "CREATE TABLE orders (id INT, user_id INT, amount INT)",
+        base,
+    )
+    .unwrap();
+    exec_multi("CREATE TABLE users (id INT, city TEXT)", base).unwrap();
+    exec_multi(
+        "INSERT INTO orders (id, user_id, amount) VALUES
+         (1, 1, 10), (2, 2, 20), (3, 1, 30), (4, 3, 40), (5, 2, 50)",
+        base,
+    )
+    .unwrap();
+    exec_multi(
+        "INSERT INTO users (id, city) VALUES
+         (1, 'a'), (2, 'b'), (3, 'c'), (9, 'x')",
+        base,
+    )
+    .unwrap();
+}
+
+#[test]
+fn explain_analyze_reports_join_route_labels() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // General hash-join route (no fast path matches).
+    let plan = explain_analyze_plan(
+        &default_path,
+        "EXPLAIN ANALYZE SELECT orders.amount, users.city
+         FROM orders JOIN users ON orders.user_id = users.id",
+    );
+    assert_eq!(actual_path(&plan), "hash_join");
+
+    // COUNT(*) over a plain inner join takes the count fast path.
+    let plan = explain_analyze_plan(
+        &default_path,
+        "EXPLAIN ANALYZE SELECT COUNT(*)
+         FROM orders JOIN users ON orders.user_id = users.id",
+    );
+    assert_eq!(actual_path(&plan), "join_count_fast_path");
+}
+
+#[test]
+fn explain_analyze_reports_cte_route_labels() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // Single-use CTE is inlined into the main query (no materialization).
+    let plan = explain_analyze_plan(
+        &default_path,
+        "EXPLAIN ANALYZE WITH top AS
+         (SELECT amount FROM orders WHERE amount > 25) SELECT * FROM top",
+    );
+    assert_eq!(actual_path(&plan), "cte_inline");
+
+    // Multi-reference CTE is materialized into the shared batch cache.
+    let plan = explain_analyze_plan(
+        &default_path,
+        "EXPLAIN ANALYZE WITH top AS
+         (SELECT amount FROM orders WHERE amount > 25)
+         SELECT (SELECT COUNT(*) FROM top) AS n,
+                (SELECT MAX(amount) FROM top) AS m",
+    );
+    assert_eq!(actual_path(&plan), "cte_materialize");
+
+    // Recursive CTE runs the iterative fixpoint loop.
+    let plan = explain_analyze_plan(
+        &default_path,
+        "EXPLAIN ANALYZE WITH RECURSIVE fact(n) AS
+         (SELECT 1 UNION ALL SELECT n + 1 FROM fact WHERE n < 5)
+         SELECT n FROM fact",
+    );
+    assert_eq!(actual_path(&plan), "cte_recursive");
+}

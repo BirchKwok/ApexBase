@@ -973,6 +973,7 @@ impl ApexExecutor {
             };
 
         if recursive {
+            crate::query::executor::record_path("cte_recursive");
             // Recursive CTE: body must be UNION ALL with anchor (left) and recursive part (right)
             let (anchor_stmt, recursive_stmt, _union_all) = match body {
                 SqlStatement::Union(ref u) => ((*u.left).clone(), (*u.right).clone(), u.all),
@@ -1094,6 +1095,7 @@ impl ApexExecutor {
                 && matches!(&body, SqlStatement::Select(_) | SqlStatement::Union(_))
                 && references == 1
             {
+                crate::query::executor::record_path("cte_inline");
                 let body = Self::prune_cte_body_for_references(name, body, &main);
                 Self::visit_cte_references_in_statement(&mut main, name, Some(&body), None);
                 return Self::execute_parsed_multi(main, base_dir, default_table_path);
@@ -1101,6 +1103,7 @@ impl ApexExecutor {
 
             // Shared non-recursive CTE: retain one immutable Arrow batch and let
             // every consumer clone its buffers at zero copy.
+            crate::query::executor::record_path("cte_materialize");
             let body = if column_aliases.is_empty() {
                 Self::prune_cte_body_for_references(name, body, &main)
             } else {

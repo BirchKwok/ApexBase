@@ -22,6 +22,7 @@ impl ApexExecutor {
         // the unmatched probes).
         if let Some(count) = Self::try_count_only_join(&stmt, &joins, base_dir, default_table_path)?
         {
+            crate::query::executor::record_path("join_count_fast_path");
             return Ok(ApexResult::Scalar(count));
         }
 
@@ -31,6 +32,7 @@ impl ApexExecutor {
             base_dir,
             default_table_path,
         )? {
+            crate::query::executor::record_path("join_preaggregated_dimension");
             return Ok(result);
         }
 
@@ -38,6 +40,7 @@ impl ApexExecutor {
         if let Some(result) =
             Self::try_groupby_inner_join_count(&stmt, &joins, base_dir, default_table_path)?
         {
+            crate::query::executor::record_path("join_groupby_count_pushdown");
             return Ok(result);
         }
 
@@ -50,8 +53,12 @@ impl ApexExecutor {
             base_dir,
             default_table_path,
         )? {
+            crate::query::executor::record_path("join_bounded_full_outer");
             return Ok(result);
         }
+
+        // General hash-join route: no fast path above matched.
+        crate::query::executor::record_path("hash_join");
 
         let mut required_columns = stmt.required_columns().unwrap_or_default();
         // JOIN ON keys and extra ON predicates are needed by the hash join even

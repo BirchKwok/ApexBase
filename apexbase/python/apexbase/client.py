@@ -4534,8 +4534,15 @@ class ApexClient:
         if _RE_CREATE_TABLE.search(sql):
             return
         
-        # Skip validation for CTE queries (WITH ... AS ...)
-        if sql.strip().upper().startswith('WITH'):
+        # Skip validation for CTE queries (WITH ... AS ...); EXPLAIN and
+        # EXPLAIN ANALYZE may prefix the statement (e.g. EXPLAIN ANALYZE WITH
+        # ...), so look past them before checking.
+        head = sql.strip().upper()
+        for prefix in ("EXPLAIN ANALYZE ", "EXPLAIN "):
+            if head.startswith(prefix):
+                head = head[len(prefix):].lstrip()
+                break
+        if head.startswith("WITH"):
             return
         
         # Extract table name from FROM clause
