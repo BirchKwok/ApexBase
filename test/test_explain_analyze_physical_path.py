@@ -1,0 +1,117 @@
+"""R5.1: EXPLAIN ANALYZE physical path trace (architecture review R5).
+
+Covers, against the installed release wheel:
+1. ``Actual Path:`` appears in EXPLAIN ANALYZE output and in no other plan.
+2. Metadata COUNT(*), generic scan, and O(1) ``_id`` point-lookup routes.
+3. The batched scan pipeline route reports the batch count on a
+   multi-row-group table (200k narrow rows span two adaptive row groups).
+4. Shapes outside every fast path report the generic executor route.
+"""
+
+import tempfile
+
+from apexbase import ApexClient
+
+FIXTURE_ROWS = 200_000  # > 1 adaptive row group (131072 rows for narrow data)
+
+
+def _make_client(dirpath):
+    return ApexClient(dirpath, drop_if_exists=True, enable_cache=False)
+
+
+def _seed(client, rows=FIXTURE_ROWS):
+    client.create_table(
+        "users",
+        {"code": "int", "score": "float", "city": "string"},
+    )
+    client.use_table("users")
+    chunk = 50_000
+    for start in range(0, rows, chunk):
+        end = min(start + chunk, rows)
+        client.store(
+            {
+                "code": [i % 7 for i in range(start, end)],
+                "score": [(i % 97) * 0.5 for i in range(start, end)],
+                "city": [f"city{i % 13}" for i in range(start, end)],
+            }
+        )
+    client.flush()
+
+
+def _plan_text(client, sql):
+    """EXPLAIN returns one row with a single ``plan`` column."""
+    return client.execute(sql).to_dict()[0]["plan"]
+
+
+def _actual_path(plan):
+    line = plan.split("Actual Path:", 1)[1].splitlines()[0]
+    return line.strip()
+
+
+def test_explain_analyze_reports_simple_read_paths():
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        _seed(client)
+        try:
+            plan = _plan_text(client, "EXPLAIN ANALYZE SELECT COUNT(*) FROM users")
+            assert "Actual Path: count_star_metadata" in plan
+
+            plan = _plan_text(client, "EXPLAIN ANALYZE SELECT city FROM users LIMIT 5")
+            assert "Actual Path: generic_executor" in plan
+
+            plan = _plan_text(
+                client, "EXPLAIN ANALYZE SELECT city, code FROM users WHERE _id = 3"
+            )
+            assert "Actual Path: id_point_lookup" in plan
+        finally:
+            client.close()
+
+
+def test_explain_analyze_reports_batched_scan_pipeline_with_batch_count():
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        _seed(client)
+        try:
+            # Two group keys: the fused single-key kernels reject this shape,
+            # so the query reaches the scan-group pipeline and the batched
+            # row-group stream (same shape as the R3 parity tests).
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE SELECT city, code, COUNT(*) AS n FROM users "
+                "WHERE score >= 20 GROUP BY city, code",
+            )
+            path = _actual_path(plan)
+            assert path.startswith("batched_scan_pipeline(batches="), path
+            batches = int(path[len("batched_scan_pipeline(batches="):-1])
+            assert batches >= 2, "two-row-group fixture must consume >= 2 batches"
+        finally:
+            client.close()
+
+
+def test_explain_analyze_reports_generic_executor_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        _seed(client)
+        try:
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE SELECT city, code FROM users "
+                "WHERE score > 25 AND code <= 4 ORDER BY code",
+            )
+            assert "Actual Path: generic_executor" in plan
+        finally:
+            client.close()
+
+
+def test_plain_explain_does_not_report_actual_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        _seed(client)
+        try:
+            plan = _plan_text(client, "EXPLAIN SELECT COUNT(*) FROM users")
+            assert "Actual Path" not in plan
+
+            plan = _plan_text(client, "EXPLAIN SELECT city FROM users LIMIT 5")
+            assert "Actual Path" not in plan
+        finally:
+            client.close()
