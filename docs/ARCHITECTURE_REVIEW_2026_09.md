@@ -515,3 +515,129 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 4. 亚毫秒 canary 指标（过滤聚合族）在本机负载下窗口级波动可达
    ±20%（含 base 侧），建议在门禁脚本中登记为已知易波动族（不改
    阈值），与 R3 记录的 `INTERSECT (ordered)` 同处理。
+
+## 14. 实施状态（R5：规划与并行）
+
+状态：本轮增量完成（R5.1：EXPLAIN ANALYZE 报告实际物理路径）；
+CBO 驱动物理访问、成本校准、morsel 并行评估为 R5 余项（§14.5）。
+
+### 14.1 交付物
+
+1. **物理路径跟踪（thread-local，默认关闭）**：`PATH_TRACE`
+   （`executor/mod.rs`）。仅 EXPLAIN ANALYZE 在其执行线程上
+   `begin_path_trace()`；各路由决策点最多记录一次（首个胜出路由
+   生效，嵌套/子查询不覆盖外层记录），非 EXPLAIN ANALYZE 查询
+   零成本（无 trace 时 `record_path` 为空操作；细节走
+   `format_args!`，关闭时零分配）。
+2. **EXPLAIN ANALYZE 新增 `Actual Path:` 行**：`execute_explain`
+   analyze 分支在真实执行前开启跟踪、执行后取回，将实际物理路径
+   与既有 `Chosen Plan`（CBO 决策）并列展示——两者不一致即暴露
+   规划/执行偏差（R5 目标"EXPLAIN 与实际执行一致"的可观测基础）。
+3. **路由标签覆盖**（每查询至多一条记录，位于路由决策点而非行级）：
+   - 预解析引擎（绕过 SELECT 执行器）：`preparse_scan`、
+     `preparse_id_point_lookup`、`preparse_id_set_lookup`、
+     `preparse_string_filter_scan`、`preparse_numeric_range_scan`、
+     `preparse_like_scan`；`count_star_metadata`（预解析 COUNT(*) 与
+     解析后纯 COUNT(*) 两条入口）。
+   - SELECT 预聚合/TopK 快路径：`fast_numeric_filter_topk`、
+     `fast_not_null_topk`、`fast_count_distinct_scalars`、
+     `fast_numeric_case_aggregation`、`fast_null_count_aggregation`、
+     `mmap_aggregation`、`fast_not_filter_count`、`filtered_aggregation`、
+     `fast_filtered_string_agg`、`fast_filtered_numeric_agg`、
+     `fast_in_subquery_count`、`fast_dict_scalar_count`、
+     `fast_exists_count`。
+   - SELECT 融合 GROUP BY 内核：`fast_numeric_filter_group_by`、
+     `fast_fused_group_by`、`storage_string_eq_group_by`、
+     `fast_distinct_projection`、`fast_transform_group_by`、
+     `fast_ratio_group_by`、`fast_numeric_group_by`、
+     `fast_native_string_group_by`、`fast_numeric_case_group_by`、
+     `fast_cached_group_by`、`fast_cached_case_count`、
+     `fast_order_by_length`。
+   - SELECT 基础路由：`fast_deep_offset`、`topk_explode`、`cte_batch`、
+     `topk_distance`、`table_function`、`direct_file`、
+     `id_point_lookup`、`index_accelerated_read`。
+   - 扫描管线：`batched_scan_pipeline(batches=N)`（R3 分批管线，
+     批次计数为实际消费的 morsel/行组数）、`scan_group_pipeline`
+     （单批管线）、`fused_filter_group_order` /
+     `fused_between_group_agg`（R3 保留的融合内核）。
+   - 兜底：`generic_executor`（`GenericRouteGuard` 在
+     `execute_select_with_base_dir` 退出时记录，仅当无快路径胜出）。
+
+### 14.2 实现明细
+
+| 文件 | 变更 |
+| --- | --- |
+| `apexbase/src/query/executor/mod.rs` | `PATH_TRACE` thread-local + `begin_path_trace` / `record_path` / `record_path_detail_f` / `finish_path_trace`；预解析 COUNT(*) 路由记录 |
+| `apexbase/src/query/executor/select.rs` | `GenericRouteGuard` 兜底标签 + 17 个快路径路由决策点记录 |
+| `apexbase/src/query/executor/signature_engine.rs` | 预解析读取 6 类路由在结果确定处一次性记录 |
+| `apexbase/src/query/executor/scan_pipeline.rs` | 单批扫描管线与两个融合内核的记录点 |
+| `apexbase/src/query/executor/batch_group.rs` | 分批管线批次计数（`batches=N` 细节） |
+| `apexbase/src/query/executor/ddl.rs` | EXPLAIN ANALYZE 开启/收尾跟踪并输出 `Actual Path:` |
+| `docs/RESOURCE_OWNERSHIP.md` | §1.1 登记 `PATH_TRACE` |
+
+### 14.3 测试覆盖（Rust + Python 两侧）
+
+- Rust 单元测试（4 项新增）：
+  - `path_trace_first_record_wins_and_is_off_by_default`：首记录生效、
+    细节拼接、默认关闭无状态残留。
+  - `explain_analyze_reports_batched_scan_pipeline_path`：多行组
+    fixture 的 GROUP BY 查询报告 `batched_scan_pipeline(batches=≥2)`。
+  - `explain_analyze_reports_preparse_and_metadata_paths`：
+    `count_star_metadata` / `preparse_scan` / `preparse_id_point_lookup`。
+  - `explain_analyze_reports_generic_executor_path`：无快路径形状
+    报告 `generic_executor`。
+- Python 契约测试（`test/test_explain_analyze_physical_path.py`，
+  4 项新增，200K 行 / 2 行组 fixture）：预解析三路由、分批管线
+  批次计数（≥2）、generic 兜底、普通 EXPLAIN 不含 `Actual Path`。
+
+### 14.4 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功（约 5 分钟）；同口径 `cargo build --release` 警告 R4 与 R5.1 均为 197 条且逐条一致（无新增警告；maturin 口径两侧均为 198 条） |
+| pytest（完整串行） | 1760 passed（既有 1756 + 新增 4），29.0s（最终 wheel 上复验） |
+| cargo test（完整） | 532 lib + 6 doc passed（lib 含 4 项新增） |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103 项全部执行；中位比值 current/base = 0.997（vs `benchmarks/latest_public_baseline.json`，492956b）；5 项 ≥+15%（IN subquery / EXISTS / EXCEPT / COUNT(DISTINCT city) / Persistent VIEW）经专项重测与同状态配对对照全部推翻（§14.4.1）；原始 JSON 存 `benchmarks/public_bench_current.json` |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时） | 5 次运行（20260908-182428/185219/190812/192342/203714）均 exit 1，回归项全部落在亚毫秒噪声族；逐项 A/B 推翻全部 6 项被标记指标（最差 +2.58%，6 项中 4 项 current 更快）；本机为负载桌面，当日未取得干净的 exit 0 canary，同机结论以完整模式 + 专项 A/B 为依据（§14.4.1） |
+| 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a） | 20260908-193815 PASSED：109 项表指标 0 回退 + 2 项 Q/s + 8 项量化，exit 0 |
+
+### 14.4.1 亚毫秒指标专项验证（A/B 方法）
+
+方法：共享 200K 行数据集（`/tmp/apex_ab_shared_ds/apex_bench`，只读），
+base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`，
+隔离 CARGO_TARGET_DIR），current = conda base 中的当轮 release 轮子；
+两侧 `enable_cache=False`；5 次预热，每窗口 30 次计时、8 个窗口交错
+（首尾 B-C 对称），每侧 240 样本，中位数比较；原始数据保留在各报告
+目录（`base-*.json` / `current-*.json` / `summary.json`）。
+
+1. **Numeric conjunction aggregation**（canary 反复标记项）：
+   - 首次 240 次 A/B（20260908-203714）：base 0.4951 vs current
+     0.5505 ms（+11.21%）。
+   - bisect：R4 树构建轮子复跑同一 A/B（20260908-211637）：base
+     0.5326 vs current 0.5583 ms（+4.84%），8 窗中 3 窗 current 更快。
+   - 同状态复测 R5.1（20260908-212126）：base 0.5052 vs current
+     0.5148 ms（**+1.89%**）；同一机器状态下 R5.1（0.5148）低于 R4
+     （0.5583）。
+   - 结论：base 侧读数在三次运行间漂移 ±4%（0.4951 / 0.5326 /
+     0.5052），初始 +11.21% 由当日机器状态漂移主导，不能归因于 R5.1
+     增量；同状态偏差 +1.89%，远低于 15% 门禁阈值。
+2. **Persistent VIEW select**（公开 benchmark 重测中唯一判 REPRODUCED
+   项）：同状态专项复测（3 个全新会话 × 40 次）——R5.1 中位 2.0811 ms，
+   base（origin/main）2.1032 ms，R5.1 反而快 1%；该数值为持续负载后的
+   机器状态效应（当日 18:23 同查询同方法测得 0.5401 ms），非代码回退。
+3. 其余 4 项重测均在基线水平或更快：IN subquery 0.4543 / EXISTS
+   0.4535 / EXCEPT 0.7675 / COUNT(DISTINCT city) 0.0289 ms，对应基线
+   0.6725 / 0.7566 / 1.1775 / 0.2004 ms。
+
+### 14.5 残余与后续（R5 余项）
+
+1. **CBO 驱动物理访问**：`Chosen Plan` 目前仍是描述性输出，执行器
+   路由顺序未由 QueryPlan 直接驱动；下一步将路由决策与规划器策略
+   对齐（先对齐、再校准，不改变既有快路径优先级语义）。
+2. **成本校准**：`estimated_cost` 与实测（Actual Time / Actual Path）
+   闭环校准；EXPLAIN ANALYZE 的 Actual Path 为此提供训练/验证数据源。
+3. **morsel 并行评估**：R3 已限定串行分批（内存与正确性前提）；
+   并行需先有成本模型与超订阅控制证据，不默认启用。
+4. **JOIN 路径标签**：`execute_select_with_joins` 及 CTE 物化路径
+   暂无路由标签（本轮范围为基础 SELECT 路由），其 EXPLAIN ANALYZE
+   不输出 `Actual Path` 行；并入余项 1 的路由对齐工作。
