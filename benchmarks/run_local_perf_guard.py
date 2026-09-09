@@ -67,9 +67,9 @@ def one_wheel(directory):
 
 def benchmark_arguments(
     mode, rows, warmup, iterations, output, qps_only=False, quant_only=False,
-    index_only=False,
+    index_only=False, parallel_only=False,
 ):
-    if mode == "canary" or qps_only or quant_only or index_only:
+    if mode == "canary" or qps_only or quant_only or index_only or parallel_only:
         script = ROOT / "benchmarks" / "bench_perf_canary.py"
         defaults = (200_000, 2, 7)
     else:
@@ -96,6 +96,8 @@ def benchmark_arguments(
         command.insert(1, "--quant-only")
     if index_only:
         command.insert(1, "--index-only")
+    if parallel_only:
+        command.insert(1, "--parallel-only")
     return tuple(command)
 
 
@@ -344,6 +346,31 @@ def main(argv=None):
                     collect_idx, idx_reports, "idx-comparison"
                 )
                 comparison_status = max(comparison_status, idx_status)
+
+                # The opt-in parallel fold (architecture review R5.7 phase A)
+                # is a core scan shape when enabled; compare its behavior
+                # base/current at full scale in a dedicated interleaved
+                # phase (2/4/8 threads).
+                par_counts = {"base": 0, "current": 0}
+                par_reports = {"base": [], "current": []}
+                collect_par = make_collect(
+                    "par",
+                    par_counts,
+                    par_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary",
+                        args.rows if args.rows is not None else 1_000_000,
+                        args.warmup,
+                        args.iterations,
+                        report,
+                        parallel_only=True,
+                    ),
+                )
+                collect_par(SAMPLE_ORDER)
+                par_status = run_comparison(
+                    collect_par, par_reports, "par-comparison"
+                )
+                comparison_status = max(comparison_status, par_status)
 
             print(f"Reports and comparison saved in {output_dir}")
         finally:

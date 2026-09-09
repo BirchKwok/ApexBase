@@ -81,6 +81,16 @@ CANARY_SPECS = (
     ("Index equality (skewed)", "bench_index_eq_skewed", "mean"),
     ("Index range (BETWEEN)", "bench_index_range", "mean"),
     ("Index covering projection", "bench_index_covering", "mean"),
+    ("Parallel batch scan (2 threads)", "bench_parallel_batch_scan_t2", "mean"),
+    ("Parallel batch scan (4 threads)", "bench_parallel_batch_scan_t4", "mean"),
+)
+
+# Full-mode par phase (R5.7 phase A): the 8-thread shape exists only in the
+# dedicated 1M-row phase; the 200K canary keeps 2/4 threads.
+PARALLEL_ONLY_SPECS = (
+    ("Parallel batch scan (2 threads)", "bench_parallel_batch_scan_t2", "mean"),
+    ("Parallel batch scan (4 threads)", "bench_parallel_batch_scan_t4", "mean"),
+    ("Parallel batch scan (8 threads)", "bench_parallel_batch_scan_t8", "mean"),
 )
 
 QUANTIZED_CODECS = (
@@ -151,7 +161,7 @@ def run_quantized_canary(rows, warmup, iterations):
             client.close()
 
 
-def run_canary(rows, warmup, iterations, qps_only=False, index_only=False):
+def run_canary(rows, warmup, iterations, qps_only=False, index_only=False, parallel_only=False):
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -175,7 +185,14 @@ def run_canary(rows, warmup, iterations, qps_only=False, index_only=False):
     results = []
     try:
         bench.setup()
-        if index_only:
+        if parallel_only:
+            specs = PARALLEL_ONLY_SPECS
+            # Standalone profile: the batch pipeline setup copies the
+            # persisted default table, which only exists once the data
+            # is loaded. The full canary loads it via the Bulk Insert
+            # spec, which this profile skips - load it unmeasured here.
+            bench.bench_insert()
+        elif index_only:
             specs = tuple(
                 spec
                 for spec in CANARY_SPECS
@@ -198,7 +215,12 @@ def run_canary(rows, warmup, iterations, qps_only=False, index_only=False):
                     "bench_uncached_delta_boolean_scan_group_having_topk",
                 }:
                     bench.setup_uncached_delta_scan_pipeline()
-                elif method_name == "bench_batch_scan_group_having_topk":
+                elif method_name in {
+                    "bench_batch_scan_group_having_topk",
+                    "bench_parallel_batch_scan_t2",
+                    "bench_parallel_batch_scan_t4",
+                    "bench_parallel_batch_scan_t8",
+                }:
                     bench.setup_batch_scan_pipeline()
                 elif method_name in {
                     "bench_index_eq_rare",
@@ -216,10 +238,10 @@ def run_canary(rows, warmup, iterations, qps_only=False, index_only=False):
                     "ApexBase": round(elapsed_ms, 6),
                 })
                 print(f"{name:<34} {elapsed_ms:>12.6f} ms")
-            if not index_only:
-                results.extend(run_quantized_canary(rows, warmup, iterations))
+        if not index_only and not parallel_only:
+            results.extend(run_quantized_canary(rows, warmup, iterations))
 
-        if not index_only:
+        if not index_only and not parallel_only:
             # OLAP Q/s read profile (ApexBase-only). The harness recreates the
             # engine on a clean loaded copy, so the measurement is independent
             # of the delta-heavy state left by the DML canary metrics.
@@ -268,21 +290,36 @@ def main(argv=None):
         action="store_true",
         help="Run only the index-accelerated canary metrics (R5.6 guard phase)",
     )
+    parser.add_argument(
+        "--parallel-only",
+        action="store_true",
+        help="Run only the parallel batch-scan metrics (R5.7 guard phase)",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
 
-    if args.qps_only and (args.quant_only or args.index_only):
+    if args.qps_only and (
+        args.quant_only or args.index_only or args.parallel_only
+    ):
         parser.error(
             "--qps-only is mutually exclusive with the other profile flags"
         )
-    if args.quant_only and args.index_only:
-        parser.error("--quant-only and --index-only are mutually exclusive")
+    if args.quant_only and (args.index_only or args.parallel_only):
+        parser.error(
+            "--quant-only is mutually exclusive with the other profile flags"
+        )
+    if args.index_only and args.parallel_only:
+        parser.error("--index-only and --parallel-only are mutually exclusive")
     if args.quant_only:
         results = run_quantized_canary(args.rows, args.warmup, args.iterations)
     elif args.index_only:
         results = run_canary(
             args.rows, args.warmup, args.iterations, index_only=True
+        )
+    elif args.parallel_only:
+        results = run_canary(
+            args.rows, args.warmup, args.iterations, parallel_only=True
         )
     else:
         results = run_canary(

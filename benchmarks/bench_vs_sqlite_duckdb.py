@@ -2564,6 +2564,43 @@ class ApexBaseBench:
             show_internal_id=True,
         ).to_dict()
 
+    def bench_parallel_batch_scan_t2(self):
+        """Batch pipeline with APEX_PARALLEL_SCAN=2 (R5.7 phase A)."""
+        return self._parallel_batch_scan_group_having_topk(2)
+
+    def bench_parallel_batch_scan_t4(self):
+        """Batch pipeline with APEX_PARALLEL_SCAN=4 (R5.7 phase A)."""
+        return self._parallel_batch_scan_group_having_topk(4)
+
+    def bench_parallel_batch_scan_t8(self):
+        """Batch pipeline with APEX_PARALLEL_SCAN=8 (R5.7 phase A)."""
+        return self._parallel_batch_scan_group_having_topk(8)
+
+    def _parallel_batch_scan_group_having_topk(self, threads):
+        """The R3 batch-scan shape with the opt-in parallel fold on."""
+        if not self._batch_scan_ready:
+            raise RuntimeError("setup_batch_scan_pipeline must run first")
+        parameter_sets = (
+            (20, 35, 20.0, 0),
+            (25, 40, 30.0, 100),
+            (30, 50, 40.0, 250),
+            (35, 60, 50.0, 500),
+        )
+        params = parameter_sets[self._batch_scan_query_index % len(parameter_sets)]
+        self._batch_scan_query_index += 1
+        os.environ["APEX_PARALLEL_SCAN"] = str(threads)
+        try:
+            return self._uncached_batch_scan_client.execute(
+                "SELECT city, COUNT(*) AS n, AVG(score) AS av, MAX(score) AS mx "
+                "FROM __perf_batch_scan WHERE age > ? AND age <= ? AND score >= ? "
+                "GROUP BY city HAVING COUNT(*) > ? "
+                "ORDER BY n DESC, city LIMIT 5",
+                params=params,
+                show_internal_id=True,
+            ).to_dict()
+        finally:
+            os.environ.pop("APEX_PARALLEL_SCAN", None)
+
     def setup_view_bench(self):
         try:
             self.client.execute("DROP VIEW bench_view")

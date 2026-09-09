@@ -213,6 +213,72 @@ impl BatchKeyLane {
             _ => None,
         }
     }
+
+    /// Decode one interned group ID (slot 0 = NULL group) so a partial
+    /// fold's lanes can be re-interned into the merged lanes (R5.7).
+    fn value_at(&self, id: u32) -> Option<BatchKeyValue> {
+        match self {
+            Self::Int { values, .. } => values
+                .get(id as usize)
+                .and_then(|slot| *slot)
+                .map(BatchKeyValue::Int),
+            Self::Float { values, .. } => values
+                .get(id as usize)
+                .and_then(|slot| *slot)
+                .map(BatchKeyValue::FloatBits),
+            Self::Bool => match id {
+                1 => Some(BatchKeyValue::Bool(false)),
+                2 => Some(BatchKeyValue::Bool(true)),
+                _ => None,
+            },
+            Self::String { values, .. } => values
+                .get(id as usize)
+                .and_then(|slot| slot.as_ref())
+                .map(|value| BatchKeyValue::Str(value.clone())),
+        }
+    }
+
+    /// Intern a decoded value into this lane; None when the lane variant
+    /// does not match (the caller falls back to the serial fold).
+    fn intern_value(&mut self, value: Option<BatchKeyValue>) -> Option<u32> {
+        match (self, value) {
+            (Self::Int { dict, values }, Some(BatchKeyValue::Int(value))) => Some(
+                *dict.entry(value).or_insert_with(|| {
+                    let id = values.len() as u32;
+                    values.push(Some(value));
+                    id
+                }),
+            ),
+            (Self::Float { dict, values }, Some(BatchKeyValue::FloatBits(bits))) => Some(
+                *dict.entry(bits).or_insert_with(|| {
+                    let id = values.len() as u32;
+                    values.push(Some(bits));
+                    id
+                }),
+            ),
+            (Self::Bool, Some(BatchKeyValue::Bool(value))) => {
+                Some(if value { 2 } else { 1 })
+            }
+            (Self::String { dict, values }, Some(BatchKeyValue::Str(value))) => {
+                let id = *dict.entry(value.clone()).or_insert_with(|| {
+                    let id = values.len() as u32;
+                    values.push(Some(value));
+                    id
+                });
+                Some(id)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Decoded group-key value exchanged between partial folds (R5.7).
+#[derive(Clone, Debug)]
+enum BatchKeyValue {
+    Int(i64),
+    FloatBits(u64),
+    Bool(bool),
+    Str(String),
 }
 
 /// Incremental aggregate state of one group. Field-for-field the same
@@ -239,6 +305,32 @@ impl BatchGroupState {
             min_float: None,
             max_float: None,
         }
+    }
+
+    /// Fold another partial state into this one. Int sums wrap (associative),
+    /// float sums add chunk partials in chunk order (deterministic); the
+    /// phase-A parity fixtures use exactly representable values, so the
+    /// merge is bit-equal to the serial fold.
+    fn merge_from(&mut self, other: &BatchGroupState) {
+        self.count += other.count;
+        self.sum_int = self.sum_int.wrapping_add(other.sum_int);
+        self.sum_float += other.sum_float;
+        self.min_int = match (self.min_int, other.min_int) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.max_int = match (self.max_int, other.max_int) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.min_float = match (self.min_float, other.min_float) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.max_float = match (self.max_float, other.max_float) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
     }
 }
 
@@ -625,6 +717,83 @@ impl BatchGroupAggregator {
         let schema = Arc::new(Schema::new(fields));
         RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))
     }
+
+    /// Intern a decoded group-key value into the slot lane, creating the
+    /// lane from the value's type on first use (parallel merge, R5.7).
+    /// Returns None when the lane variant does not match the value.
+    fn intern_lane_value(&mut self, slot: usize, value: Option<BatchKeyValue>) -> Option<u32> {
+        let value = value?; // slot 0 is the NULL group in every lane
+        let lane = match (slot, &mut self.key1, &mut self.key2) {
+            (0, lane @ None, _) => {
+                *lane = Some(Self::lane_for_value(&value));
+                self.key1.as_mut().unwrap()
+            }
+            (1, _, lane @ None) => {
+                *lane = Some(Self::lane_for_value(&value));
+                self.key2.as_mut().unwrap()
+            }
+            _ => if slot == 0 {
+                self.key1.as_mut()?
+            } else {
+                self.key2.as_mut()?
+            },
+        };
+        lane.intern_value(Some(value))
+    }
+
+    fn lane_for_value(value: &BatchKeyValue) -> BatchKeyLane {
+        match value {
+            BatchKeyValue::Int(_) => BatchKeyLane::new_int(),
+            BatchKeyValue::FloatBits(_) => BatchKeyLane::new_float(),
+            BatchKeyValue::Bool(_) => BatchKeyLane::new_bool(),
+            BatchKeyValue::Str(_) => BatchKeyLane::new_string(),
+        }
+    }
+}
+
+/// Per-thread fold outcome of one morsel chunk (parallel batch pipeline,
+/// R5.7 phase A).
+enum ParallelChunkOutcome {
+    Folded(BatchGroupAggregator),
+    FallBack,
+    Cancelled,
+}
+
+/// Process-wide in-flight worker budget for parallel folds (R5.7 phase A,
+/// design §14.8.3): capacity min(hardware_concurrency - 1, 4), lazy, zero
+/// state until the first parallel request. Registered in
+/// docs/RESOURCE_OWNERSHIP.md.
+static PARALLEL_SCAN_TOKENS: std::sync::OnceLock<std::sync::atomic::AtomicUsize> =
+    std::sync::OnceLock::new();
+
+fn parallel_scan_tokens() -> &'static std::sync::atomic::AtomicUsize {
+    PARALLEL_SCAN_TOKENS.get_or_init(|| {
+        let capacity = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .saturating_sub(1)
+            .min(4);
+        std::sync::atomic::AtomicUsize::new(capacity)
+    })
+}
+
+/// Holds in-flight fold tokens; returns them on drop so every exit path of
+/// the parallel fold releases the budget (RAII).
+struct ParallelTokenGuard {
+    count: usize,
+}
+
+impl Drop for ParallelTokenGuard {
+    fn drop(&mut self) {
+        parallel_scan_tokens()
+            .fetch_add(self.count, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn exhaust_parallel_tokens_for_test() -> ParallelTokenGuard {
+    let count = parallel_scan_tokens().swap(0, std::sync::atomic::Ordering::AcqRel);
+    ParallelTokenGuard { count }
 }
 
 impl ApexExecutor {
@@ -713,32 +882,104 @@ impl ApexExecutor {
             return Ok(None);
         };
 
-        let mut agg = aggregator;
-        let mut batch_count: u64 = 0;
-        loop {
-            // Cancellation is checked at batch boundaries (one atomic load
-            // per row group), never per row (architecture review R4).
-            if crate::query::executor::query_cancelled() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "query cancelled",
-                ));
-            }
-            match stream.next() {
-                Some(Ok(crate::storage::BatchMorselOutcome::Morsel(morsel))) => {
-                    batch_count += 1;
-                    let batch = morsel.into_record_batch()?;
-                    if agg.consume_batch(&batch).is_none() {
-                        return Ok(None);
+        // APEX_PARALLEL_SCAN (R5.7 phase A, opt-in): collect the projected
+        // morsels and fold them on a scoped thread pool. The serial
+        // streaming path below is the unchanged default.
+        let (agg, batch_count, parallel_threads) = match Self::parallel_scan_requested() {
+            Some(requested) => {
+                let mut batches: Vec<RecordBatch> = Vec::new();
+                let mut error: Option<io::Error> = None;
+                loop {
+                    // Cancellation is checked at batch boundaries (one
+                    // atomic load per row group), never per row (R4).
+                    if crate::query::executor::query_cancelled() {
+                        error = Some(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "query cancelled",
+                        ));
+                        break;
+                    }
+                    match stream.next() {
+                        Some(Ok(crate::storage::BatchMorselOutcome::Morsel(morsel))) => {
+                            match morsel.into_record_batch() {
+                                Ok(batch) => batches.push(batch),
+                                Err(err) => {
+                                    error = Some(err);
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Ok(crate::storage::BatchMorselOutcome::Unsupported)) => {
+                            return Ok(None);
+                        }
+                        Some(Err(err)) => {
+                            error = Some(err);
+                            break;
+                        }
+                        None => break,
                     }
                 }
-                Some(Ok(crate::storage::BatchMorselOutcome::Unsupported)) => {
-                    return Ok(None);
+                if let Some(err) = error {
+                    return Err(err);
                 }
-                Some(Err(error)) => return Err(error),
-                None => break,
+                // A single morsel has nothing to parallelize.
+                if batches.len() < 2 {
+                    (
+                        Self::serial_fold_batches(&batches, effective_stmt)?,
+                        batches.len() as u64,
+                        None,
+                    )
+                } else if let Some(threads) = Self::try_acquire_parallel_tokens(requested) {
+                    let _token_guard = ParallelTokenGuard { count: threads };
+                    let agg =
+                        match Self::parallel_batch_group_fold(&batches, effective_stmt, threads) {
+                            Ok(agg) => agg,
+                            Err(err) => return Err(err),
+                        };
+                    (agg, batches.len() as u64, Some(threads))
+                } else {
+                    // No free tokens (another query holds the budget): stay
+                    // serial, so oversubscription stays bounded.
+                    (
+                        Self::serial_fold_batches(&batches, effective_stmt)?,
+                        batches.len() as u64,
+                        None,
+                    )
+                }
             }
-        }
+            None => {
+                let mut agg = aggregator;
+                let mut batch_count: u64 = 0;
+                loop {
+                    // Cancellation is checked at batch boundaries (one atomic load
+                    // per row group), never per row (architecture review R4).
+                    if crate::query::executor::query_cancelled() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "query cancelled",
+                        ));
+                    }
+                    match stream.next() {
+                        Some(Ok(crate::storage::BatchMorselOutcome::Morsel(morsel))) => {
+                            batch_count += 1;
+                            let batch = morsel.into_record_batch()?;
+                            if agg.consume_batch(&batch).is_none() {
+                                return Ok(None);
+                            }
+                        }
+                        Some(Ok(crate::storage::BatchMorselOutcome::Unsupported)) => {
+                            return Ok(None);
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => break,
+                    }
+                }
+                (Some(agg), batch_count, None)
+            }
+        };
+        let Some(mut agg) = agg else {
+            return Ok(None);
+        };
 
         let mut result = ApexResult::Data(agg.finish(effective_stmt)?);
 
@@ -793,7 +1034,14 @@ impl ApexExecutor {
         }
 
         crate::query::executor::record_path("batched_scan_pipeline");
-        crate::query::executor::record_path_detail_f(format_args!("(batches={batch_count})"));
+        match parallel_threads {
+            Some(threads) => crate::query::executor::record_path_detail_f(format_args!(
+                "(batches={batch_count}, parallel={threads})"
+            )),
+            None => crate::query::executor::record_path_detail_f(
+                format_args!("(batches={batch_count})"),
+            ),
+        }
         Ok(Some(result))
     }
 
@@ -804,5 +1052,157 @@ impl ApexExecutor {
             Some(value) => value != "0",
             None => true,
         }
+    }
+
+    /// `APEX_PARALLEL_SCAN=N` (R5.7 phase A, opt-in): N >= 2 requests N
+    /// fold threads for the batched pipeline; unset, 0, 1, or malformed
+    /// values stay serial, mirroring the APEX_BATCH_SCAN diagnostics.
+    fn parallel_scan_requested() -> Option<usize> {
+        let value = std::env::var_os("APEX_PARALLEL_SCAN")?;
+        let text = value.to_str()?;
+        let requested = text.parse::<usize>().ok()?;
+        (requested >= 2).then_some(requested)
+    }
+
+    /// Take in-flight fold tokens for one query: min(requested, available);
+    /// below two threads the query stays serial (R5.7 phase A, §14.8.3).
+    fn try_acquire_parallel_tokens(requested: usize) -> Option<usize> {
+        let tokens = parallel_scan_tokens();
+        let mut available = tokens.load(Ordering::Acquire);
+        loop {
+            let want = requested.min(available);
+            if want < 2 {
+                return None;
+            }
+            match tokens.compare_exchange_weak(
+                available,
+                available - want,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(want),
+                Err(current) => available = current,
+            }
+        }
+    }
+
+    /// Serial fold over already-collected morsels: the parallel path's
+    /// no-token and single-morsel fallbacks (same per-batch semantics as
+    /// the streaming loop).
+    fn serial_fold_batches(
+        batches: &[RecordBatch],
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<BatchGroupAggregator>> {
+        let Some(mut agg) = BatchGroupAggregator::new(stmt) else {
+            return Ok(None);
+        };
+        for batch in batches {
+            // Cancellation is checked at batch boundaries (one atomic load
+            // per row group), never per row (architecture review R4).
+            if crate::query::executor::query_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "query cancelled",
+                ));
+            }
+            if agg.consume_batch(batch).is_none() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(agg))
+    }
+
+    /// Parallel fold of the collected morsels (R5.7 phase A): each worker
+    /// on the dedicated per-query pool folds a contiguous morsel chunk
+    /// into its own partial group state; partials merge in chunk order
+    /// (deterministic), re-interning key values through the merged lanes.
+    /// A dedicated pool keeps the scan fold off the rayon global pool,
+    /// which the vector kernels own (§14.8.3); the pool is dropped at the
+    /// end of the query, so no background threads survive it.
+    fn parallel_batch_group_fold(
+        batches: &[RecordBatch],
+        stmt: &SelectStatement,
+        threads: usize,
+    ) -> io::Result<Option<BatchGroupAggregator>> {
+        use rayon::prelude::*;
+
+        let chunk_count = threads.min(batches.len());
+        let chunk_size = (batches.len() + chunk_count - 1) / chunk_count;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(chunk_count)
+            .build()
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
+            })?;
+        // Each worker folds its contiguous chunk into a partial state;
+        // collect keeps chunk order for the deterministic merge.
+        let partials: Vec<ParallelChunkOutcome> = pool.install(|| {
+            (0..chunk_count)
+                .into_par_iter()
+                .map(|chunk| {
+                    let start = chunk * chunk_size;
+                    let end = (start + chunk_size).min(batches.len());
+                    let mut agg = match BatchGroupAggregator::new(stmt) {
+                        Some(agg) => agg,
+                        None => return ParallelChunkOutcome::FallBack,
+                    };
+                    for batch in &batches[start..end] {
+                        if crate::query::executor::query_cancelled() {
+                            return ParallelChunkOutcome::Cancelled;
+                        }
+                        if agg.consume_batch(batch).is_none() {
+                            return ParallelChunkOutcome::FallBack;
+                        }
+                    }
+                    ParallelChunkOutcome::Folded(agg)
+                })
+                .collect()
+        });
+        let mut merged: Option<BatchGroupAggregator> = None;
+        for outcome in partials.into_iter() {
+            match outcome {
+                ParallelChunkOutcome::Cancelled => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "query cancelled",
+                    ));
+                }
+                ParallelChunkOutcome::FallBack => return Ok(None),
+                ParallelChunkOutcome::Folded(partial) => {
+                    let merged = merged.get_or_insert_with(|| {
+                        BatchGroupAggregator::new(stmt).expect(
+                            "the shape gate verified this statement before the fold",
+                        )
+                    });
+                    merged.source_is_int = merged.source_is_int.or(partial.source_is_int);
+                    let two_keys = partial.group_cols.len() == 2;
+                    for (key, state) in partial.groups.iter() {
+                        let id1 = (*key >> 32) as u32;
+                        let value1 = partial.key1.as_ref().and_then(|lane| lane.value_at(id1));
+                        let Some(global1) = merged.intern_lane_value(0, value1) else {
+                            return Ok(None);
+                        };
+                        let global2 = if two_keys {
+                            let id2 = *key as u32;
+                            let value2 =
+                                partial.key2.as_ref().and_then(|lane| lane.value_at(id2));
+                            let Some(global2) = merged.intern_lane_value(1, value2) else {
+                                return Ok(None);
+                            };
+                            global2
+                        } else {
+                            0
+                        };
+                        let merged_key = ((global1 as u64) << 32) | global2 as u64;
+                        merged
+                            .groups
+                            .entry(merged_key)
+                            .or_insert_with(BatchGroupState::new)
+                            .merge_from(state);
+                    }
+                }
+            }
+        }
+        Ok(merged)
     }
 }

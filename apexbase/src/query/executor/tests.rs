@@ -2815,7 +2815,9 @@ fn test_zone_map_pruning_logic() {
 // R3: serial batched Filter -> GROUP BY -> HAVING -> TopK pipeline
 // ============================================================================
 
-/// Serializes tests that toggle APEX_BATCH_SCAN (process-wide env state).
+/// Serializes tests that toggle APEX_BATCH_SCAN / APEX_PARALLEL_SCAN
+/// (process-wide env state); pipeline selection and the path detail
+/// depend on both switches, so both are guarded by this one lock.
 static BATCH_SCAN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn with_batch_scan<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
@@ -3155,6 +3157,165 @@ fn batch_scan_pipeline_matches_single_batch_pipeline() {
     let off = run_with_batch_scan(false, &path, sql);
     let on = run_with_batch_scan(true, &path, sql);
     assert_batches_logically_equal(&off, &on, sql);
+}
+
+// ============================================================================
+// R5.7: parallel (morsel) fold of the batch pipeline, opt-in
+// ============================================================================
+
+fn with_parallel_scan<T>(threads: Option<usize>, f: impl FnOnce() -> T) -> T {
+    let _guard = BATCH_SCAN_ENV_LOCK.lock().unwrap();
+    match threads {
+        Some(count) => std::env::set_var("APEX_PARALLEL_SCAN", count.to_string()),
+        None => std::env::remove_var("APEX_PARALLEL_SCAN"),
+    }
+    let result = f();
+    std::env::remove_var("APEX_PARALLEL_SCAN");
+    result
+}
+
+fn run_with_parallel_scan(threads: Option<usize>, path: &Path, sql: &str) -> RecordBatch {
+    with_parallel_scan(threads, || {
+        ApexExecutor::execute(sql, path)
+            .unwrap()
+            .to_record_batch()
+            .unwrap()
+    })
+}
+
+#[test]
+fn parallel_batch_scan_matches_serial_pipeline() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("parallel_batch_scan.apex");
+    create_batch_scan_fixture(&path);
+
+    // The same shapes as the serial parity test: values are exactly
+    // representable in f64, so the deterministic chunk-order merge is
+    // bit-equal to the serial fold at any thread count.
+    let queries = [
+        "SELECT code, COUNT(*) AS n, SUM(amount) AS s, MIN(amount) AS mn, MAX(amount) AS mx          FROM default WHERE amount IS NOT NULL AND code >= 1          GROUP BY code HAVING SUM(amount) > -5000 ORDER BY n DESC, code LIMIT 10",
+        "SELECT city, code, COUNT(*) AS n, AVG(score) AS av, MIN(score) AS mn, MAX(score) AS mx, SUM(score) AS s          FROM default WHERE score >= 20 AND score <= 40 AND code IN (1, 3, 5)          GROUP BY city, code HAVING COUNT(*) > 2 ORDER BY av DESC, city, code LIMIT 20",
+        "SELECT city, COUNT(*) AS n FROM default WHERE score IS NULL GROUP BY city          ORDER BY n DESC, city LIMIT 5",
+        "SELECT city, COUNT(*) AS n, AVG(amount) AS av FROM default          WHERE amount BETWEEN -100 AND 100 OR city IN ('city1', 'city7')          GROUP BY city HAVING COUNT(*) > 10 ORDER BY av DESC, city LIMIT 7 OFFSET 1",
+        "SELECT flag, COUNT(*) AS n FROM default WHERE amount > 0 GROUP BY flag          HAVING COUNT(*) > 100 ORDER BY n DESC, flag LIMIT 5",
+        "SELECT score, COUNT(*) AS n FROM default WHERE score IS NOT NULL AND score >= 30          GROUP BY score ORDER BY n DESC, score LIMIT 5",
+        "SELECT city, COUNT(*) AS n FROM default WHERE code = 99 GROUP BY city ORDER BY n DESC, city LIMIT 3",
+        "SELECT city, code, flag, COUNT(*) AS n FROM default          WHERE amount > 0 AND code <= 4 GROUP BY city, code, flag          ORDER BY n DESC, city, code, flag LIMIT 5",
+    ];
+
+    let serial = queries
+        .iter()
+        .map(|sql| run_with_parallel_scan(None, &path, sql))
+        .collect::<Vec<_>>();
+    for &threads in &[2usize, 4] {
+        for (sql, expected) in queries.iter().zip(serial.iter()) {
+            let parallel = run_with_parallel_scan(Some(threads), &path, sql);
+            assert_batches_logically_equal(expected, &parallel, sql);
+        }
+    }
+}
+
+#[test]
+fn parallel_batch_scan_falls_back_when_tokens_exhausted() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("parallel_tokens.apex");
+    create_batch_scan_fixture(&path);
+    let sql = "SELECT city, code, COUNT(*) AS n, SUM(score) AS s          FROM default WHERE score >= 20 AND score <= 40 AND code IN (1, 3, 5)          GROUP BY city, code HAVING COUNT(*) > 2 ORDER BY n DESC, city, code LIMIT 20";
+
+    let serial = run_with_parallel_scan(None, &path, sql);
+    // Hold every in-flight token while the env switch is held under
+    // the shared env lock: the parallel request must fall back to the
+    // serial fold instead of oversubscribing (the token pool is also
+    // process-wide, so the exhausted span must not overlap other
+    // parallel tests).
+    let _guard = BATCH_SCAN_ENV_LOCK.lock().unwrap();
+    std::env::set_var("APEX_PARALLEL_SCAN", "4");
+    let _exhausted = crate::query::executor::exhaust_parallel_tokens_for_test();
+    let parallel = ApexExecutor::execute(sql, &path)
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+    std::env::remove_var("APEX_PARALLEL_SCAN");
+    assert_batches_logically_equal(&serial, &parallel, sql);
+}
+
+#[test]
+fn parallel_batch_scan_single_morsel_stays_serial() {
+    // 3000 narrow rows fit in one row group (default 65536): a single
+    // morsel has nothing to parallelize.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("parallel_single_rg.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    let rows: usize = 3000;
+    storage
+        .insert_typed(
+            HashMap::from([
+                ("code".to_string(), (0..rows).map(|i| (i % 5) as i64).collect()),
+                ("amount".to_string(), (0..rows).map(|i| (i % 50) as i64).collect()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save().unwrap();
+
+    let sql = "SELECT code, COUNT(*) AS n, SUM(amount) AS s          FROM default WHERE amount >= 10          GROUP BY code ORDER BY n DESC, code";
+    let serial = run_with_parallel_scan(None, &path, sql);
+    let parallel = run_with_parallel_scan(Some(4), &path, sql);
+    assert_batches_logically_equal(&serial, &parallel, sql);
+}
+
+#[test]
+fn parallel_batch_scan_falls_back_with_delta_state() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("parallel_delta.apex");
+    create_batch_scan_fixture(&path);
+    let backend = TableStorageBackend::open(&path).unwrap();
+    backend
+        .insert_rows_to_delta(&[HashMap::from([
+            ("city".to_string(), Value::String("city3".to_string())),
+            ("code".to_string(), Value::Int64(3)),
+            ("flag".to_string(), Value::Bool(true)),
+            ("score".to_string(), Value::Float64(25.5)),
+            ("amount".to_string(), Value::Int64(10)),
+            ("pad".to_string(), Value::String("d".repeat(110))),
+        ])])
+        .unwrap();
+    drop(backend);
+    invalidate_storage_cache(&path);
+
+    let sql = "SELECT city, code, COUNT(*) AS n, AVG(score) AS av, MIN(score) AS mn, MAX(score) AS mx, SUM(score) AS s          FROM default WHERE score >= 20 AND score <= 40 AND code IN (1, 3, 5)          GROUP BY city, code HAVING COUNT(*) > 2 ORDER BY av DESC, city, code LIMIT 20";
+    let serial = run_with_parallel_scan(None, &path, sql);
+    let parallel = run_with_parallel_scan(Some(4), &path, sql);
+    assert_batches_logically_equal(&serial, &parallel, sql);
+}
+
+#[test]
+fn parallel_batch_scan_honors_cancellation_token() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("parallel_cancel.apex");
+    create_batch_scan_fixture(&path);
+    let sql = "SELECT city, code, COUNT(*) AS n          FROM default WHERE score >= 20          GROUP BY city, code ORDER BY n DESC, city, code";
+
+    // Pre-set token: the collect loop aborts at the first batch boundary.
+    with_parallel_scan(Some(2), || {
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        crate::query::executor::set_query_cancel_token(Some(std::sync::Arc::clone(&token)));
+        let outcome = ApexExecutor::execute(sql, &path);
+        crate::query::executor::set_query_cancel_token(None);
+        let err = match outcome {
+            Err(err) => err,
+            Ok(_) => panic!("cancellation must surface from the parallel collect"),
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    });
+
+    // Cleared token: the parallel fold completes and matches serial.
+    let parallel = run_with_parallel_scan(Some(2), &path, sql);
+    let serial = run_with_parallel_scan(None, &path, sql);
+    assert_batches_logically_equal(&serial, &parallel, sql);
 }
 
 #[test]
@@ -3499,7 +3660,11 @@ fn explain_analyze_reports_batched_scan_pipeline_path() {
         let Some(rest) = actual.strip_prefix("batched_scan_pipeline(batches=") else {
             panic!("expected the batched scan pipeline path, got: {actual}");
         };
-        let batches: u64 = rest.trim_end_matches(')').parse().unwrap();
+        // R5.7 may append the opt-in parallel suffix to the detail
+        // (`(batches=N, parallel=T)`); the batch count is the first
+        // field in either format.
+        let batches_field = rest.split(',').next().unwrap_or(rest);
+        let batches: u64 = batches_field.trim_end_matches(')').parse().unwrap();
         assert!(
             batches >= 2,
             "the multi-row-group fixture must consume multiple batches: {actual}"
