@@ -520,9 +520,10 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 
 状态：R5.1（EXPLAIN ANALYZE 报告实际物理路径）、R5.2（CBO 驱动物理访问
 与规划/执行分歧报告）、R5.3（成本校准：时间维度，§14.7）、R5.4
-（morsel 并行评估：设计/评估文档，不改代码，§14.8）与 R5.5（JOIN 与
-CTE 路径标签，§14.9）完成；§14.5 余项仅剩规划器候选携带可直接执行的
-键/范围/残余谓词与物化信息（全路由 plan 驱动）。
+（morsel 并行评估：设计/评估文档，不改代码，§14.8）、R5.5（JOIN 与
+CTE 路径标签，§14.9）与 R5.6（规划器候选携带可直接执行的索引物化
+信息，全路由 plan 驱动，§14.10）完成；§14.5 余项为成本校准状态驻留
+内存（余项 2）与 morsel 并行 A 期实现（余项 3）。
 
 ### 14.1 交付物
 
@@ -634,12 +635,11 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
 
 ### 14.5 残余与后续（R5 余项）
 
-1. **CBO 驱动物理访问**（索引路由对齐已完成，见 §14.6）：索引路由
-   现由规划器选定的策略直接驱动，规划/执行分歧由 EXPLAIN ANALYZE
-   报告。余项：规划器索引候选目前只携带列 + 查找类型，尚未携带可
-   直接执行的键/范围/残余谓词与物化信息；shape 快路径仍在 CBO 之前
-   执行（优先级语义不变），全路由 plan 驱动待成本校准（余项 2）后
-   再推进。
+1. **CBO 驱动物理访问**（已完成，见 §14.6/§14.10）：索引路由由规划器
+   选定的策略直接驱动，规划器索引候选携带规划期物化的
+   `IndexExecutionSpec`（键/范围/残余谓词与 covering/skip 决策，
+   执行期复核索引状态），规划/执行分歧由 EXPLAIN ANALYZE 报告。
+   shape 快路径仍在 CBO 之前执行（优先级语义不变，属设计保留）。
 2. **成本校准**（时间维度已完成，见 §14.7）：`estimated_cost` 与实测
    （Actual Time / Actual Path）闭环校准已落地——EXPLAIN ANALYZE 按
    （表, 查询形状）记录实际执行的成本类（scan/index）的模型成本与
@@ -966,3 +966,109 @@ scatter-gather（O(log)/行 + 随机取行），并行化会放大随机 IO 与�
    若未来调整内联策略，标签语义需同步更新。
 3. 客户端表名校验为 best-effort（函数既有定位），EXPLAIN 前缀跳过
    仅影响 `EXPLAIN [ANALYZE] WITH ...` 语句，其余校验行为不变。
+
+### 14.10 R5.6：规划器候选携带可直接执行的索引物化信息（全路由 plan 驱动）
+
+#### 14.10.1 交付物
+
+1. **索引候选携带 `IndexExecutionSpec`**（`query/planner.rs`）：
+   `PlanCandidate` / `QueryPlan` 新增 `execution: Option<IndexExecutionSpec>`
+   字段；5 族索引候选（union / equality / range / intersection / composite）
+   在规划期一次性物化并携带同一 spec，扫描候选与 `fixed()` 策略不带
+   spec。spec 内容：
+   - `predicates`：AND 扁平化提取的 (列, PredicateHint) 谓词；
+   - `disjunction`：WHERE 含 OR 时为完整 WHERE 表达式；
+   - `residual`：完整 WHERE（取回后残余过滤）；
+   - `try_covering_scan` / `skip_residual_filter`：镜像执行器现有
+     判据（完全可索引 ∧ 无复合/复合全等）在规划期索引状态上的
+     求值结果——两个独立布尔值，因执行器判据在无复合索引时
+     cfe 恒为 false（covering 允许、skip 不允许），单布尔会改变
+     常见路径行为；
+   - `composite_columns`：covering 决策所依据的复合索引列（None
+     表示决策未依赖复合索引），供执行期状态复核。
+2. **执行器消费 spec 而非重推 WHERE**（`executor/index_access.rs`）：
+   `try_index_accelerated_read` 新增 `spec: Option<&IndexExecutionSpec>`
+   参数（唯一调用点 `select.rs` CBO 块传入 `cbo_plan.execution`）。
+   有 spec 时：谓词取 spec.predicates、OR 判定取 spec.disjunction、
+   残余过滤用 spec.residual；无 spec 时保持原提取逻辑（兼容直接
+   调用与测试）。4 个纯谓词助手（`extract_index_predicates` /
+   `expr_to_value` / `contains_disjunction` /
+   `is_fully_indexable_predicate`）移入 `QueryPlanner` 公开
+   关联函数（planner 物化与 executor 复核共用同一实现）。
+3. **spec 新鲜度复核**（执行期）：covering/skip 两个布尔来自规划期
+   索引状态；执行前复核 spec 谓词列的索引支持与 spec 复合索引的
+   存在性——索引 DDL 与规划竞争（stale spec）时回退到按实时索引
+   状态重算的判据（与无 spec 行为完全一致），不会信任过期的
+   covering/skip 决策。
+4. **EXPLAIN 展示**（`executor/ddl.rs`）：`Chosen Plan` 块在
+   `Feedback:` 之后输出 `Index Spec: preds=[col=Hint] composite=..
+   covering_scan=.. skip_residual_filter=..`（仅索引路由）。
+5. **门禁覆盖面扩展**（§1.3）：canary 新增 4 项索引指标
+   （稀有等值 / 偏斜等值 / BETWEEN 范围 / covering 投影，idxcan
+   表：tag 偏斜字符串 50% "heavy" + 7 个尾部值、amount 低基数
+   整数，tag Hash 索引 + amount BTree 索引 + ANALYZE；canary
+   200K 行，full 模式 idx 阶段 1M 行）；`bench_perf_canary.py`
+   新增 `--index-only` 剖面；`run_local_perf_guard.py` 完整模式
+   新增 idx 阶段（1M 行 base/current 交错比较，与 qps 阶段同构）。
+
+#### 14.10.2 实现明细
+
+| 文件 | 变更 |
+| --- | --- |
+| `apexbase/src/query/planner.rs` | `IndexExecutionSpec`（Debug+Clone）+ `PlanCandidate.execution` / `QueryPlan.execution`；`QueryPlanner::build_index_execution_spec`（谓词提取、与执行器同式复合索引选择、covering/skip 镜像求值）；4 个谓词助手移入并改为 pub；5 族索引候选携带 spec；反馈重选块同步 `plan.execution` |
+| `apexbase/src/query/executor/index_access.rs` | `try_index_accelerated_read` 增加 spec 参数；谓词/OR/残余过滤改由 spec 供给（无 spec 走原逻辑）；spec 新鲜度复核 + covering/skip 决策；删除 4 个已移动的助手函数 |
+| `apexbase/src/query/executor/select.rs` | CBO 块三元组携带 `plan_index_spec`，传入索引路由 |
+| `apexbase/src/query/executor/ddl.rs` | EXPLAIN `Index Spec:` 行 |
+| `benchmarks/bench_vs_sqlite_duckdb.py` | `ApexBaseBench.setup_index_canary` + 4 个 `bench_index_*` 方法（不进公开 103 项表格） |
+| `benchmarks/bench_perf_canary.py` | CANARY_SPECS 尾部追加 4 项索引指标 + setup hook + `--index-only` 剖面 |
+| `benchmarks/run_local_perf_guard.py` | `benchmark_arguments(index_only=...)` + full 模式 idx 阶段（1M 行） |
+
+#### 14.10.3 测试覆盖（Rust + Python 两侧）
+
+- Rust（3 项新增，`executor/tests.rs`）：
+  - `index_execution_spec_materializes_at_planning`：等值形状 spec
+    携带提取谓词（city=Eq(heavy)）、无 disjunction、无复合时
+    covering 允许而 skip 不允许；OR 形状 spec 携带 disjunction
+    且谓词为空（提取不降入 OR）；低 NDV 表计划选扫描、plan 不带
+    spec。
+  - `index_execution_spec_matches_legacy_execution`：6 形状
+    （稀有等值 / 偏斜等值 / BTree 范围 / 纯 OR / 混合 disjunction
+    （括号 OR + 范围交集）/ covering 投影）直接调用
+    `try_index_accelerated_read`，spec 驱动 vs 无 spec（legacy）
+    逐一对比——结果形状与 RecordBatch 内容完全一致。
+  - `stale_index_execution_spec_falls_back_to_scan`：规划后
+    DROP INDEX——stale spec 下索引路由回退扫描（Ok(None)），
+    不信任规划期状态、不 panic。
+- Python（1 项新增，10K 偏斜 fixture）：
+  `test_explain_analyze_reports_index_spec`——EXPLAIN ANALYZE
+  偏斜值 `city = 'heavy'` 计划选索引且输出唯一 `Index Spec:`
+  行（city= / Eq / covering_scan=true / skip_residual_filter=false，
+  执行侧 MCV 回退扫描，`Plan Divergence` 行保留）；稀有值
+  `city = 't1'` 同形状且实际路径为 `index_accelerated_read`。
+- 门禁：canary 4 项索引指标 + full 模式 idx 阶段（见 14.10.1-5）。
+
+#### 14.10.4 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功；同口径 `cargo build --release` 194 条 lib 警告 / 111 建议，较 R5.2–R5.5 基线（195/112）少 1 条——移除执行器中一处既有 unused import（`BinaryOperator` 本地 use，随助手函数移出后不再使用），无新增警告（HEAD/工作区双侧同口径构建列表 diff 确认）；门禁自身构建口径（含 server/flight 特性）base 201/116 → current 197/113，current 同样无新增警告 |
+| pytest（完整串行） | 1764 passed（既有 1763 + 新增 1），27.7s |
+| cargo test（完整） | 542 lib + 6 doc passed（lib 含 3 项新增），约 5.5 分钟 |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103 项全部执行；中位比值 current/基线 = 0.944（vs `benchmarks/latest_public_baseline.json`，492956b）；2 项 ≥+15%：COUNT WHERE category 0.2509/0.3854 ms（+53.6%）、FTS Index Build (name,city,category) 1.6919/2.3739 ms（+40.3%），均经同状态交错 A/B（n=240/侧，8 窗，共享 1M 数据集）推翻：base 0.2365/0.4792 vs current 0.2454/0.4702 ms（+3.76% / -1.89%）。两形状均不经 R5.6 改动路径（无索引列的 COUNT 走普通扫描路由不取索引 spec；FTS 构建路径不变；spec 只影响索引路由）。原始 JSON 存 `benchmarks/public_bench_current.json`，A/B 证据 `local-perf-results/20260909-r56-public-ab/`（含 README + 逐项原始 JSON） |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时） | 20260909-100014 exit 0：60 项全部通过（初判 3 样本 1 项 flag，Numeric GROUP BY (5 funcs) +32.78%；5 样本终判 0.920 -> 0.873 ms（-5.19%）低于阈值——属已登记的亚毫秒波动聚合族，路径不经 R5.6 改动）；4 项新增索引指标全绿（-1.50% / -0.91% / -1.09% / -0.61%）。证据 `local-perf-results/20260909-100014/`（含 README + 逐项原始 JSON） |
+| 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a，含 idx 阶段） | 20260909-101929 exit 0：109 项表格 + 2 项 Q/s + 8 项量化 + 4 项 idx，四段比较全部通过，退出码 0（三样本初判直接通过，无需五样本扩展；idx 段 covering -0.15% / 稀有等值 +2.67% / 偏斜等值 +2.50% / 范围 +0.66%）。证据 `local-perf-results/20260909-101929/`（含 README + 逐项原始 JSON） |
+
+#### 14.10.5 残余风险
+
+1. **OR 候选携带空谓词为设计行为**：提取不降入 OR，纯 OR 形状
+   执行器在空谓词处早退（与 legacy 一致），union 索引路由实际只在
+   `（… OR …）AND 索引谓词` 形状经 `lookup_index_expression`
+   可达；planner 的 analyze_where 不识别 Paren，括号 OR 的
+   选择性估计走默认值——两者均为既有行为，R5.6 不改变。
+2. **covering 决策按规划期索引状态镜像**：执行器复核保证 stale
+   spec 回退（与无 spec 行为一致），但复核粒度为"spec 谓词列的
+   索引支持 + spec 复合索引存在性"，若未来索引 DDL 语义扩展
+   （如部分索引）需同步更新复核条件。
+3. **spec 与候选一一对应而非按候选差异化**：同一 WHERE 下 5 族
+   候选共享同一 spec（物化只依赖 WHERE 与索引状态，与候选成本
+   无关）；若未来出现候选级物化差异（如按候选裁剪谓词）需细化。
