@@ -521,9 +521,10 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 状态：R5.1（EXPLAIN ANALYZE 报告实际物理路径）、R5.2（CBO 驱动物理访问
 与规划/执行分歧报告）、R5.3（成本校准：时间维度，§14.7）、R5.4
 （morsel 并行评估：设计/评估文档，不改代码，§14.8）、R5.5（JOIN 与
-CTE 路径标签，§14.9）与 R5.6（规划器候选携带可直接执行的索引物化
-信息，全路由 plan 驱动，§14.10）完成；§14.5 余项为成本校准状态驻留
-内存（余项 2）与 morsel 并行 A 期实现（余项 3）。
+CTE 路径标签，§14.9）、R5.6（规划器候选携带可直接执行的索引物化
+信息，全路由 plan 驱动，§14.10）与 R5.7（morsel 并行 A 期：opt-in
+并行批量折叠，§14.11）完成；§14.5 余项为成本校准状态驻留内存（余项
+ 2）与 morsel 并行 B 期成本自动启用（余项 3）。
 
 ### 14.1 交付物
 
@@ -647,12 +648,12 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
    余项：校准状态驻留内存（`PLAN_FEEDBACK`），进程重启即丢失，不
    跨会话持久化；无样本的候选类保持模型成本量级（短暂混合量级
    窗口，见 §14.7.4）。
-3. **morsel 并行评估**（评估已完成，见 §14.8；不改代码）：R3 已限定
-   串行分批（内存与正确性前提）。评估结论：并行只对扫描/聚合类形状
-   成立（索引类为 scatter-gather，无并行收益），默认不启用；分两期
-   ——A 期 opt-in（env/客户端参数 + 全局在飞 worker 预算），B 期
-   成本自动启用（依赖 R5.3 时间校准 + 超订阅争抢矩阵 + 并行加速曲
-   线证据）。余项：A 期实现、加速曲线与争抢矩阵实测未开始。
+3. **morsel 并行**（A 期已完成，见 §14.8/§14.11）：`APEX_PARALLEL_SCAN=N`
+   opt-in（0=关为默认）+ 进程级在飞 worker 预算（min(hw-1, 4)）+ 每
+   查询专属 scoped 线程池（不共享 rayon 全局池）；并行化批量管道的
+   聚合阶段（每 morsel 部分状态 + 块序确定性合并），默认行为零变化。
+   余项：B 期成本自动启用（依赖并发争抢矩阵 + 并行扫描独立成本类
+   记录）；并行段目前仅覆盖聚合阶段，扫描/物化段仍串行（§14.11.5-1）。
 4. **JOIN 路径标签**（已完成，见 §14.9）：`execute_select_with_joins`
    的 4 条快路径与通用 hash join、CTE 的递归/内联/物化三条路由均有
    路由标签，其 EXPLAIN ANALYZE 输出 `Actual Path` 行；并入余项 1
@@ -1072,3 +1073,106 @@ scatter-gather（O(log)/行 + 随机取行），并行化会放大随机 IO 与�
 3. **spec 与候选一一对应而非按候选差异化**：同一 WHERE 下 5 族
    候选共享同一 spec（物化只依赖 WHERE 与索引状态，与候选成本
    无关）；若未来出现候选级物化差异（如按候选裁剪谓词）需细化。
+
+### 14.11 R5.7：morsel 并行 A 期（opt-in 并行批量折叠）
+
+#### 14.11.1 交付物
+
+1. **批量管道并行折叠**（`executor/batch_group.rs`）：
+   `APEX_PARALLEL_SCAN=N`（N≥2；未设置/0/1/非法值 = 关，与
+   `APEX_BATCH_SCAN` 同诊断风格）下，批量 GROUP BY 管道先收集投影
+   morsel（仅分组键 + 单一聚合源列，窄投影），每个 worker 折叠一个
+   连续 morsel 块为独立部分聚合状态（复用既有增量分组内核），按块
+   顺序确定性合并（键值经合并 lane 重新 interning；NULL 组、
+   min/max、计数、整型和均保持逐值一致；float 和按块序累加，
+   确定性）。单 morsel、token 不足、任一 chunk 越出门控（列类型/
+   缺失）或取消时回退串行折叠，结果与串行逐批完全一致。
+2. **全局在飞 worker 预算**（§14.8.3）：进程级 token 池
+   `PARALLEL_SCAN_TOKENS`（惰性，首次并行请求才初始化），容量
+   `min(hardware_concurrency - 1, 4)`；每查询取
+   `min(请求数, 可用数)`，不足 2 即退串行；RAII guard 在所有退出
+   路径归还（超订阅下有界）。
+3. **每查询专属 scoped 线程池**（§14.8.3）：rayon 专属池
+   （线程数 = 取到的 token 数）`install` 作用域内完成折叠，查询
+   结束即 drop/join——不维持常驻池、不泄漏后台线程，且不共享
+   rayon 全局池（向量 TopK 内核独占全局池，避免互相抢占配额）。
+4. **EXPLAIN 诊断**：索引无关路由标签保持 `batched_scan_pipeline`，
+   细节串并行时输出 `(batches=N, parallel=T)`。
+5. **门禁覆盖面扩展**（§1.3）：canary 新增 2 项并行指标（2/4
+   线程，200K 行）；完整模式新增 par 阶段（1M 行，2/4/8 线程，
+   `--parallel-only` 剖面，与 qps/idx 阶段同构）；并行指标与串行
+   批量指标同表可对照，构成加速曲线证据。
+
+#### 14.11.2 实现明细
+
+| 文件 | 变更 |
+| --- | --- |
+| `apexbase/src/query/executor/batch_group.rs` | `BatchKeyValue`（lane 值解码/再 interning）；`BatchKeyLane::value_at` / `intern_value`；`BatchGroupState::merge_from`；`BatchGroupAggregator::intern_lane_value` / `lane_for_value`；`PARALLEL_SCAN_TOKENS`（OnceLock 惰性）+ `try_acquire_parallel_tokens` + `ParallelTokenGuard`（RAII）；`parallel_scan_requested`（env 解析）；`serial_fold_batches`（收集后的串行折叠，token 不足/单 morsel 回退）；`parallel_batch_group_fold`（每块部分折叠 + 块序合并）；`try_batch_group_pipeline` 并行分支与路径细节 |
+| `apexbase/src/query/executor/tests.rs` | 5 项新增测试（见 14.11.3）；`APEX_BATCH_SCAN` / `APEX_PARALLEL_SCAN` 两组开关共用同一把 env 锁（两者均为进程级状态，路径细节与管道选择同时依赖两个开关，独立锁下并发互扰曾使 EXPLAIN 细节解析非确定失败）；token 耗尽测试的耗尽窗口纳入同一把锁；EXPLAIN 细节解析容错 `(batches=N, parallel=T)` 后缀 |
+| `test/test_batch_scan_pipeline.py` | 4 项新增测试（见 14.11.3） |
+| `benchmarks/bench_vs_sqlite_duckdb.py` | `bench_parallel_batch_scan_t2/t4/t8`（同一批量形状，进程内 env 开关，不进公开 103 项表格） |
+| `benchmarks/bench_perf_canary.py` | CANARY_SPECS 尾部追加 2/4 线程 2 项 + `PARALLEL_ONLY_SPECS`（2/4/8）+ setup hook + `--parallel-only` 剖面（剖面自装载基础表：独立运行时无 Bulk Insert 前置，批次管道 setup 需要已持久化的 default 表） |
+| `benchmarks/run_local_perf_guard.py` | `benchmark_arguments(parallel_only=...)` + full 模式 par 阶段（1M 行） |
+| `docs/RESOURCE_OWNERSHIP.md` | `PARALLEL_SCAN_TOKENS` 登记 |
+
+#### 14.11.3 测试覆盖（Rust + Python 两侧）
+
+- Rust（5 项新增，`executor/tests.rs`）：
+  - `parallel_batch_scan_matches_serial_pipeline`：8 形状（复用
+    串行 parity 形状，值可精确表示）× 2/4 线程 vs 串行，逐值
+    （含 bit 级 float）一致。
+  - `parallel_batch_scan_falls_back_when_tokens_exhausted`：耗尽
+    全部 token 后并行请求退串行，结果一致。
+  - `parallel_batch_scan_single_morsel_stays_serial`：单行组表在
+    N=4 下保持串行语义。
+  - `parallel_batch_scan_falls_back_with_delta_state`：delta 状态
+    下批量管道整体回退（并行 env 不影响）。
+  - `parallel_batch_scan_honors_cancellation_token`：取消 token 在
+    收集边界以 Interrupted 上报；清除后并行折叠与串行一致。
+- Python（4 项新增，`test/test_batch_scan_pipeline.py`）：
+  - `test_parallel_batch_scan_matches_serial_pipeline`：200K 行
+    （2+ 行组）7 形状 × 2/4 线程 vs 串行进程内 env A/B。
+  - `test_parallel_batch_scan_falls_back_with_delta_state`：delta
+    状态 + 并行 env 的 parity。
+  - `test_parallel_batch_scan_keeps_peak_rss_bounded_by_threads`：
+    1.2M 行子进程 RSS 上界——并行峰值 ≤ 线程数 × 0.85 × 单批峰值
+    （§14.8.4 内存界，线程数参数化）。
+  - `test_canary_parallel_only_profile_loads_base_table`：子进程跑
+    `--parallel-only` 剖面（200K 行），验证独立运行端到端完成且
+    恰好产出 3 项并行指标（回归 §14.11.2 的剖面自装载修复）。
+- 门禁：canary 2/4 线程 + full par 阶段 2/4/8 线程（见 14.11.1-5）。
+- Rust 测试隔离：两个 env 开关的切换（含 token 池耗尽窗口）统一
+  串行化，消除跨测试 env 互扰（详见 14.11.2 tests.rs 行）。
+
+#### 14.11.4 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功；同口径 `cargo build --release` 194 条 lib 警告 / 111 建议，与 R5.6 完全一致，无新增警告（maturin 特性口径 197/113 亦与 R5.6 一致） |
+| pytest（完整串行） | 1768 passed（既有 1764 + 新增 4），29.1s |
+| cargo test（完整） | 547 lib + 6 doc passed（lib 含 5 项新增） |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103/103 项执行；与基线 492956b 中位数比 0.9938（R5.6 为 0.944）；9 项 ≥+15%（GROUP BY city (10 groups) +101.7%、GROUP BY + HAVING +140.5%、UNION ALL (ordered) +430.6% 等），逐项 A/B 交错复核（8 窗口 × 30 次，每侧 240 样本，canary 口径 200K / public 口径 1M 同数据）全部落在 ±4% 内（最大 +3.75%），判定为当日机器持续负载噪声；R5.7 默认路径（env 未设置）零行为变化，同形状在 R5.5/R5.6 亦出现过同类假旗。结果存 benchmarks/public_bench_current.json，A/B 明细 local-perf-results/20260909-r57-ab/ |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时，62 项含 2 项新增并行指标） | 首轮 20260909-162435 退出 1：五样本终判 2 项（Two-key GROUP BY (5 funcs) +46.18%、Derived ratio GROUP BY +22.10%，当日高负载窗口）；交错 A/B 复核该 2 项为 +0.72% / +3.75%（200K 同口径）予以证伪；重跑 20260909-165533 退出 0：62/62 项 ok（初判 3 样本即无 flag），该 2 项为 -8.22% / +9.89%，2 项新增并行指标 +4.79%（2 线程）/ -5.28%（4 线程）。两轮原始报告均保留 |
+| 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a，含 par 阶段） | 四轮：170954（perf 终判 2 项 + par 阶段剖面缺陷——`--parallel-only` 独立运行缺 default 表崩溃，修复并加回归测试）→ 192200（perf 终判 4 项，qps/quant/idx/par 全过）→ 211847（perf 终判 4 项）→ 231240 **退出 0**：perf 109/109（初判 1 项 JSON Read + Filter +24.08% 经五样本终判消解）、qps 10/10、量化 8/8、idx 4/4、par 3/3。四轮全部不同 flag（JSON Read + Filter / NOT filter / INTERSECT (ordered) / Persistent VIEW select / UNION ALL (ordered) / EXISTS subquery COUNT / IN subquery COUNT，共 7 项，均为亚 3ms 集合/扫描/子查询/视图形状，无一在 R5.7 路径上）逐项 A/B 交错复核（每侧 240 样本）全部落在 +6.3% 内（+6.26% / +4.83% / -5.81% / -7.16% / +0.04% / -1.82% / -3.34%），判定为当日机器负载噪声（load ~5-8、各轮 flag 集合互不重合、R1/R3 同形状先例）；末轮于负载回落至 ~2-5 后执行。par 阶段四轮并行 ≈ 串行（末轮 +0.36% / -1.25% / -6.49%），见 14.11.5-1 的 Amdahl 限制。四轮原始报告与 A/B 全部保留（20260909-170954 / 192200 / 211847 / 231240、r57{,b,c,d}-full-ab） |
+
+#### 14.11.5 残余风险
+
+1. **并行段仅覆盖聚合（consume）阶段**：Phase A 不触及存储层，
+   扫描/物化（mmap 谓词求值 + 行组读取）仍串行，端到端加速受
+   Amdahl 串行段限制；par 段（2/4/8 线程）实测数据即加速曲线
+   证据，若表明 consume 段并行收益不足，B 期需以存储层并行扫描
+   为前提（§14.8.5 B 期门槛不变）。
+2. **float 和的不可结合性**：合并按块序累加部分和（确定性），
+   非精确可表示值下可能与串行逐行折叠在最后 ulp 相异；parity
+   测试用可精确表示值保持 bit 级一致，int 和因结合性恒一致。
+3. **每查询专属线程池的建池开销**：与一次并行扫描的量级相当
+   （毫秒级下为常数开销）；专属池与全局池（向量内核）互不共享
+   是本设计约束（§14.8.3-3），未来常驻预算池需 B 期争抢矩阵
+   证据。
+4. **无 ORDER BY 的 GROUP BY 行序为哈希序（既有行为）**：并行
+   合并重新 interning 键，键编码与串行不同，但未排序 GROUP BY
+   的行序本就逐运行非确定（ahash 随机种子）；结果集合（组 +
+   值）确定且与串行一致。
+5. **进程级 env 开关**：`APEX_PARALLEL_SCAN` 与 `APEX_BATCH_SCAN`
+   同为进程级诊断开关，同进程多客户端共享；按查询隔离需按
+   子进程控制（门禁 A/B 即此方式）。
