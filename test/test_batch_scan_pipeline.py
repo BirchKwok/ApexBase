@@ -255,3 +255,172 @@ def test_batch_scan_keeps_peak_rss_bounded():
         f"batched peak {batch_peak:.1f} MB is not below 85% of the "
         f"single-batch peak {single_peak:.1f} MB"
     )
+
+
+# ---------------------------------------------------------------------------
+# R5.7: parallel (morsel) fold of the batch pipeline, opt-in via
+# APEX_PARALLEL_SCAN=N (read per query, like APEX_BATCH_SCAN).
+# ---------------------------------------------------------------------------
+
+
+def _run_parallel(client, sql, threads):
+    os.environ["APEX_PARALLEL_SCAN"] = str(threads)
+    try:
+        return _run(client, sql)
+    finally:
+        os.environ.pop("APEX_PARALLEL_SCAN", None)
+
+
+def test_parallel_batch_scan_matches_serial_pipeline():
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        _seed(client)
+        try:
+            for sql in QUERIES:
+                os.environ["APEX_BATCH_SCAN"] = "1"
+                try:
+                    serial = _run(client, sql)
+                finally:
+                    os.environ.pop("APEX_BATCH_SCAN", None)
+                for threads in (2, 4):
+                    parallel = _run_parallel(client, sql, threads)
+                    assert parallel == serial, (
+                        f"parallel({threads})/serial results diverge:\n{sql}\n"
+                        f"serial   ={str(serial[:3])}\nparallel={str(parallel[:3])}"
+                    )
+        finally:
+            client.close()
+
+
+def test_parallel_batch_scan_falls_back_with_delta_state():
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        _seed(client)
+        try:
+            client.execute("BEGIN")
+            client.execute(
+                "INSERT INTO perf_scan (city, code, amount, score, flag) "
+                "VALUES ('city3', 3, 10, 25.5, true)"
+            )
+            client.execute("COMMIT")
+            sql = QUERIES[1]
+            os.environ["APEX_BATCH_SCAN"] = "1"
+            try:
+                serial = _run(client, sql)
+            finally:
+                os.environ.pop("APEX_BATCH_SCAN", None)
+            parallel = _run_parallel(client, sql, 4)
+            assert parallel == serial, "delta state must fall back and keep parity"
+        finally:
+            client.close()
+
+
+_CHILD_PARALLEL_MEASURE = r"""
+import json
+import os
+import resource
+import sys
+
+from apexbase import ApexClient
+
+
+def peak_rss_mb():
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return usage / (1024 * 1024)
+    return usage / 1024
+
+
+def main():
+    dirpath = sys.argv[1]
+    threads = int(sys.argv[2])
+    client = ApexClient(dirpath, enable_cache=False)
+    client.use_table("perf_scan")
+    sql = (
+        "SELECT city, code, COUNT(*) AS n, SUM(value) AS s "
+        "FROM perf_scan WHERE value >= 0 "
+        "GROUP BY city, code HAVING COUNT(*) > 1000 "
+        "ORDER BY n DESC, city, code LIMIT 5"
+    )
+    if threads > 1:
+        os.environ["APEX_PARALLEL_SCAN"] = str(threads)
+    for _ in range(3):
+        client.execute(sql).to_dict()
+    client.close()
+    print(json.dumps({"peak_rss_mb": peak_rss_mb()}))
+
+
+main()
+"""
+
+
+def _child_parallel_peak_rss_mb(dirpath, threads):
+    env = dict(os.environ)
+    env["APEX_BATCH_SCAN"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", _CHILD_PARALLEL_MEASURE, str(dirpath), str(threads)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    return payload["peak_rss_mb"]
+
+
+def test_parallel_batch_scan_keeps_peak_rss_bounded_by_threads():
+    # The parallel fold buffers the narrow projected columns plus one
+    # partial group map per thread; the peak must stay within the
+    # thread-scaled bound relative to the single-batch materialization
+    # (architecture review §14.8.4).
+    with tempfile.TemporaryDirectory() as tmp:
+        _seed_memory_table(tmp, 1_200_000)
+        single_peak = _child_peak_rss_mb(tmp, False)
+        for threads in (2, 4):
+            parallel_peak = _child_parallel_peak_rss_mb(tmp, threads)
+            assert parallel_peak < single_peak * 0.85 * threads, (
+                f"parallel peak {parallel_peak:.1f} MB exceeds the "
+                f"{threads}-thread bound of the single-batch peak "
+                f"{single_peak:.1f} MB"
+            )
+
+
+def test_canary_parallel_only_profile_loads_base_table():
+    # The standalone --parallel-only profile (used by the full-mode par
+    # phase of the local perf guard) skips the Bulk Insert spec, so the
+    # profile must load the persisted base table by itself before the
+    # batch pipeline setup copies it (architecture review R5.7).
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "par-only.json")
+        script = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "benchmarks",
+            "bench_perf_canary.py",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                script,
+                "--parallel-only",
+                "--rows",
+                "200000",
+                "--warmup",
+                "1",
+                "--iterations",
+                "2",
+                "--output",
+                out,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert completed.returncode == 0, completed.stderr
+        results = json.loads(open(out, encoding="utf-8").read())["results"]
+        names = [r["query"] for r in results]
+        assert names == [
+            "Parallel batch scan (2 threads)",
+            "Parallel batch scan (4 threads)",
+            "Parallel batch scan (8 threads)",
+        ]
