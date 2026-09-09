@@ -1049,6 +1049,7 @@ const TABLE_FILE_SUFFIXES: &[&str] = &[
     ".delta.meta",
     ".deltastore",
     ".deltastore.tmp",
+    ".plan_feedback",
 ];
 
 /// (mtime nanos, len) fingerprint captured when a table file is queued for
@@ -1294,10 +1295,12 @@ mod tests {
         let table = dir.join("t.apex");
         fs::write(&table, b"payload").unwrap();
         fs::write(dir.join("t.apex.delta"), b"delta").unwrap();
+        fs::write(dir.join("t.apex.plan_feedback"), b"feedback").unwrap();
         queue_file_deletions(std::slice::from_ref(&table));
         reap_table_files(&table);
         assert!(!table.exists());
         assert!(!dir.join("t.apex.delta").exists());
+        assert!(!dir.join("t.apex.plan_feedback").exists());
         assert!(!PENDING_DELETIONS.contains_key(&table));
         let _ = fs::remove_dir_all(&dir);
     }

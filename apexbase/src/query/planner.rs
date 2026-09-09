@@ -105,24 +105,85 @@ static STATS_CACHE: Lazy<RwLock<HashMap<String, (TableStats, u64)>>> =
 
 const STATS_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone)]
-struct PlanFeedback {
-    strategy: ExecutionStrategy,
-    estimated_rows: f64,
-    actual_rows: f64,
-    samples: u64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PlanFeedback {
+    pub(crate) strategy: ExecutionStrategy,
+    pub(crate) estimated_rows: f64,
+    pub(crate) actual_rows: f64,
+    pub(crate) samples: u64,
     /// Running model-cost / measured-time averages per cost class, recorded
     /// for the class that actually executed (architecture review R5.3).
-    scan_cost_avg: f64,
-    scan_time_avg_us: f64,
-    scan_samples: u64,
-    index_cost_avg: f64,
-    index_time_avg_us: f64,
-    index_samples: u64,
+    pub(crate) scan_cost_avg: f64,
+    pub(crate) scan_time_avg_us: f64,
+    pub(crate) scan_samples: u64,
+    pub(crate) index_cost_avg: f64,
+    pub(crate) index_time_avg_us: f64,
+    pub(crate) index_samples: u64,
 }
 
-static PLAN_FEEDBACK: Lazy<RwLock<HashMap<u64, PlanFeedback>>> =
+/// Process-global plan feedback, keyed by table key and then by shape hash
+/// (architecture review R5.8): the per-table prefix keeps cross-session
+/// persistence in one per-table sidecar file.
+static PLAN_FEEDBACK: Lazy<RwLock<HashMap<String, HashMap<u64, PlanFeedback>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Tables whose feedback sidecar this process already attempted to load
+/// (at most once per table; a file that another process updates later
+/// becomes visible at the next process start).
+static FEEDBACK_LOADED: Lazy<RwLock<HashSet<String>>> =
+    Lazy::new(|| RwLock::new(HashSet::new()));
+
+/// Serializes the feedback persistence read-modify-write (memory update +
+/// sidecar write) across tables. The planning read path never takes it.
+static FEEDBACK_PERSIST_LOCK: Lazy<std::sync::Mutex<()>> =
+    Lazy::new(|| std::sync::Mutex::new(()));
+
+const FEEDBACK_SCHEMA_VERSION: u32 = 1;
+
+/// On-disk form of one table's plan feedback entries.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedPlanFeedback {
+    version: u32,
+    entries: Vec<(u64, PlanFeedback)>,
+}
+
+/// Per-table feedback sidecar, colocated with the table file (same
+/// placement as the `.cbo_stats` sidecar; reaped with the table via
+/// `TABLE_FILE_SUFFIXES`).
+fn feedback_sidecar_path(table_key: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.plan_feedback", table_key))
+}
+
+/// Lazily load a table's feedback sidecar into the process-global map, at
+/// most once per (process, table): the planning read path must not do
+/// per-query IO. Missing or unreadable files, and version mismatches,
+/// count as "no persisted feedback". Entries already recorded by this
+/// process win over file entries.
+fn ensure_feedback_loaded(table_key: &str) {
+    if FEEDBACK_LOADED.read().contains(table_key) {
+        return;
+    }
+    let mark_loaded = || {
+        FEEDBACK_LOADED.write().insert(table_key.to_string());
+    };
+    let data = match std::fs::read(feedback_sidecar_path(table_key)) {
+        Ok(data) => data,
+        Err(_) => return mark_loaded(),
+    };
+    let file: PersistedPlanFeedback =
+        match bincode::deserialize::<PersistedPlanFeedback>(&data) {
+        Ok(file) if file.version == FEEDBACK_SCHEMA_VERSION => file,
+        _ => return mark_loaded(),
+    };
+    if !file.entries.is_empty() {
+        let mut cache = PLAN_FEEDBACK.write();
+        let inner = cache.entry(table_key.to_string()).or_default();
+        for (key, entry) in file.entries {
+            inner.entry(key).or_insert(entry);
+        }
+    }
+    mark_loaded();
+}
 
 /// Store ANALYZE results into the stats cache
 pub fn store_table_stats(table_key: &str, mut stats: TableStats) {
@@ -199,43 +260,84 @@ pub fn record_plan_feedback(
     executed_cost: f64,
     actual_time_us: f64,
 ) {
+    ensure_feedback_loaded(table_key);
+    // The persist lock spans the memory update and the sidecar write so
+    // concurrent records cannot truncate each other's file snapshots; the
+    // planning read path never takes this lock.
+    let _persist = FEEDBACK_PERSIST_LOCK.lock().unwrap();
     let key = feedback_key(table_key, select);
-    let mut cache = PLAN_FEEDBACK.write();
-    let entry = cache.entry(key).or_insert_with(|| PlanFeedback {
-        strategy: strategy.clone(),
-        estimated_rows: 0.0,
-        actual_rows: 0.0,
-        samples: 0,
-        scan_cost_avg: 0.0,
-        scan_time_avg_us: 0.0,
-        scan_samples: 0,
-        index_cost_avg: 0.0,
-        index_time_avg_us: 0.0,
-        index_samples: 0,
-    });
-    entry.strategy = strategy.clone();
-    entry.estimated_rows = (entry.estimated_rows * entry.samples as f64 + estimated_rows)
-        / (entry.samples as f64 + 1.0);
-    entry.actual_rows =
-        (entry.actual_rows * entry.samples as f64 + actual_rows) / (entry.samples as f64 + 1.0);
-    entry.samples = entry.samples.saturating_add(1);
-    if executed_index_class {
-        entry.index_cost_avg =
-            (entry.index_cost_avg * entry.index_samples as f64 + executed_cost)
-                / (entry.index_samples as f64 + 1.0);
-        entry.index_time_avg_us =
-            (entry.index_time_avg_us * entry.index_samples as f64 + actual_time_us)
-                / (entry.index_samples as f64 + 1.0);
-        entry.index_samples = entry.index_samples.saturating_add(1);
-    } else {
-        entry.scan_cost_avg =
-            (entry.scan_cost_avg * entry.scan_samples as f64 + executed_cost)
-                / (entry.scan_samples as f64 + 1.0);
-        entry.scan_time_avg_us =
-            (entry.scan_time_avg_us * entry.scan_samples as f64 + actual_time_us)
-                / (entry.scan_samples as f64 + 1.0);
-        entry.scan_samples = entry.scan_samples.saturating_add(1);
+    let snapshot = {
+        let mut cache = PLAN_FEEDBACK.write();
+        let inner = cache.entry(table_key.to_string()).or_default();
+        let entry = inner.entry(key).or_insert_with(|| PlanFeedback {
+            strategy: strategy.clone(),
+            estimated_rows: 0.0,
+            actual_rows: 0.0,
+            samples: 0,
+            scan_cost_avg: 0.0,
+            scan_time_avg_us: 0.0,
+            scan_samples: 0,
+            index_cost_avg: 0.0,
+            index_time_avg_us: 0.0,
+            index_samples: 0,
+        });
+        entry.strategy = strategy.clone();
+        entry.estimated_rows =
+            (entry.estimated_rows * entry.samples as f64 + estimated_rows)
+                / (entry.samples as f64 + 1.0);
+        entry.actual_rows = (entry.actual_rows * entry.samples as f64 + actual_rows)
+            / (entry.samples as f64 + 1.0);
+        entry.samples = entry.samples.saturating_add(1);
+        if executed_index_class {
+            entry.index_cost_avg =
+                (entry.index_cost_avg * entry.index_samples as f64 + executed_cost)
+                    / (entry.index_samples as f64 + 1.0);
+            entry.index_time_avg_us =
+                (entry.index_time_avg_us * entry.index_samples as f64 + actual_time_us)
+                    / (entry.index_samples as f64 + 1.0);
+            entry.index_samples = entry.index_samples.saturating_add(1);
+        } else {
+            entry.scan_cost_avg =
+                (entry.scan_cost_avg * entry.scan_samples as f64 + executed_cost)
+                    / (entry.scan_samples as f64 + 1.0);
+            entry.scan_time_avg_us =
+                (entry.scan_time_avg_us * entry.scan_samples as f64 + actual_time_us)
+                    / (entry.scan_samples as f64 + 1.0);
+            entry.scan_samples = entry.scan_samples.saturating_add(1);
+        }
+        inner
+            .iter()
+            .map(|(shape, entry)| (*shape, entry.clone()))
+            .collect::<Vec<_>>()
+    };
+    if let Ok(data) = bincode::serialize(&PersistedPlanFeedback {
+        version: FEEDBACK_SCHEMA_VERSION,
+        entries: snapshot,
+    }) {
+        let _ = std::fs::write(feedback_sidecar_path(table_key), data);
     }
+}
+
+/// Test-only: forget one table's in-memory feedback and its loaded mark
+/// (simulates a process restart for that table).
+#[cfg(test)]
+pub(crate) fn feedback_reset_table_for_tests(table_key: &str) {
+    PLAN_FEEDBACK.write().remove(table_key);
+    FEEDBACK_LOADED.write().remove(table_key);
+}
+
+/// Test-only: load (once) and look up one (table, shape) feedback entry.
+#[cfg(test)]
+pub(crate) fn feedback_lookup_for_tests(
+    table_key: &str,
+    select: &SelectStatement,
+) -> Option<PlanFeedback> {
+    ensure_feedback_loaded(table_key);
+    PLAN_FEEDBACK
+        .read()
+        .get(table_key)
+        .and_then(|inner| inner.get(&feedback_key(table_key, select)))
+        .cloned()
 }
 
 fn stats_sidecar_path(table_key: &str) -> std::path::PathBuf {
@@ -820,7 +922,7 @@ impl QueryPlanner {
 // ============================================================================
 
 /// The chosen execution strategy for a query
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionStrategy {
     /// Use OLTP path: index-based lookups
     OltpIndexLookup {
@@ -847,7 +949,7 @@ pub enum ExecutionStrategy {
 }
 
 /// Type of index lookup for OLTP path
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexLookupType {
     /// Exact equality: col = value
     Equality,
@@ -1002,7 +1104,12 @@ impl QueryPlanner {
         let stats = get_table_stats(table_key);
         let mut plan = Self::plan_select_with_stats(select, index_manager, stats.as_ref(), context);
         if !plan.candidates.is_empty() {
-            if let Some(feedback) = PLAN_FEEDBACK.read().get(&feedback_key(table_key, select)) {
+            ensure_feedback_loaded(table_key);
+            let guard = PLAN_FEEDBACK.read();
+            let feedback = guard
+                .get(table_key)
+                .and_then(|inner| inner.get(&feedback_key(table_key, select)));
+            if let Some(feedback) = feedback {
                 let mut corrected = false;
                 if feedback.samples > 0 && feedback.estimated_rows > 0.0 {
                     let correction =
