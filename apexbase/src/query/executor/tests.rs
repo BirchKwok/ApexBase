@@ -4002,6 +4002,108 @@ fn time_calibration_ignores_zero_cost_samples() {
 
 
 // ============================================================================
+// R5.8: cross-session persistence of plan feedback
+// ============================================================================
+
+use crate::query::planner::{feedback_lookup_for_tests, feedback_reset_table_for_tests};
+
+fn parsed_select(sql: &str) -> crate::query::SelectStatement {
+    match SqlParser::parse(sql).unwrap() {
+        SqlStatement::Select(select) => select,
+        _ => panic!("expected SELECT"),
+    }
+}
+
+#[test]
+fn plan_feedback_persists_to_sidecar_and_reloads() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    let key = path.to_string_lossy().to_string();
+    feedback_reset_table_for_tests(&key);
+    let select = parsed_select("SELECT * FROM default WHERE city = 'heavy'");
+
+    record_plan_feedback(
+        &key,
+        &select,
+        &ExecutionStrategy::OlapAggregation,
+        100.0,
+        90.0,
+        false,
+        50.0,
+        1234.0,
+    );
+
+    // The sidecar lives next to the table file, and the entry is in memory.
+    let sidecar = dir.path().join("default.apex.plan_feedback");
+    assert!(sidecar.exists());
+    let in_memory = feedback_lookup_for_tests(&key, &select).unwrap();
+    assert_eq!(in_memory.samples, 1);
+    assert_eq!(in_memory.actual_rows, 90.0);
+    assert_eq!(in_memory.scan_time_avg_us, 1234.0);
+    assert_eq!(in_memory.scan_samples, 1);
+
+    // Simulate a process exit and restart for this table only: the entry
+    // comes back from the sidecar on the first lookup.
+    feedback_reset_table_for_tests(&key);
+    let reloaded = feedback_lookup_for_tests(&key, &select).unwrap();
+    assert_eq!(reloaded.samples, 1);
+    assert_eq!(reloaded.actual_rows, 90.0);
+    assert_eq!(reloaded.scan_time_avg_us, 1234.0);
+    assert!(matches!(reloaded.strategy, ExecutionStrategy::OlapAggregation));
+
+    // A second record in the "new" process appends to the persisted state
+    // and the file keeps the merged sliding averages.
+    record_plan_feedback(
+        &key,
+        &select,
+        &ExecutionStrategy::OlapAggregation,
+        100.0,
+        80.0,
+        false,
+        50.0,
+        1300.0,
+    );
+    feedback_reset_table_for_tests(&key);
+    let reloaded = feedback_lookup_for_tests(&key, &select).unwrap();
+    assert_eq!(reloaded.samples, 2);
+    assert!((reloaded.actual_rows - 85.0).abs() < 1e-9);
+    assert!((reloaded.scan_time_avg_us - 1267.0).abs() < 1e-9);
+}
+
+#[test]
+fn plan_feedback_ignores_unreadable_sidecar() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    let key = path.to_string_lossy().to_string();
+    feedback_reset_table_for_tests(&key);
+    std::fs::write(
+        dir.path().join("default.apex.plan_feedback"),
+        b"not a feedback file",
+    )
+    .unwrap();
+    let select = parsed_select("SELECT * FROM default WHERE city = 't1'");
+
+    // A corrupt sidecar counts as "no persisted feedback"; a subsequent
+    // record repairs the file with a valid one.
+    assert!(feedback_lookup_for_tests(&key, &select).is_none());
+    record_plan_feedback(
+        &key,
+        &select,
+        &ExecutionStrategy::OlapFullScan,
+        10.0,
+        8.0,
+        false,
+        4.0,
+        100.0,
+    );
+    feedback_reset_table_for_tests(&key);
+    let reloaded = feedback_lookup_for_tests(&key, &select).unwrap();
+    assert_eq!(reloaded.samples, 1);
+    assert!(matches!(reloaded.strategy, ExecutionStrategy::OlapFullScan));
+}
+
+
+// ============================================================================
 // R5.5: route labels for JOIN and CTE execution paths
 // ============================================================================
 

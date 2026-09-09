@@ -9,6 +9,9 @@ Covers, against the installed release wheel:
 """
 
 import re
+import subprocess
+import sys
+import os
 import tempfile
 
 from apexbase import ApexClient
@@ -220,6 +223,84 @@ def test_explain_analyze_time_calibration_updates_plan_cost():
             assert "Feedback Recorded: yes" in second
         finally:
             client.close()
+
+
+def test_plan_feedback_persists_across_sessions():
+    """R5.8: plan feedback recorded by EXPLAIN ANALYZE is persisted to a
+    per-table sidecar and reloaded by a fresh process; the first EXPLAIN
+    ANALYZE of a shape that has feedback from a previous session reports
+    the applied feedback (before R5.8 the state was lost on exit)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        client.create_table("users", {"score": "float", "city": "string"})
+        client.use_table("users")
+        rows = 10_000
+        chunk = 5_000
+        for start in range(0, rows, chunk):
+            end = min(start + chunk, rows)
+            client.store(
+                {
+                    "score": [(i % 97) * 0.5 for i in range(start, end)],
+                    "city": [
+                        "heavy" if i % 2 == 0 else f"t{i % 7}"
+                        for i in range(start, end)
+                    ],
+                }
+            )
+        client.flush()
+        sidecar = os.path.join(tmp, "users.apex.plan_feedback")
+        try:
+            client.execute("CREATE INDEX idx_city ON users(city)")
+            client.execute("ANALYZE users")
+
+            sql = "EXPLAIN ANALYZE SELECT * FROM users WHERE city = 'heavy'"
+            first = _plan_text(client, sql)
+            assert "Feedback: applied" not in first
+            assert "Feedback Recorded: yes" in first
+            assert os.path.exists(sidecar)
+        finally:
+            client.close()
+
+        # Fresh process: the in-memory feedback is empty, so the applied
+        # feedback on the first EXPLAIN ANALYZE can only come from the
+        # persisted sidecar.
+        child = (
+            "from apexbase import ApexClient\n"
+            f"c = ApexClient({tmp!r})\n"
+            'c.use_table("users")\n'
+            f"plan = c.execute({sql!r}).to_dict()[0]['plan']\n"
+            "c.close()\n"
+            "assert 'Feedback: applied' in plan, plan\n"
+            "print('CHILD_OK')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", child], capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+        assert "CHILD_OK" in result.stdout
+
+
+def test_plan_feedback_sidecar_reaped_on_same_name_recreate():
+    """R5.8: dropping a table and recreating the same name reaps the
+    feedback sidecar with the table files (no stale calibration for the
+    recreated table)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        client.create_table("users", {"score": "float"})
+        client.use_table("users")
+        client.store({"score": [float(i) for i in range(1000)]})
+        client.flush()
+        sidecar = os.path.join(tmp, "users.apex.plan_feedback")
+        try:
+            client.execute(
+                "EXPLAIN ANALYZE SELECT COUNT(*) FROM users WHERE score > 10"
+            )
+            assert os.path.exists(sidecar)
+            client.execute("DROP TABLE users")
+            client.create_table("users", {"score": "float"})
+        finally:
+            client.close()
+        assert not os.path.exists(sidecar)
 
 
 def test_explain_analyze_reports_join_and_cte_paths():
