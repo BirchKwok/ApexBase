@@ -280,3 +280,67 @@ def test_explain_analyze_reports_join_and_cte_paths():
             assert _actual_path(plan) == "cte_recursive"
         finally:
             client.close()
+
+
+def test_explain_analyze_reports_index_spec():
+    """R5.6: index candidates carry a directly executable spec; EXPLAIN
+    ANALYZE displays the chosen candidate's spec (extracted predicates,
+    covering-scan attempt and residual-skip decisions)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        client.create_table("users", {"score": "float", "city": "string"})
+        client.use_table("users")
+        rows = 10_000
+        chunk = 5_000
+        for start in range(0, rows, chunk):
+            end = min(start + chunk, rows)
+            client.store(
+                {
+                    "score": [(i % 97) * 0.5 for i in range(start, end)],
+                    # 50% of the rows carry one skewed value, the rest spread
+                    # over 7 tail values (city NDV = 8).
+                    "city": [
+                        "heavy" if i % 2 == 0 else f"t{i % 7}"
+                        for i in range(start, end)
+                    ],
+                }
+            )
+        client.flush()
+        try:
+            client.execute("CREATE INDEX idx_city ON users(city)")
+            client.execute("ANALYZE users")
+
+            # Skewed value: the planner chooses the index candidate and its
+            # spec is displayed (no composite index: covering attempt is
+            # allowed, residual filter stays).
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE SELECT * FROM users WHERE city = 'heavy'",
+            )
+            assert "Chosen Plan: OltpIndexLookup" in plan
+            spec_lines = [
+                line for line in plan.splitlines() if "Index Spec:" in line
+            ]
+            assert len(spec_lines) == 1, (
+                f"exactly one Index Spec line expected:\n{plan}"
+            )
+            assert "city=" in spec_lines[0]
+            assert "Eq" in spec_lines[0]
+            assert "covering_scan=true" in spec_lines[0]
+            assert "skip_residual_filter=false" in spec_lines[0]
+            assert "Plan Divergence" in plan
+
+            # Rare value: the same spec shape, and the index route executes.
+            plan = _plan_text(
+                client,
+                "EXPLAIN ANALYZE SELECT * FROM users WHERE city = 't1'",
+            )
+            spec_lines = [
+                line for line in plan.splitlines() if "Index Spec:" in line
+            ]
+            assert len(spec_lines) == 1
+            assert "city=" in spec_lines[0]
+            assert "covering_scan=true" in spec_lines[0]
+            assert _actual_path(plan) == "index_accelerated_read"
+        finally:
+            client.close()
