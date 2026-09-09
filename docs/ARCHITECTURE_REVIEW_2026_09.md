@@ -522,9 +522,9 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 与规划/执行分歧报告）、R5.3（成本校准：时间维度，§14.7）、R5.4
 （morsel 并行评估：设计/评估文档，不改代码，§14.8）、R5.5（JOIN 与
 CTE 路径标签，§14.9）、R5.6（规划器候选携带可直接执行的索引物化
-信息，全路由 plan 驱动，§14.10）与 R5.7（morsel 并行 A 期：opt-in
-并行批量折叠，§14.11）完成；§14.5 余项为成本校准状态驻留内存（余项
- 2）与 morsel 并行 B 期成本自动启用（余项 3）。
+信息，全路由 plan 驱动，§14.10）、R5.7（morsel 并行 A 期：opt-in
+并行批量折叠，§14.11）与 R5.8（成本校准状态跨会话驻留，§14.12）
+完成；§14.5 余项仅剩 morsel 并行 B 期成本自动启用（余项 3）。
 
 ### 14.1 交付物
 
@@ -641,13 +641,13 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
    `IndexExecutionSpec`（键/范围/残余谓词与 covering/skip 决策，
    执行期复核索引状态），规划/执行分歧由 EXPLAIN ANALYZE 报告。
    shape 快路径仍在 CBO 之前执行（优先级语义不变，属设计保留）。
-2. **成本校准**（时间维度已完成，见 §14.7）：`estimated_cost` 与实测
-   （Actual Time / Actual Path）闭环校准已落地——EXPLAIN ANALYZE 按
-   （表, 查询形状）记录实际执行的成本类（scan/index）的模型成本与
-   实测时间，再规划时将该类候选折算到微秒量级并重选最小候选。
-   余项：校准状态驻留内存（`PLAN_FEEDBACK`），进程重启即丢失，不
-   跨会话持久化；无样本的候选类保持模型成本量级（短暂混合量级
-   窗口，见 §14.7.4）。
+2. **成本校准**（时间维度与跨会话驻留已完成，见 §14.7/§14.12）：
+`estimated_cost` 与实测（Actual Time / Actual Path）闭环校准已
+落地——EXPLAIN ANALYZE 按（表, 查询形状）记录实际执行的成本类
+（scan/index）的模型成本与实测时间，再规划时将该类候选折算到
+微秒量级并重选最小候选。校准状态持久化于每表 sidecar（每进程
+惰性加载一次、随表 DROP 回收）；无样本的候选类保持模型成本量级
+（短暂混合量级窗口，见 §14.7.4）。
 3. **morsel 并行**（A 期已完成，见 §14.8/§14.11）：`APEX_PARALLEL_SCAN=N`
    opt-in（0=关为默认）+ 进程级在飞 worker 预算（min(hw-1, 4)）+ 每
    查询专属 scoped 线程池（不共享 rayon 全局池）；并行化批量管道的
@@ -1176,3 +1176,88 @@ scatter-gather（O(log)/行 + 随机取行），并行化会放大随机 IO 与�
 5. **进程级 env 开关**：`APEX_PARALLEL_SCAN` 与 `APEX_BATCH_SCAN`
    同为进程级诊断开关，同进程多客户端共享；按查询隔离需按
    子进程控制（门禁 A/B 即此方式）。
+
+### 14.12 R5.8：成本校准状态跨会话驻留（PLAN_FEEDBACK 持久化）
+
+#### 14.12.1 交付物
+
+1. **反馈 sidecar**（`{table_key}.plan_feedback`）：`PLAN_FEEDBACK` 按
+   表 key 为外层键组织（`(表, 形状hash) → 反馈`）；EXPLAIN ANALYZE
+   记录时将该表全部反馈条目同步写入与表文件同置的 sidecar
+   （bincode + 模式版本，与 `.cbo_stats` sidecar 同置同风格）。
+   进程重启不再丢失校准状态（§14.5 余项 2 关闭）。
+2. **惰性加载**：每 (进程, 表) 至多一次——该表首次规划（或记录）时
+   把 sidecar 读入进程全局 map；规划读路径无每查询 IO。文件缺失、
+   损坏或版本不符按"无持久反馈"处理（不报错、不毒化后续记录）。
+3. **跨会话闭环**：重启后同形状的首次 EXPLAIN ANALYZE 直接命中前一
+   会话的行维度校正与按类时间折算并输出 `Feedback: applied`；复用
+   R5.3 的同一反馈机制，无新增校准路径。
+4. **DROP 回收**：`.plan_feedback` 进入 `TABLE_FILE_SUFFIXES`，随表
+   文件在延迟回收/同名重建时被 unlink——重建表不继承旧表校准。
+
+#### 14.12.2 实现明细
+
+| 文件 | 变更 |
+| --- | --- |
+| `apexbase/src/query/planner.rs` | `PLAN_FEEDBACK` 改嵌套 `HashMap<String(表 key), HashMap<u64(形状), PlanFeedback>>`；`ExecutionStrategy` / `IndexLookupType` / `PlanFeedback` 增加 serde derive；`PersistedPlanFeedback`（版本 + 条目）+ `feedback_sidecar_path`；`FEEDBACK_LOADED`（每表一次加载标记）+ `ensure_feedback_loaded`（惰性加载；损坏/缺版本按无反馈；内存条目优先于文件条目）；`FEEDBACK_PERSIST_LOCK`（跨表串行化"内存更新 + sidecar 写入"的读改写；规划读路径不取该锁）；`record_plan_feedback` 增加更新后快照与 sidecar 写入（在规划锁外完成 IO）；`plan_select_details` 反馈块改"先惰性加载 + 嵌套查找"（读路径零分配）；`#[cfg(test)] feedback_reset_table_for_tests` / `feedback_lookup_for_tests` |
+| `apexbase/src/storage/table_catalog.rs` | `TABLE_FILE_SUFFIXES` 增加 `".plan_feedback"`；既有回收测试覆盖新后缀 |
+| `apexbase/src/query/executor/tests.rs` | 2 项新增测试（见 14.12.3） |
+| `test/test_explain_analyze_physical_path.py` | 2 项新增测试（见 14.12.3） |
+| `docs/RESOURCE_OWNERSHIP.md` | `PLAN_FEEDBACK` 登记更新（sidecar 跨会话驻留 + 回收） |
+
+#### 14.12.3 测试覆盖（Rust + Python 两侧）
+
+- Rust（2 项新增，`executor/tests.rs`）：
+  - `plan_feedback_persists_to_sidecar_and_reloads`：记录 → sidecar
+    存在且内存一致；模拟进程重启（表级状态清除）后首次查找从
+    sidecar 重载（样本数/行数/实测时间/策略逐项一致）；"重启"后
+    再次记录并入持久滑动均值（重载值为两样本均值 85.0 /
+    1267.0 µs）。
+  - `plan_feedback_ignores_unreadable_sidecar`：损坏 sidecar 按"无
+    持久反馈"处理；后续记录把文件修复为合法文件并可再重载。
+- Rust（回收，`table_catalog.rs`）：
+  `reap_table_files_unlinks_under_registry_lock` 扩展覆盖
+  `.plan_feedback` 后缀（随表文件一并回收）。
+- Python（2 项新增，`test_explain_analyze_physical_path.py`）：
+  - `test_plan_feedback_persists_across_sessions`：主进程首次
+    EXPLAIN ANALYZE（无 `Feedback: applied`、`Feedback Recorded:
+    yes`、sidecar 落盘）→ 子进程（全新 `PLAN_FEEDBACK`）打开同一
+    DB，同形状首次 EXPLAIN ANALYZE 即出现 `Feedback: applied`
+    ——跨会话校准命中。
+  - `test_plan_feedback_sidecar_reaped_on_same_name_recreate`：
+    EXPLAIN ANALYZE 后 sidecar 存在 → DROP TABLE → 同名 CREATE →
+    sidecar 被回收。
+- 门禁：公开 benchmark / canary / 完整模式不执行 EXPLAIN ANALYZE
+  （`PLAN_FEEDBACK` 恒空、sidecar 恒不存在），R5.8 的读写路径对
+  benchmark 不可达（与 R5.3 结论同构）；门禁负责验证规划路径
+  重构（嵌套 map + 每表一次惰性加载）的零回退。
+
+#### 14.12.4 验收证据（conda base，release 构建，同机 M1 Pro 10 核）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功；同口径 `cargo build --release` 194 条 lib 警告 / 111 建议，与 R5.6/R5.7 完全一致，无新增警告 |
+| pytest（完整串行） | 1770 passed（既有 1768 + 新增 2），28.74s |
+| cargo test（完整） | 549 lib + 6 doc passed（lib 含 2 项新增） |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103/103 项执行；与基线 492956b 中位数比 0.9459（R5.7 为 0.9938、R5.6 为 0.944）；4 项 ≥+15%（NOT filter +29.5%、CSV Read + ORDER BY LIMIT 100 +25.2%、UNION ALL (ordered) +21.8%、GROUP BY city ORDER BY count +21.4%），逐项 A/B 交错复核（8 窗口 × 30 次，每侧 240 样本，1M 同数据）逐项 A/B 交错复核（8 窗口 × 30 次，每侧 240 样本，1M 同数据 + 共享 CSV）：NOT filter −4.59%、CSV Read + ORDER BY LIMIT 100 +2.33%、UNION ALL (ordered) +2.85%、GROUP BY city ORDER BY count −2.85%，全部在 ±4.6% 内证伪（亚 3~5ms 波动带；NOT filter / UNION ALL (ordered) / GROUP BY city 形状在 20260909 R5.7 各轮亦被同类 flag 并以同法证伪；bench 进程不运行 EXPLAIN ANALYZE，`PLAN_FEEDBACK` 恒空、sidecar 恒不存在，R5.8 读写路径不可达）；明细 local-perf-results/20260910-r58-ab/；R5.8 默认路径零行为变化（EXPLAIN ANALYZE 才触达 sidecar 写入） |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时，62 项） | 三轮：20260910-020155 退出 1（初判 1 项 CSV scalar MAX +43.07% 经五样本消解，终判 2 项 CSV integer GROUP BY numeric agg +27.57% / Numeric conjunction aggregation +20.54%）；20260910-021802 退出 1（初判 3 项，终判 1 项 CSV filtered GROUP BY + HAVING +23.03%）；20260910-023210 **退出 0**：62/62 项 ok（初判即无 flag，无需五样本扩展）。两轮 exit 1 的全部 5 个不同 flag 逐项 A/B 交错复核（每侧 240 样本，200K canary 同口径）全部在 ±2.2% 内证伪（+1.07% / −0.20% / −0.81% / −0.09% / +0.83% / −2.19% 中取对应项），均为亚 5ms 波动带形状、各轮 flag 集合互不重合且无一在 R5.8 路径上，判定为当日机器负载噪声（load 3.5~8.0）；末轮于负载回落至 ~3.6 后执行。原始报告与 A/B 全部保留（20260910-020155 / 021802 / 023210、r58-ab-canary / r58-ab-canary2，各目录含 README） |
+| 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a，含 par 阶段） | 20260910-024524 **退出 0**（首轮即过）：perf 109/109（初判 2 项 Filtered aggregation (city) +25.93% / INTERSECT (ordered) +55.90%，均经五样本终判消解——亚 3ms 波动带，INTERSECT (ordered) 在 R5.3/R5.7 完整模式各轮亦被同类 flag 并以同法消解，五样本终判即最终判定，无需追加 A/B）、qps 10/10、量化 8/8、idx 4/4、par 3/3（2/4/8 线程 +2.65% / −3.37% / −6.43%，并行 ≈ 串行，consume 段 Amdahl 限制与 R5.7 一致）。原始报告保留（20260910-024524，含 README） |
+
+#### 14.12.5 残余风险
+
+1. **跨进程最终一致**：其他进程对 sidecar 的更新在本进程下次启动时
+   才可见（每表一次加载）；进程内记录为真源且不被文件覆盖（内存
+   条目优先）。跨进程陈旧样本的偏置由滑动均值随新 EXPLAIN ANALYZE
+   样本重收敛而有界（与 R5.3 混合量级窗口同构），不改变查询语义。
+2. **DROP 后进程内条目不逐表清除**：DROP 后该表的进程内条目存续至
+   进程退出（既有行为，与 R5.3 同构）；同进程同名重建时旧反馈可能
+   影响一段重规划窗口，偏置同样由滑动均值有界。
+3. **形状哈希跨版本稳定性**：sidecar 存储 `DefaultHasher` 形状哈希
+   （跨进程确定性）；若 Rust 版本间哈希实现变化，旧条目仅"不命中、
+   需重录"，不会损坏（版本字段 + 损坏文件容错保证）。
+4. **DML 不主动失效反馈**：数据变化后旧样本滑动均值仍生效至新
+   EXPLAIN ANALYZE 重收敛（行维度校正已 clamp [0.25, 4.0]）；与
+   "校准是启发式闭环、不改变查询正确性"的定位一致。
+5. **文件增长**：sidecar 条目数 = 该表曾被 EXPLAIN ANALYZE 的形状
+   数，无主动上限（与内存 map 的 G1 登记同性质）；单条目约百字节量
+   级，常规使用下为 KB 级文件。
