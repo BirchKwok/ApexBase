@@ -677,16 +677,19 @@ return Ok(result);
                             // CBO: the planner's chosen strategy directly drives the physical
                             // index route (architecture review R5.2). Planning is skipped for:
                             // (a) no WHERE clause, (b) table has no indexes.
-                            let (plan_uses_index_route, plan_uses_secondary_index) =
-                                if stmt.where_clause.is_none() {
-                                    (false, false)
-                                } else {
+                            let (
+                                plan_uses_index_route,
+                                plan_uses_secondary_index,
+                                plan_index_spec,
+                            ) = if stmt.where_clause.is_none() {
+                                (false, false, None)
+                            } else {
                                     let (bd, tname) = base_dir_and_table(storage_path);
                                     let idx_mgr_arc = get_index_manager(&bd, &tname);
                                     let idx_mgr = idx_mgr_arc.lock();
                                     // Fast exit: if table has no indexes, the plan can only choose a scan
                                     if idx_mgr.catalog_is_empty() {
-                                        (false, false)
+                                        (false, false, None)
                                     } else {
                                         let table_key = storage_path.to_string_lossy();
                                         let cbo_plan = QueryPlanner::plan_select_details(
@@ -705,6 +708,7 @@ return Ok(result);
                                                 cbo_plan.strategy,
                                                 ExecutionStrategy::OltpIndexLookup { .. }
                                             ),
+                                            cbo_plan.execution,
                                         )
                                     }
                                 };
@@ -716,6 +720,7 @@ return Ok(result);
                                         &backend,
                                         &stmt,
                                         where_clause,
+                                        plan_index_spec.as_ref(),
                                         base_dir,
                                         storage_path,
                                     )? {

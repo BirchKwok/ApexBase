@@ -8,10 +8,10 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
         where_clause: &SqlExpr,
+        spec: Option<&crate::query::planner::IndexExecutionSpec>,
         base_dir: &Path,
         storage_path: &Path,
     ) -> io::Result<Option<ApexResult>> {
-        use crate::query::sql_parser::BinaryOperator;
         use crate::storage::index::index_manager::PredicateHint;
 
         // Only use index for simple queries: no GROUP BY, no aggregation, no JOIN
@@ -26,10 +26,17 @@ impl ApexExecutor {
             return Ok(None);
         }
 
-        // Extract predicate(s): single or AND-combined predicates
-        // Flatten AND chains into individual (col_name, hint) pairs
-        let mut predicates: Vec<(String, PredicateHint)> = Vec::new();
-        Self::extract_index_predicates(where_clause, &mut predicates);
+        // Predicates: single or AND-combined.  A plan-carried spec
+        // (architecture review R5.6) supplies the planner's materialization;
+        // the legacy path re-derives it from the WHERE clause.
+        let predicates: Vec<(String, PredicateHint)> = match spec {
+            Some(spec) => spec.predicates.clone(),
+            None => {
+                let mut predicates = Vec::new();
+                QueryPlanner::extract_index_predicates(where_clause, &mut predicates);
+                predicates
+            }
+        };
 
         if predicates.is_empty() {
             return Ok(None);
@@ -42,7 +49,10 @@ impl ApexExecutor {
 
         // OR is only legal when every branch can be satisfied by indexes. The
         // complete predicate is still reapplied after union and deduplication.
-        let disjunctive_row_ids = if Self::contains_disjunction(where_clause) {
+        let disjunctive_row_ids = if spec
+            .map(|spec| spec.disjunction.is_some())
+            .unwrap_or_else(|| QueryPlanner::contains_disjunction(where_clause))
+        {
             Self::lookup_index_expression(&mut idx_mgr, where_clause)?
         } else {
             None
@@ -190,17 +200,45 @@ impl ApexExecutor {
                     .flat_map(|(columns, _)| columns.iter().cloned()),
             )
             .collect();
-        let full_predicate_covered = Self::is_fully_indexable_predicate(
-            where_clause,
-            &indexed_columns,
-        );
+        let full_predicate_covered =
+            QueryPlanner::is_fully_indexable_predicate(where_clause, &indexed_columns);
         let composite_is_full_equality = composite_columns
             .as_ref()
             .map(|(columns, prefix_len)| *prefix_len == columns.len())
             .unwrap_or(false);
-        if full_predicate_covered
-            && (composite_columns.is_none() || composite_is_full_equality)
-        {
+        // A plan-carried spec (architecture review R5.6) derives the covering
+        // and residual-skip decisions from the planning-time index state.
+        // Re-verify that state before trusting the booleans: if index DDL
+        // raced the plan, fall back to the decisions re-derived on the live
+        // index state (identical to the no-spec behavior).
+        let spec_fresh = match spec {
+            Some(spec) => {
+                let live_composite_columns = composite_columns
+                    .as_ref()
+                    .map(|(columns, _)| columns.iter().cloned().collect::<Vec<_>>());
+                spec.predicates.iter().all(|(column, _)| {
+                    idx_mgr.has_single_column_index_on(column)
+                        || live_composite_columns
+                            .as_ref()
+                            .map(|columns| columns.iter().any(|c| c == column))
+                            .unwrap_or(false)
+                }) && match (&spec.composite_columns, live_composite_columns.as_ref()) {
+                    (Some(planned), Some(live)) => planned == live,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                }
+            }
+            None => true,
+        };
+        let (try_covering_scan, skip_residual_filter) = match spec {
+            Some(spec) if spec_fresh => (spec.try_covering_scan, spec.skip_residual_filter),
+            _ => (
+                full_predicate_covered
+                    && (composite_columns.is_none() || composite_is_full_equality),
+                full_predicate_covered && composite_is_full_equality,
+            ),
+        };
+        if try_covering_scan {
             let mut covering_preds = indexed_preds.clone();
             for (column, value) in &equality_values {
                 if !covering_preds
@@ -240,12 +278,14 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(empty.schema())));
         }
 
-        // Indexes produce candidate rows.  Always apply the original WHERE so
-        // non-indexed residual predicates remain correct.
-        let filtered = if full_predicate_covered && composite_is_full_equality {
+        // Indexes produce candidate rows.  The residual (full WHERE) filter
+        // keeps non-indexed predicates correct; it is skipped only when the
+        // covering decision proves full equality coverage.
+        let residual = spec.map(|spec| &spec.residual).unwrap_or(where_clause);
+        let filtered = if skip_residual_filter {
             combined
         } else {
-            Self::apply_filter_with_storage(&combined, where_clause, storage_path)?
+            Self::apply_filter_with_storage(&combined, residual, storage_path)?
         };
         if filtered.num_rows() == 0 {
             return Ok(Some(ApexResult::Empty(filtered.schema())));
@@ -292,17 +332,6 @@ impl ApexExecutor {
         Ok(Some(ApexResult::Data(result)))
     }
 
-    fn contains_disjunction(expr: &SqlExpr) -> bool {
-        matches!(expr, SqlExpr::BinaryOp { op: BinaryOperator::Or, .. })
-            || match expr {
-                SqlExpr::BinaryOp { left, right, .. } => {
-                    Self::contains_disjunction(left) || Self::contains_disjunction(right)
-                }
-                SqlExpr::Paren(inner) => Self::contains_disjunction(inner),
-                _ => false,
-            }
-    }
-
     fn planner_context(
         backend: &TableStorageBackend,
         where_clause: Option<&SqlExpr>,
@@ -313,9 +342,9 @@ impl ApexExecutor {
                 low,
                 high,
                 negated: false,
-            }) => Self::expr_to_value(low)
+            }) => QueryPlanner::expr_to_value(low)
                 .and_then(|value| value.as_f64())
-                .zip(Self::expr_to_value(high).and_then(|value| value.as_f64()))
+                .zip(QueryPlanner::expr_to_value(high).and_then(|value| value.as_f64()))
                 .and_then(|(low, high)| {
                     backend
                         .estimate_zone_map_range(column, low, high)
@@ -378,7 +407,7 @@ impl ApexExecutor {
             SqlExpr::Paren(inner) => Self::lookup_index_expression(indexes, inner),
             _ => {
                 let mut predicates = Vec::with_capacity(1);
-                Self::extract_index_predicates(expr, &mut predicates);
+                QueryPlanner::extract_index_predicates(expr, &mut predicates);
                 if predicates.len() != 1 {
                     return Ok(None);
                 }
@@ -388,141 +417,6 @@ impl ApexExecutor {
                 }
                 Ok(indexes.lookup(&column, &hint)?.map(|result| result.row_ids))
             }
-        }
-    }
-
-    /// Return true only when every predicate can be represented by an index
-    /// candidate.  This controls index-only scans; ordinary index scans still
-    /// accept partial coverage and apply the residual filter above.
-    fn is_fully_indexable_predicate(
-        expr: &SqlExpr,
-        indexed_columns: &std::collections::HashSet<String>,
-    ) -> bool {
-        use crate::query::sql_parser::BinaryOperator;
-        match expr {
-            SqlExpr::BinaryOp { left, op, right } => match op {
-                BinaryOperator::And => {
-                    Self::is_fully_indexable_predicate(left, indexed_columns)
-                        && Self::is_fully_indexable_predicate(right, indexed_columns)
-                }
-                BinaryOperator::Eq
-                | BinaryOperator::Gt
-                | BinaryOperator::Ge
-                | BinaryOperator::Lt
-                | BinaryOperator::Le => {
-                    (matches!(left.as_ref(), SqlExpr::Column(_))
-                        && Self::expr_to_value(right).is_some()
-                        && matches!(left.as_ref(), SqlExpr::Column(column) if indexed_columns.contains(column)))
-                        || (matches!(right.as_ref(), SqlExpr::Column(_))
-                            && Self::expr_to_value(left).is_some()
-                            && matches!(right.as_ref(), SqlExpr::Column(column) if indexed_columns.contains(column)))
-                }
-                _ => false,
-            },
-            SqlExpr::Between {
-                column,
-                low,
-                high,
-                negated,
-            } => {
-                !negated
-                    && indexed_columns.contains(column)
-                    && Self::expr_to_value(low).is_some()
-                    && Self::expr_to_value(high).is_some()
-            }
-            SqlExpr::In {
-                column,
-                values,
-                negated,
-            } => !negated && indexed_columns.contains(column) && !values.is_empty(),
-            _ => false,
-        }
-    }
-
-    /// Extract index-usable predicates from an expression (flattens AND chains).
-    /// Each predicate is (column_name, PredicateHint).
-    fn extract_index_predicates(
-        expr: &SqlExpr,
-        out: &mut Vec<(String, crate::storage::index::index_manager::PredicateHint)>,
-    ) {
-        use crate::query::sql_parser::BinaryOperator;
-        use crate::storage::index::index_manager::PredicateHint;
-        match expr {
-            // AND chain: recurse into both sides
-            SqlExpr::BinaryOp {
-                left,
-                op: BinaryOperator::And,
-                right,
-            } => {
-                Self::extract_index_predicates(left, out);
-                Self::extract_index_predicates(right, out);
-            }
-            // col OP literal or literal OP col
-            SqlExpr::BinaryOp { left, op, right } => {
-                if let SqlExpr::Column(col) = left.as_ref() {
-                    if col != "_id" {
-                        if let Some(val) = Self::expr_to_value(right) {
-                            let h = match op {
-                                BinaryOperator::Eq => Some(PredicateHint::Eq(val)),
-                                BinaryOperator::Gt => Some(PredicateHint::Gt(val)),
-                                BinaryOperator::Ge => Some(PredicateHint::Gte(val)),
-                                BinaryOperator::Lt => Some(PredicateHint::Lt(val)),
-                                BinaryOperator::Le => Some(PredicateHint::Lte(val)),
-                                _ => None,
-                            };
-                            if let Some(hint) = h {
-                                out.push((col.clone(), hint));
-                            }
-                        }
-                    }
-                } else if let SqlExpr::Column(col) = right.as_ref() {
-                    if col != "_id" {
-                        if let Some(val) = Self::expr_to_value(left) {
-                            let h = match op {
-                                BinaryOperator::Eq => Some(PredicateHint::Eq(val)),
-                                BinaryOperator::Gt => Some(PredicateHint::Lt(val)),
-                                BinaryOperator::Ge => Some(PredicateHint::Lte(val)),
-                                BinaryOperator::Lt => Some(PredicateHint::Gt(val)),
-                                BinaryOperator::Le => Some(PredicateHint::Gte(val)),
-                                _ => None,
-                            };
-                            if let Some(hint) = h {
-                                out.push((col.clone(), hint));
-                            }
-                        }
-                    }
-                }
-            }
-            SqlExpr::Between {
-                column,
-                low,
-                high,
-                negated,
-            } => {
-                if !negated && column != "_id" {
-                    if let (Some(low_val), Some(high_val)) =
-                        (Self::expr_to_value(low), Self::expr_to_value(high))
-                    {
-                        out.push((
-                            column.clone(),
-                            PredicateHint::Range {
-                                low: low_val,
-                                high: high_val,
-                            },
-                        ));
-                    }
-                }
-            }
-            SqlExpr::In {
-                column,
-                values,
-                negated,
-            } => {
-                if !negated && column != "_id" {
-                    out.push((column.clone(), PredicateHint::In(values.clone())));
-                }
-            }
-            _ => {}
         }
     }
 
@@ -668,14 +562,6 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(result.schema())));
         }
         Ok(Some(ApexResult::Data(result)))
-    }
-
-    /// Convert a SqlExpr literal to a Value (for index lookup)
-    fn expr_to_value(expr: &SqlExpr) -> Option<Value> {
-        match expr {
-            SqlExpr::Literal(v) => Some(v.clone()),
-            _ => None,
-        }
     }
 
     fn table_has_index_catalog(base_dir: Option<&Path>, storage_path: &Path) -> bool {

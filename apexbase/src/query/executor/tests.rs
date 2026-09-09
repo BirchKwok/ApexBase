@@ -3921,3 +3921,233 @@ fn explain_analyze_reports_cte_route_labels() {
     );
     assert_eq!(actual_path(&plan), "cte_recursive");
 }
+
+// ============================================================================
+// R5.6: plan-carried index execution spec
+// ============================================================================
+
+use crate::data::Value;
+use crate::storage::index::index_manager::PredicateHint;
+
+fn index_spec_for(path: &Path, sql: &str) -> Option<crate::query::planner::IndexExecutionSpec> {
+    planned_select(path, sql)
+        .candidates
+        .iter()
+        .find(|candidate| candidate.execution.is_some())
+        .and_then(|candidate| candidate.execution.clone())
+}
+
+fn create_index_spec_range_fixture(path: &Path) {
+    // 1000 rows; `heavy` covers 50% of the rows and the remaining half is
+    // spread over 7 tail values (city NDV = 8); `score` is indexed for the
+    // range and mixed-disjunction shapes.
+    const ROWS: usize = 1_000;
+    let storage = OnDemandStorage::create(path).unwrap();
+    let mut cities = Vec::with_capacity(ROWS);
+    let mut scores = Vec::with_capacity(ROWS);
+    for i in 0..ROWS {
+        cities.push(if i % 2 == 0 {
+            "heavy".to_string()
+        } else {
+            format!("t{}", i % 7)
+        });
+        scores.push((i % 97) as f64 * 0.5);
+    }
+    storage
+        .insert_typed(
+            HashMap::new(),
+            HashMap::from([("score".to_string(), scores)]),
+            HashMap::from([("city".to_string(), cities)]),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save().unwrap();
+
+    ApexExecutor::execute("CREATE INDEX idx_city ON default(city)", path).unwrap();
+    // BTree: the default HASH type cannot serve range lookups.
+    ApexExecutor::execute(
+        "CREATE INDEX idx_score ON default(score) USING BTREE",
+        path,
+    )
+    .unwrap();
+    ApexExecutor::execute("ANALYZE default", path).unwrap();
+}
+
+fn result_shape(result: &Option<ApexResult>) -> String {
+    match result {
+        None => "None".to_string(),
+        Some(ApexResult::Data(batch)) => {
+            format!("Data({}x{})", batch.num_rows(), batch.num_columns())
+        }
+        Some(ApexResult::Empty(schema)) => format!("Empty({} cols)", schema.fields().len()),
+        Some(ApexResult::Scalar(value)) => format!("Scalar({value})"),
+    }
+}
+
+fn assert_index_results_equal(
+    with_spec: &Option<ApexResult>,
+    without_spec: &Option<ApexResult>,
+    sql: &str,
+) {
+    assert_eq!(
+        result_shape(with_spec),
+        result_shape(without_spec),
+        "{sql}: spec-driven and legacy routes must agree"
+    );
+    match (with_spec.as_ref(), without_spec.as_ref()) {
+        (Some(ApexResult::Data(a)), Some(ApexResult::Data(b))) => {
+            assert_batches_logically_equal(a, b, sql)
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn index_execution_spec_materializes_at_planning() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    create_index_divergence_fixture(&path);
+
+    // Single equality: the spec carries the extracted predicate and no
+    // disjunction.  There is no composite index, so the covering attempt is
+    // allowed but the residual filter must stay.
+    let spec = index_spec_for(&path, "SELECT * FROM default WHERE city = 'heavy'")
+        .expect("equality candidate must carry the execution spec");
+    assert!(
+        spec.predicates.iter().any(|(column, hint)| {
+            column == "city"
+                && matches!(
+                    hint,
+                    PredicateHint::Eq(value)
+                        if value == &Value::String("heavy".to_string())
+                )
+        }),
+        "spec must carry the city predicate, got: {spec:?}"
+    );
+    assert!(spec.disjunction.is_none());
+    assert!(!spec.skip_residual_filter);
+    assert!(spec.try_covering_scan);
+    assert!(spec.composite_columns.is_none());
+
+    // OR shape: the union candidate carries the disjunction flag and no
+    // extracted predicates (AND flattening does not descend into OR).
+    let spec = index_spec_for(&path, "SELECT * FROM default WHERE city = 'heavy' OR city = 't1'")
+        .expect("union candidate must carry the execution spec");
+    assert!(spec.disjunction.is_some());
+    assert!(spec.predicates.is_empty());
+    assert!(!spec.try_covering_scan);
+    assert!(!spec.skip_residual_filter);
+
+    // Low-NDV indexed table: the chosen candidate is a scan and the plan
+    // carries no execution spec.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    create_index_time_calibration_fixture(&path);
+    assert!(
+        planned_select(&path, "SELECT * FROM default WHERE city = 'a'")
+            .execution
+            .is_none()
+    );
+}
+
+#[test]
+fn index_execution_spec_matches_legacy_execution() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    create_index_spec_range_fixture(&path);
+    let (base_dir, _) = base_dir_and_table(&path);
+    let backend = get_cached_backend(&path).unwrap();
+
+    let shapes = [
+        // Rare equality: the index route executes under both worlds.
+        "SELECT * FROM default WHERE city = 't1'",
+        // Skewed equality: both CBOs fall back to the scan (Ok(None)).
+        "SELECT * FROM default WHERE city = 'heavy'",
+        // Range on the BTree index.
+        "SELECT * FROM default WHERE score BETWEEN 10 AND 19",
+        // Pure OR: the union candidate carries the disjunction flag; the
+        // empty extracted predicate list makes both worlds fall back.
+        "SELECT * FROM default WHERE city = 't1' OR city = 't2'",
+        // Mixed disjunction: the spec carries both the extracted score
+        // predicate and the disjunction flag (the executor resolves the OR
+        // branch through the index union and intersects the range).
+        "SELECT * FROM default WHERE (city = 't1' OR city = 't2') AND score > 40",
+        // Covering projection: the index-only scan executes under both.
+        "SELECT city FROM default WHERE city = 't5'",
+    ];
+    for sql in shapes {
+        let select = match SqlParser::parse(sql).unwrap() {
+            SqlStatement::Select(select) => select,
+            _ => panic!("expected SELECT"),
+        };
+        let where_clause = select.where_clause.as_ref().unwrap();
+        let plan = planned_select(&path, sql);
+        let with_spec = ApexExecutor::try_index_accelerated_read(
+            &backend,
+            &select,
+            where_clause,
+            plan.execution.as_ref(),
+            &base_dir,
+            &path,
+        )
+        .unwrap();
+        let without_spec = ApexExecutor::try_index_accelerated_read(
+            &backend,
+            &select,
+            where_clause,
+            None,
+            &base_dir,
+            &path,
+        )
+        .unwrap();
+        assert_index_results_equal(&with_spec, &without_spec, sql);
+    }
+
+    // Every index-routed shape must carry the spec into the executor.
+    for sql in [
+        "SELECT * FROM default WHERE city = 't1'",
+        "SELECT * FROM default WHERE score BETWEEN 10 AND 19",
+        "SELECT * FROM default WHERE city = 't1' OR city = 't2'",
+        "SELECT * FROM default WHERE (city = 't1' OR city = 't2') AND score > 40",
+        "SELECT city FROM default WHERE city = 't5'",
+    ] {
+        assert!(
+            planned_select(&path, sql).execution.is_some(),
+            "{sql}: chosen index candidate must carry the spec"
+        );
+    }
+}
+
+#[test]
+fn stale_index_execution_spec_falls_back_to_scan() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    create_index_divergence_fixture(&path);
+    let sql = "SELECT * FROM default WHERE city = 't1'";
+    let select = match SqlParser::parse(sql).unwrap() {
+        SqlStatement::Select(select) => select,
+        _ => panic!("expected SELECT"),
+    };
+    let spec = index_spec_for(&path, sql).expect("index spec must exist");
+
+    // Drop the index after planning: the spec is stale, so the index route
+    // must fall back to the scan instead of trusting the planning-time state.
+    ApexExecutor::execute("DROP INDEX idx_city ON default", &path).unwrap();
+    let (base_dir, _) = base_dir_and_table(&path);
+    let backend = get_cached_backend(&path).unwrap();
+    let result = ApexExecutor::try_index_accelerated_read(
+        &backend,
+        &select,
+        select.where_clause.as_ref().unwrap(),
+        Some(&spec),
+        &base_dir,
+        &path,
+    )
+    .unwrap();
+    assert!(
+        result.is_none(),
+        "stale spec must fall back to the scan, got: {:?}",
+        result.is_some()
+    );
+}

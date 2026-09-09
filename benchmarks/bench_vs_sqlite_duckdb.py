@@ -2302,6 +2302,7 @@ class ApexBaseBench:
         self._uncached_batch_scan_client = None
         self._batch_scan_query_index = 0
         self._batch_scan_ready = False
+        self._index_canary_ready = False
 
     def _query_all(self, sql):
         return self.client.execute(sql, show_internal_id=True).to_dict()
@@ -2352,6 +2353,7 @@ class ApexBaseBench:
             self._uncached_scan_client = None
         self._batch_scan_query_index = 0
         self._batch_scan_ready = False
+        self._index_canary_ready = False
         if self._uncached_batch_scan_client:
             self._uncached_batch_scan_client.close()
             self._uncached_batch_scan_client = None
@@ -3491,6 +3493,48 @@ class ApexBaseBench:
         return self._query_all(
             f"SELECT category, COUNT(*) FROM read_json('{self.json_path}') GROUP BY category"
         )
+
+    def setup_index_canary(self):
+        """Build the index-accelerated canary fixture once per process
+        (architecture review R5.6): a skewed string column and a low-NDV
+        numeric column, both indexed."""
+        if self._index_canary_ready:
+            return
+        self.client.execute("CREATE TABLE idxcan (tag TEXT, amount INT)")
+        self.client.use_table("idxcan")
+        for start in range(0, self.n, 50_000):
+            end = min(start + 50_000, self.n)
+            self.client.store(
+                {
+                    "tag": [
+                        "heavy" if idx % 2 == 0 else f"t{idx % 7}"
+                        for idx in range(start, end)
+                    ],
+                    "amount": [idx % 50 for idx in range(start, end)],
+                }
+            )
+        self.client.flush()
+        self.client.execute("CREATE INDEX idx_tag ON idxcan(tag)")
+        self.client.execute(
+            "CREATE INDEX idx_amount ON idxcan(amount) USING BTREE"
+        )
+        self.client.execute("ANALYZE idxcan")
+        self.client.use_table("default")
+        self._index_canary_ready = True
+
+    def bench_index_eq_rare(self):
+        return self._query_all("SELECT * FROM idxcan WHERE tag = 't3'")
+
+    def bench_index_eq_skewed(self):
+        return self._query_all("SELECT * FROM idxcan WHERE tag = 'heavy'")
+
+    def bench_index_range(self):
+        return self._query_all(
+            "SELECT * FROM idxcan WHERE amount BETWEEN 20 AND 29"
+        )
+
+    def bench_index_covering(self):
+        return self._query_all("SELECT tag FROM idxcan WHERE tag = 't5'")
 
     def close(self):
         if self._uncached_scan_client:

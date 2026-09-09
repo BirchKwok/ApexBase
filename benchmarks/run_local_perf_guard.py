@@ -66,9 +66,10 @@ def one_wheel(directory):
 
 
 def benchmark_arguments(
-    mode, rows, warmup, iterations, output, qps_only=False, quant_only=False
+    mode, rows, warmup, iterations, output, qps_only=False, quant_only=False,
+    index_only=False,
 ):
-    if mode == "canary" or qps_only or quant_only:
+    if mode == "canary" or qps_only or quant_only or index_only:
         script = ROOT / "benchmarks" / "bench_perf_canary.py"
         defaults = (200_000, 2, 7)
     else:
@@ -93,6 +94,8 @@ def benchmark_arguments(
         command.insert(1, "--qps-only")
     if quant_only:
         command.insert(1, "--quant-only")
+    if index_only:
+        command.insert(1, "--index-only")
     return tuple(command)
 
 
@@ -316,6 +319,31 @@ def main(argv=None):
                     collect_quant, quant_reports, "quant-comparison"
                 )
                 comparison_status = max(comparison_status, quant_status)
+
+                # Index-accelerated reads are a core OLTP hot path
+                # (architecture review R5.6). Compare the four index canary
+                # metrics base/current at full scale in a dedicated
+                # interleaved phase.
+                idx_counts = {"base": 0, "current": 0}
+                idx_reports = {"base": [], "current": []}
+                collect_idx = make_collect(
+                    "idx",
+                    idx_counts,
+                    idx_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary",
+                        args.rows if args.rows is not None else 1_000_000,
+                        args.warmup,
+                        args.iterations,
+                        report,
+                        index_only=True,
+                    ),
+                )
+                collect_idx(SAMPLE_ORDER)
+                idx_status = run_comparison(
+                    collect_idx, idx_reports, "idx-comparison"
+                )
+                comparison_status = max(comparison_status, idx_status)
 
             print(f"Reports and comparison saved in {output_dir}")
         finally:

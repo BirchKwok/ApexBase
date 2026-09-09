@@ -27,7 +27,7 @@
 //! └──────────┘  └──────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use once_cell::sync::Lazy;
@@ -38,6 +38,7 @@ use crate::data::Value;
 use crate::query::sql_parser::BinaryOperator;
 use crate::query::{SelectColumn, SelectStatement, SqlExpr, SqlStatement};
 use crate::storage::index::IndexManager;
+use crate::storage::index::index_manager::PredicateHint;
 
 // ============================================================================
 // Table Statistics Cache (for CBO)
@@ -341,6 +342,8 @@ pub struct PlanCandidate {
     pub name: String,
     pub strategy: ExecutionStrategy,
     pub cost: PlanCost,
+    /// Directly executable index access decision (index candidates only).
+    pub execution: Option<IndexExecutionSpec>,
 }
 
 /// The complete decision handed to the executor and EXPLAIN.
@@ -351,8 +354,31 @@ pub struct QueryPlan {
     pub candidates: Vec<PlanCandidate>,
     pub stats_available: bool,
     pub feedback_applied: bool,
+    /// Execution spec of the chosen candidate (index routes only).
+    pub execution: Option<IndexExecutionSpec>,
     /// Time spent constructing and costing candidates.
     pub planning_time_micros: u64,
+}
+
+/// Directly executable index access decision materialized at planning time
+/// (architecture review R5.6).  The executor consumes this instead of
+/// re-deriving predicate materialization from the WHERE clause.
+#[derive(Debug, Clone)]
+pub struct IndexExecutionSpec {
+    /// Index-usable predicates extracted from the AND-flattened WHERE clause.
+    pub predicates: Vec<(String, PredicateHint)>,
+    /// The full WHERE clause when it contains a disjunction.
+    pub disjunction: Option<SqlExpr>,
+    /// The full WHERE clause, reapplied after fetch to enforce residual
+    /// (non-indexed) predicates.
+    pub residual: SqlExpr,
+    /// Attempt the index-only (covering) scan.
+    pub try_covering_scan: bool,
+    /// Skip the post-fetch residual filter.
+    pub skip_residual_filter: bool,
+    /// Columns of the composite index the covering decision was made on
+    /// (None when the decision did not depend on a composite index).
+    pub composite_columns: Option<Vec<String>>,
 }
 
 /// Storage facts that affect physical plan legality and cost.
@@ -560,6 +586,224 @@ impl QueryPlanner {
         let scan_cost = PlanCost::seq_scan(row_count as f64);
         let index_cost = PlanCost::index_scan(row_count as f64, selectivity);
         index_cost.total < scan_cost.total
+    }
+
+    /// Detect an OR anywhere in the expression.
+    pub fn contains_disjunction(expr: &SqlExpr) -> bool {
+        matches!(expr, SqlExpr::BinaryOp { op: BinaryOperator::Or, .. })
+            || match expr {
+                SqlExpr::BinaryOp { left, right, .. } => {
+                    Self::contains_disjunction(left) || Self::contains_disjunction(right)
+                }
+                SqlExpr::Paren(inner) => Self::contains_disjunction(inner),
+                _ => false,
+            }
+    }
+
+    /// Convert a SqlExpr literal to a Value (for index lookup).
+    pub fn expr_to_value(expr: &SqlExpr) -> Option<Value> {
+        match expr {
+            SqlExpr::Literal(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    /// Extract index-usable predicates from an expression (flattens AND chains).
+    /// Each predicate is (column_name, PredicateHint).
+    pub fn extract_index_predicates(
+        expr: &SqlExpr,
+        out: &mut Vec<(String, PredicateHint)>,
+    ) {
+        match expr {
+            // AND chain: recurse into both sides
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                Self::extract_index_predicates(left, out);
+                Self::extract_index_predicates(right, out);
+            }
+            // col OP literal or literal OP col
+            SqlExpr::BinaryOp { left, op, right } => {
+                if let SqlExpr::Column(col) = left.as_ref() {
+                    if col != "_id" {
+                        if let Some(val) = Self::expr_to_value(right) {
+                            let h = match op {
+                                BinaryOperator::Eq => Some(PredicateHint::Eq(val)),
+                                BinaryOperator::Gt => Some(PredicateHint::Gt(val)),
+                                BinaryOperator::Ge => Some(PredicateHint::Gte(val)),
+                                BinaryOperator::Lt => Some(PredicateHint::Lt(val)),
+                                BinaryOperator::Le => Some(PredicateHint::Lte(val)),
+                                _ => None,
+                            };
+                            if let Some(hint) = h {
+                                out.push((col.clone(), hint));
+                            }
+                        }
+                    }
+                } else if let SqlExpr::Column(col) = right.as_ref() {
+                    if col != "_id" {
+                        if let Some(val) = Self::expr_to_value(left) {
+                            let h = match op {
+                                BinaryOperator::Eq => Some(PredicateHint::Eq(val)),
+                                BinaryOperator::Gt => Some(PredicateHint::Lt(val)),
+                                BinaryOperator::Ge => Some(PredicateHint::Lte(val)),
+                                BinaryOperator::Lt => Some(PredicateHint::Gt(val)),
+                                BinaryOperator::Le => Some(PredicateHint::Gte(val)),
+                                _ => None,
+                            };
+                            if let Some(hint) = h {
+                                out.push((col.clone(), hint));
+                            }
+                        }
+                    }
+                }
+            }
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => {
+                if !negated && column != "_id" {
+                    if let (Some(low_val), Some(high_val)) =
+                        (Self::expr_to_value(low), Self::expr_to_value(high))
+                    {
+                        out.push((
+                            column.clone(),
+                            PredicateHint::Range {
+                                low: low_val,
+                                high: high_val,
+                            },
+                        ));
+                    }
+                }
+            }
+            SqlExpr::In {
+                column,
+                values,
+                negated,
+            } => {
+                if !negated && column != "_id" {
+                    out.push((column.clone(), PredicateHint::In(values.clone())));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Return true only when every predicate can be represented by an index
+    /// candidate.  This controls index-only scans; ordinary index scans still
+    /// accept partial coverage and apply the residual filter.
+    pub fn is_fully_indexable_predicate(
+        expr: &SqlExpr,
+        indexed_columns: &HashSet<String>,
+    ) -> bool {
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::And => {
+                    Self::is_fully_indexable_predicate(left, indexed_columns)
+                        && Self::is_fully_indexable_predicate(right, indexed_columns)
+                }
+                BinaryOperator::Eq
+                | BinaryOperator::Gt
+                | BinaryOperator::Ge
+                | BinaryOperator::Lt
+                | BinaryOperator::Le => {
+                    (matches!(left.as_ref(), SqlExpr::Column(_))
+                        && Self::expr_to_value(right).is_some()
+                        && matches!(left.as_ref(), SqlExpr::Column(column) if indexed_columns.contains(column)))
+                        || (matches!(right.as_ref(), SqlExpr::Column(_))
+                            && Self::expr_to_value(left).is_some()
+                            && matches!(right.as_ref(), SqlExpr::Column(column) if indexed_columns.contains(column)))
+                }
+                _ => false,
+            },
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => {
+                !negated
+                    && indexed_columns.contains(column)
+                    && Self::expr_to_value(low).is_some()
+                    && Self::expr_to_value(high).is_some()
+            }
+            SqlExpr::In {
+                column,
+                values,
+                negated,
+            } => !negated && indexed_columns.contains(column) && !values.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Materialize the directly executable index access decision carried by
+    /// every index candidate (architecture review R5.6).  The covering and
+    /// residual-skip flags mirror the executor's live conditions on the
+    /// planning-time index state, so a fresh spec never changes the physical
+    /// route; the executor re-verifies the state before trusting them.
+    pub fn build_index_execution_spec(
+        index_manager: &IndexManager,
+        where_clause: &SqlExpr,
+    ) -> IndexExecutionSpec {
+        let mut predicates = Vec::new();
+        Self::extract_index_predicates(where_clause, &mut predicates);
+        let equality_values: HashMap<String, Value> = predicates
+            .iter()
+            .filter_map(|(column, hint)| match hint {
+                PredicateHint::Eq(value) => Some((column.clone(), value.clone())),
+                _ => None,
+            })
+            .collect();
+        let composite_columns = index_manager
+            .list_indexes()
+            .into_iter()
+            .filter(|meta| meta.is_composite())
+            .map(|meta| {
+                meta.effective_columns()
+                    .iter()
+                    .map(|column| column.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter_map(|columns| {
+                let prefix_len = columns
+                    .iter()
+                    .take_while(|column| equality_values.contains_key(*column))
+                    .count();
+                (prefix_len > 0).then_some((columns, prefix_len))
+            })
+            .max_by_key(|(_, prefix_len)| *prefix_len)
+            .map(|(columns, _)| columns);
+        let indexed_columns: HashSet<String> = predicates
+            .iter()
+            .filter(|(column, _)| index_manager.has_single_column_index_on(column))
+            .map(|(column, _)| column.clone())
+            .chain(composite_columns.iter().flat_map(|columns| columns.iter().cloned()))
+            .collect();
+        let full_predicate_covered =
+            Self::is_fully_indexable_predicate(where_clause, &indexed_columns);
+        let composite_is_full_equality = composite_columns
+            .as_ref()
+            .map(|columns| {
+                columns
+                    .iter()
+                    .take_while(|column| equality_values.contains_key(*column))
+                    .count()
+                    == columns.len()
+            })
+            .unwrap_or(false);
+        IndexExecutionSpec {
+            disjunction: Self::contains_disjunction(where_clause).then(|| where_clause.clone()),
+            residual: where_clause.clone(),
+            try_covering_scan: full_predicate_covered
+                && (composite_columns.is_none() || composite_is_full_equality),
+            skip_residual_filter: full_predicate_covered && composite_is_full_equality,
+            composite_columns,
+            predicates,
+        }
     }
 
     /// Optimize join order for a list of tables with estimated row counts
@@ -804,6 +1048,7 @@ impl QueryPlanner {
                     }) {
                         plan.strategy = chosen.strategy.clone();
                         plan.cost = chosen.cost.clone();
+                        plan.execution = chosen.execution.clone();
                         plan.feedback_applied = true;
                     }
                 }
@@ -832,6 +1077,7 @@ impl QueryPlanner {
             candidates: Vec::new(),
             stats_available: stats.is_some(),
             feedback_applied: false,
+            execution: None,
             planning_time_micros: 0,
         };
 
@@ -891,9 +1137,13 @@ impl QueryPlanner {
             },
             strategy: scan_strategy,
             cost: scan_cost,
+            execution: None,
         }];
 
         if let (Some(idx_mgr), Some(_where_expr)) = (index_manager, &select.where_clause) {
+            // Materialize the execution spec once; every index candidate
+            // below carries it (architecture review R5.6).
+            let index_spec = Self::build_index_execution_spec(idx_mgr, _where_expr);
             if chars.has_disjunction {
                 let all_indexed = chars
                     .equality_filter_columns
@@ -921,6 +1171,7 @@ impl QueryPlanner {
                             lookup_type: IndexLookupType::Union,
                         },
                         cost,
+                        execution: Some(index_spec.clone()),
                     });
                 }
             } else {
@@ -947,6 +1198,7 @@ impl QueryPlanner {
                             lookup_type: IndexLookupType::Equality,
                         },
                         cost,
+                        execution: Some(index_spec.clone()),
                     });
                 }
                 for col in &chars.range_filter_columns {
@@ -964,6 +1216,7 @@ impl QueryPlanner {
                             lookup_type: IndexLookupType::Range,
                         },
                         cost,
+                        execution: Some(index_spec.clone()),
                     });
                 }
 
@@ -991,6 +1244,7 @@ impl QueryPlanner {
                             lookup_type: IndexLookupType::Intersection,
                         },
                         cost,
+                        execution: Some(index_spec.clone()),
                     });
                 }
 
@@ -1043,6 +1297,7 @@ impl QueryPlanner {
                             },
                         },
                         cost,
+                        execution: Some(index_spec.clone()),
                     });
                 }
             }
@@ -1118,12 +1373,14 @@ impl QueryPlanner {
             })
             .cloned()
             .unwrap_or_else(|| candidates[0].clone());
+        let execution = chosen.execution.clone();
         QueryPlan {
             strategy: chosen.strategy,
             cost: chosen.cost,
             candidates,
             stats_available: stats.is_some(),
             feedback_applied: false,
+            execution,
             planning_time_micros: 0,
         }
     }

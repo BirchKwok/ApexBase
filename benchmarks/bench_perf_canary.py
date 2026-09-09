@@ -77,6 +77,10 @@ CANARY_SPECS = (
     ("Table CREATE+DROP cycle", "bench_table_create_drop_cycle", "once"),
     ("List tables (10)", "bench_list_tables", "setup", "bench_list_tables_setup"),
     ("TopK JOIN with unused BLOB", "bench_topk_join_canary", "median"),
+    ("Index equality (rare)", "bench_index_eq_rare", "mean"),
+    ("Index equality (skewed)", "bench_index_eq_skewed", "mean"),
+    ("Index range (BETWEEN)", "bench_index_range", "mean"),
+    ("Index covering projection", "bench_index_covering", "mean"),
 )
 
 QUANTIZED_CODECS = (
@@ -147,7 +151,7 @@ def run_quantized_canary(rows, warmup, iterations):
             client.close()
 
 
-def run_canary(rows, warmup, iterations, qps_only=False):
+def run_canary(rows, warmup, iterations, qps_only=False, index_only=False):
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -171,8 +175,18 @@ def run_canary(rows, warmup, iterations, qps_only=False):
     results = []
     try:
         bench.setup()
-        if not qps_only:
-            for spec in CANARY_SPECS:
+        if index_only:
+            specs = tuple(
+                spec
+                for spec in CANARY_SPECS
+                if spec[1].startswith("bench_index_")
+            )
+        elif qps_only:
+            specs = ()
+        else:
+            specs = CANARY_SPECS
+        if specs:
+            for spec in specs:
                 name, method_name, mode = spec[0], spec[1], spec[2]
                 setup_method = spec[3] if len(spec) > 3 else None
                 if method_name == "bench_topk_join_canary":
@@ -186,6 +200,13 @@ def run_canary(rows, warmup, iterations, qps_only=False):
                     bench.setup_uncached_delta_scan_pipeline()
                 elif method_name == "bench_batch_scan_group_having_topk":
                     bench.setup_batch_scan_pipeline()
+                elif method_name in {
+                    "bench_index_eq_rare",
+                    "bench_index_eq_skewed",
+                    "bench_index_range",
+                    "bench_index_covering",
+                }:
+                    bench.setup_index_canary()
                 elapsed_ms = _run_metric(
                     bench, method_name, mode, warmup, iterations, setup_method
                 )
@@ -195,29 +216,31 @@ def run_canary(rows, warmup, iterations, qps_only=False):
                     "ApexBase": round(elapsed_ms, 6),
                 })
                 print(f"{name:<34} {elapsed_ms:>12.6f} ms")
-            results.extend(run_quantized_canary(rows, warmup, iterations))
+            if not index_only:
+                results.extend(run_quantized_canary(rows, warmup, iterations))
 
-        # OLAP Q/s read profile (ApexBase-only). The harness recreates the
-        # engine on a clean loaded copy, so the measurement is independent of
-        # the delta-heavy state left by the DML canary metrics.
-        qps = full_bench.run_qps_benchmark(
-            tmpdir,
-            data,
-            n_threads=4,
-            min_duration=1.0,
-            min_iterations=50,
-            existing_engines={"ApexBase": bench},
-        )
-        for label, key in (
-            ("Q/s (single thread)", "ApexBase_single"),
-            ("Q/s (4 threads)", "ApexBase_concurrent_4"),
-        ):
-            results.append({
-                "category": "ApexBase Q/s",
-                "query": label,
-                "ApexBase": round(qps.get(key, 0.0), 3),
-            })
-            print(f"{label:<34} {qps.get(key, 0.0):>12.3f} Q/s")
+        if not index_only:
+            # OLAP Q/s read profile (ApexBase-only). The harness recreates the
+            # engine on a clean loaded copy, so the measurement is independent
+            # of the delta-heavy state left by the DML canary metrics.
+            qps = full_bench.run_qps_benchmark(
+                tmpdir,
+                data,
+                n_threads=4,
+                min_duration=1.0,
+                min_iterations=50,
+                existing_engines={"ApexBase": bench},
+            )
+            for label, key in (
+                ("Q/s (single thread)", "ApexBase_single"),
+                ("Q/s (4 threads)", "ApexBase_concurrent_4"),
+            ):
+                results.append({
+                    "category": "ApexBase Q/s",
+                    "query": label,
+                    "ApexBase": round(qps.get(key, 0.0), 3),
+                })
+                print(f"{label:<34} {qps.get(key, 0.0):>12.3f} Q/s")
         return results
     finally:
         bench.close()
@@ -240,14 +263,27 @@ def main(argv=None):
         action="store_true",
         help="Run only compressed-domain vector TopK metrics",
     )
+    parser.add_argument(
+        "--index-only",
+        action="store_true",
+        help="Run only the index-accelerated canary metrics (R5.6 guard phase)",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
 
-    if args.qps_only and args.quant_only:
-        parser.error("--qps-only and --quant-only are mutually exclusive")
+    if args.qps_only and (args.quant_only or args.index_only):
+        parser.error(
+            "--qps-only is mutually exclusive with the other profile flags"
+        )
+    if args.quant_only and args.index_only:
+        parser.error("--quant-only and --index-only are mutually exclusive")
     if args.quant_only:
         results = run_quantized_canary(args.rows, args.warmup, args.iterations)
+    elif args.index_only:
+        results = run_canary(
+            args.rows, args.warmup, args.iterations, index_only=True
+        )
     else:
         results = run_canary(
             args.rows, args.warmup, args.iterations, qps_only=args.qps_only

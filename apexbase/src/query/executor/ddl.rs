@@ -693,6 +693,18 @@ impl ApexExecutor {
                         if plan.feedback_applied {
                             plan_lines.push("    Feedback: applied".to_string());
                         }
+                        if let Some(spec) = &plan.execution {
+                            let predicates = spec
+                                .predicates
+                                .iter()
+                                .map(|(column, hint)| format!("{column}={hint:?}"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            plan_lines.push(format!(
+                                "    Index Spec: preds=[{}] composite={:?} covering_scan={} skip_residual_filter={}",
+                                predicates, spec.composite_columns, spec.try_covering_scan, spec.skip_residual_filter
+                            ));
+                        }
                         for candidate in &plan.candidates {
                             plan_lines.push(format!(
                                 "    Candidate: {} cost={:.3} rows={:.1}{}",
