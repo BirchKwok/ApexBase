@@ -161,20 +161,32 @@ impl ApexExecutor {
         base_dir: &Path,
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
+        use crate::txn::{CommitError, CommitOutcome};
         let mgr = crate::txn::txn_manager();
 
         // Keep OCC/MVCC state unpublished until storage and indexes finish.
         let prepared = mgr.prepare_commit(txn_id).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Transaction conflict: {}", e))
+            // OCC rejection aborts the transaction. A missing/non-active ID
+            // may instead be an already committed or concurrently committing
+            // transaction; this call cannot establish its previous outcome.
+            let outcome = if e.kind() == io::ErrorKind::WouldBlock {
+                CommitOutcome::NotCommitted
+            } else {
+                CommitOutcome::Unknown
+            };
+            CommitError::wrap(txn_id, outcome, e)
         })?;
         let writes = prepared.writes();
+        let mut outcome = CommitOutcome::NotCommitted;
         macro_rules! commit_try {
             ($expression:expr) => {
                 match $expression {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = mgr.rollback(txn_id);
-                        return Err(error);
+                        if outcome != CommitOutcome::Committed {
+                            let _ = mgr.rollback(txn_id);
+                        }
+                        return Err(CommitError::wrap(txn_id, outcome, error));
                     }
                 }
             };
@@ -246,6 +258,14 @@ impl ApexExecutor {
             }
         }
 
+        // A marker write/flush can fail after bytes reached the WAL. Fast
+        // tables can partially apply writes without a WAL. Neither case may
+        // be reported as safely aborted; UPDATE and cross-table recovery
+        // remain limited even when all markers were written successfully.
+        if !writes.is_empty() {
+            outcome = CommitOutcome::Unknown;
+        }
+
         // Phase 3: Emit the WAL commit marker — the commit point. Once the
         // marker is durable (OS flush for Safe, fsync for Max), the
         // transaction is committed even if this process dies before the rows
@@ -298,15 +318,7 @@ impl ApexExecutor {
         }
 
         commit_try!(mgr.finalize_commit(prepared));
-
-        // Record the applied WAL watermark: the whole WAL is now reflected
-        // in the table, so opens skip the recovery scan until the WAL grows
-        // again (a new commit or a crash between marker and apply).
-        for table_path in &affected_tables {
-            if let Some(backend) = wal_backends.get(table_path) {
-                commit_try!(backend.storage.wal_mark_applied());
-            }
-        }
+        outcome = CommitOutcome::Committed;
 
         for epoch_write in &_epoch_writes {
             epoch_write.commit();
@@ -317,6 +329,14 @@ impl ApexExecutor {
         for table_path in &affected_tables {
             engine.invalidate(table_path);
             crate::storage::backend::invalidate_global_dict_cache(table_path);
+        }
+
+        // Publish visibility before fallible maintenance. A watermark failure
+        // cannot undo the logical commit or suppress cache invalidation.
+        for table_path in &affected_tables {
+            if let Some(backend) = wal_backends.get(table_path) {
+                commit_try!(backend.storage.wal_mark_applied());
+            }
         }
 
         Ok(ApexResult::Scalar(applied))

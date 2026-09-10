@@ -23,9 +23,11 @@
 //! ```
 
 pub mod conflict;
+mod commit;
 pub mod context;
 pub mod manager;
 
 pub use conflict::{ConflictDetector, ConflictResult};
+pub use commit::{CommitError, CommitOutcome};
 pub use context::TxnContext;
 pub use manager::{is_live_txn, txn_manager, TxnId, TxnManager, TxnStatus};

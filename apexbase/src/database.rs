@@ -114,6 +114,9 @@ impl<'a> Session<'a> {
     }
 
     #[inline]
+    /// Commit a Rust transaction. On failure, `io::Error::get_ref()` contains
+    /// a [`crate::txn::CommitError`] with the observable commit outcome.
+    /// An unknown outcome must be reconciled before replaying DML.
     pub fn commit_txn(&self, txn_id: u64) -> io::Result<ApexResult> {
         let _scope = self.enter();
         Database::commit_txn(txn_id, self.base_dir, self.table_path)
