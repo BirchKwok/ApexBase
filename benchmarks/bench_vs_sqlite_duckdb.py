@@ -2601,6 +2601,37 @@ class ApexBaseBench:
         finally:
             os.environ.pop("APEX_PARALLEL_SCAN", None)
 
+    def bench_parallel_batch_scan_auto(self):
+        """R5.12 cost-based auto-enable: the R3 batch-scan shape with no
+        APEX_PARALLEL_SCAN set. The first call calibrates the shape via
+        EXPLAIN ANALYZE (recording the serial cost class), so every timed
+        iteration of the calibrated shape takes the auto-parallel path on
+        wheels that implement it; the base wheel has no auto path and
+        stays serial. A fixed parameter set keeps the calibrated shape
+        stable across iterations (the feedback key is per normalized AST).
+        """
+        if not self._batch_scan_ready:
+            raise RuntimeError("setup_batch_scan_pipeline must run first")
+        params = (20, 35, 20.0, 0)
+        if not getattr(self, "_auto_parallel_calibrated", False):
+            self._uncached_batch_scan_client.execute(
+                "EXPLAIN ANALYZE SELECT city, COUNT(*) AS n, AVG(score) AS av, MAX(score) AS mx "
+                "FROM __perf_batch_scan WHERE age > ? AND age <= ? AND score >= ? "
+                "GROUP BY city HAVING COUNT(*) > ? "
+                "ORDER BY n DESC, city LIMIT 5",
+                params=params,
+                show_internal_id=True,
+            ).to_dict()
+            self._auto_parallel_calibrated = True
+        return self._uncached_batch_scan_client.execute(
+            "SELECT city, COUNT(*) AS n, AVG(score) AS av, MAX(score) AS mx "
+            "FROM __perf_batch_scan WHERE age > ? AND age <= ? AND score >= ? "
+            "GROUP BY city HAVING COUNT(*) > ? "
+            "ORDER BY n DESC, city LIMIT 5",
+            params=params,
+            show_internal_id=True,
+        ).to_dict()
+
     def setup_view_bench(self):
         try:
             self.client.execute("DROP VIEW bench_view")

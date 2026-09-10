@@ -318,6 +318,63 @@ def test_parallel_batch_scan_reports_fused_path_detail():
             client.close()
 
 
+# ---------------------------------------------------------------------------
+# R5.12: cost-based auto-enable (APEX_PARALLEL_SCAN unset)
+# ---------------------------------------------------------------------------
+
+
+def test_parallel_batch_scan_auto_enables_after_calibration():
+    # With APEX_PARALLEL_SCAN unset, the first EXPLAIN ANALYZE of a shape
+    # runs serial and records the calibrated serial class; the next run of
+    # the same shape whose calibrated serial time reaches the 2 ms
+    # threshold auto-enables the fused parallel scan, and results must
+    # match the forced-serial run.
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        _seed(client)
+        try:
+            sql = QUERIES[0]
+            os.environ.pop("APEX_PARALLEL_SCAN", None)
+            first_plan = _run(client, "EXPLAIN ANALYZE " + sql)[0]["plan"]
+            assert "batched_scan_pipeline(batches=" in first_plan, first_plan
+            assert "parallel=" not in first_plan, first_plan
+            assert "Feedback Recorded: yes" in first_plan, first_plan
+
+            second_plan = _run(client, "EXPLAIN ANALYZE " + sql)[0]["plan"]
+            assert "batched_scan_pipeline(batches=" in second_plan, second_plan
+            assert ", parallel=" in second_plan, second_plan
+
+            os.environ["APEX_PARALLEL_SCAN"] = "0"
+            try:
+                serial = _run(client, sql)
+            finally:
+                os.environ.pop("APEX_PARALLEL_SCAN", None)
+            auto = _run(client, sql)
+            assert auto == serial, (
+                f"auto/serial results diverge:\n{sql}\n"
+                f"serial={str(serial[:3])}\nauto  ={str(auto[:3])}"
+            )
+        finally:
+            client.close()
+
+
+def test_parallel_batch_scan_auto_stays_serial_below_threshold():
+    # Shapes whose calibrated serial time stays below the 2 ms threshold
+    # keep the serial default with APEX_PARALLEL_SCAN unset (1K rows:
+    # single row group, sub-millisecond serial scan).
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        _seed(client, rows=1_000)
+        try:
+            os.environ.pop("APEX_PARALLEL_SCAN", None)
+            for _ in range(2):
+                plan = _run(client, "EXPLAIN ANALYZE " + QUERIES[0])[0]["plan"]
+                assert "batched_scan_pipeline(batches=" in plan, plan
+                assert "parallel=" not in plan, plan
+        finally:
+            client.close()
+
+
 def test_parallel_batch_scan_falls_back_with_delta_state():
     with tempfile.TemporaryDirectory() as tmp:
         client = _make_client(tmp)
@@ -449,4 +506,5 @@ def test_canary_parallel_only_profile_loads_base_table():
             "Parallel batch scan (2 threads)",
             "Parallel batch scan (4 threads)",
             "Parallel batch scan (8 threads)",
+            "Parallel batch scan (auto)",
         ]

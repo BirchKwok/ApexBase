@@ -83,6 +83,7 @@ CANARY_SPECS = (
     ("Index covering projection", "bench_index_covering", "mean"),
     ("Parallel batch scan (2 threads)", "bench_parallel_batch_scan_t2", "mean"),
     ("Parallel batch scan (4 threads)", "bench_parallel_batch_scan_t4", "mean"),
+    ("Parallel batch scan (auto)", "bench_parallel_batch_scan_auto", "mean"),
 )
 
 # Full-mode par phase (R5.7 phase A): the 8-thread shape exists only in the
@@ -91,6 +92,7 @@ PARALLEL_ONLY_SPECS = (
     ("Parallel batch scan (2 threads)", "bench_parallel_batch_scan_t2", "mean"),
     ("Parallel batch scan (4 threads)", "bench_parallel_batch_scan_t4", "mean"),
     ("Parallel batch scan (8 threads)", "bench_parallel_batch_scan_t8", "mean"),
+    ("Parallel batch scan (auto)", "bench_parallel_batch_scan_auto", "mean"),
 )
 
 QUANTIZED_CODECS = (
@@ -220,6 +222,7 @@ def run_canary(rows, warmup, iterations, qps_only=False, index_only=False, paral
                     "bench_parallel_batch_scan_t2",
                     "bench_parallel_batch_scan_t4",
                     "bench_parallel_batch_scan_t8",
+                    "bench_parallel_batch_scan_auto",
                 }:
                     bench.setup_batch_scan_pipeline()
                 elif method_name in {

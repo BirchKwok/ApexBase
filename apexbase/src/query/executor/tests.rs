@@ -3003,7 +3003,7 @@ fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
         let predicate =
             ApexExecutor::build_scan_predicate(stmt.where_clause.as_ref().unwrap()).unwrap();
         let result =
-            ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate).unwrap();
+            ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate, &path.to_string_lossy()).unwrap();
         assert!(
             result.is_some(),
             "gated shape must be served by the batch pipeline"
@@ -3015,7 +3015,7 @@ fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
         let wide_predicate =
             ApexExecutor::build_scan_predicate(wide_stmt.where_clause.as_ref().unwrap()).unwrap();
         assert!(
-            ApexExecutor::try_batch_group_pipeline(&backend, &wide_stmt, &wide_predicate)
+            ApexExecutor::try_batch_group_pipeline(&backend, &wide_stmt, &wide_predicate, &path.to_string_lossy())
                 .unwrap()
                 .is_none(),
             "three-key GROUP BY must fall back"
@@ -3039,7 +3039,7 @@ fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
     let predicate =
         ApexExecutor::build_scan_predicate(stmt.where_clause.as_ref().unwrap()).unwrap();
     let result = with_batch_scan(true, || {
-        ApexExecutor::try_batch_group_pipeline(&delta_backend, &stmt, &predicate).unwrap()
+        ApexExecutor::try_batch_group_pipeline(&delta_backend, &stmt, &predicate, &path.to_string_lossy()).unwrap()
     });
     assert!(
         result.is_none(),
@@ -3068,7 +3068,7 @@ fn batch_group_pipeline_honors_cancellation_token() {
         // No token: the pipeline completes normally.
         assert!(!crate::query::executor::query_cancelled());
         assert!(
-            ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate)
+            ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate, &path.to_string_lossy())
                 .unwrap()
                 .is_some(),
             "batch pipeline must complete without a cancellation token"
@@ -3077,7 +3077,7 @@ fn batch_group_pipeline_honors_cancellation_token() {
         // Pre-set token: the first batch boundary aborts with Interrupted.
         let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         crate::query::executor::set_query_cancel_token(Some(std::sync::Arc::clone(&token)));
-        let outcome = ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate);
+        let outcome = ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate, &path.to_string_lossy());
         crate::query::executor::set_query_cancel_token(None);
         let err = match outcome {
             Err(err) => err,
@@ -3088,7 +3088,7 @@ fn batch_group_pipeline_honors_cancellation_token() {
 
         // Token cleared again: the pipeline completes.
         assert!(
-            ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate)
+            ApexExecutor::try_batch_group_pipeline(&backend, &stmt, &predicate, &path.to_string_lossy())
                 .unwrap()
                 .is_some(),
             "batch pipeline must complete after the token is cleared"
@@ -3399,6 +3399,118 @@ fn fused_parallel_scan_reports_worker_count_in_path_detail() {
         "{parallel_plan}"
     );
     assert!(parallel_plan.contains(", parallel=2)"), "{parallel_plan}");
+}
+
+// ============================================================================
+// R5.12: cost-based auto-enable of the parallel batch scan
+// ============================================================================
+
+const AUTO_SQL: &str = "SELECT city, COUNT(*) AS n FROM default WHERE amount > 0 GROUP BY city ORDER BY n DESC, city LIMIT 5";
+const AUTO_EXPLAIN_SQL: &str = "EXPLAIN ANALYZE SELECT city, COUNT(*) AS n FROM default WHERE amount > 0 GROUP BY city ORDER BY n DESC, city LIMIT 5";
+
+/// One synthetic R5.3 calibration sample for the serial cost class.
+fn record_scan_feedback(path: &Path, sql: &str, time_us: f64) {
+    record_plan_feedback(
+        &path.to_string_lossy(),
+        &parsed_select(sql),
+        &ExecutionStrategy::OlapAggregation,
+        0.0,
+        0.0,
+        ExecutedCostClass::Scan,
+        0.0,
+        time_us,
+    );
+}
+
+fn record_parallel_feedback(path: &Path, sql: &str, time_us: f64) {
+    record_plan_feedback(
+        &path.to_string_lossy(),
+        &parsed_select(sql),
+        &ExecutionStrategy::OlapAggregation,
+        0.0,
+        0.0,
+        ExecutedCostClass::ParallelScan,
+        0.0,
+        time_us,
+    );
+}
+
+#[test]
+fn auto_parallel_enables_from_calibrated_threshold() {
+    let dir = tempdir().unwrap();
+
+    // The first EXPLAIN ANALYZE of a shape runs serial: no calibrated
+    // prediction exists yet, so the default behavior is unchanged.
+    let pre_path = dir.path().join("auto_pre.apex");
+    create_batch_scan_fixture(&pre_path);
+    let pre_plan = with_parallel_scan(None, || explain_analyze_plan(&pre_path, AUTO_EXPLAIN_SQL));
+    assert!(pre_plan.contains("batched_scan_pipeline(batches="), "{pre_plan}");
+    assert!(!pre_plan.contains("parallel="), "{pre_plan}");
+
+    // Calibrated serial prediction above the 2 ms threshold: the next run
+    // of the same shape auto-enables the fused parallel scan, and results
+    // must match the forced-serial run.
+    let enable_path = dir.path().join("auto_enable.apex");
+    create_batch_scan_fixture(&enable_path);
+    record_scan_feedback(&enable_path, AUTO_SQL, 2500.0);
+    let auto_plan = with_parallel_scan(None, || explain_analyze_plan(&enable_path, AUTO_EXPLAIN_SQL));
+    assert!(auto_plan.contains("batched_scan_pipeline(batches="), "{auto_plan}");
+    assert!(auto_plan.contains(", parallel="), "{auto_plan}");
+
+    let _guard = BATCH_SCAN_ENV_LOCK.lock().unwrap();
+    std::env::set_var("APEX_PARALLEL_SCAN", "0");
+    let serial = ApexExecutor::execute(AUTO_SQL, &enable_path)
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+    std::env::remove_var("APEX_PARALLEL_SCAN");
+    let auto = ApexExecutor::execute(AUTO_SQL, &enable_path)
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+    drop(_guard);
+    assert_batches_logically_equal(&serial, &auto, AUTO_SQL);
+}
+
+#[test]
+fn auto_parallel_flip_back_when_measured_slower() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("auto_flip.apex");
+    create_batch_scan_fixture(&path);
+
+    // Calibration above the threshold, but the measured parallel history
+    // is slower than the serial prediction: the same closed loop flips
+    // the shape back to serial (R5.12).
+    record_scan_feedback(&path, AUTO_SQL, 2500.0);
+    record_parallel_feedback(&path, AUTO_SQL, 3000.0);
+    let flipped_plan = with_parallel_scan(None, || explain_analyze_plan(&path, AUTO_EXPLAIN_SQL));
+    assert!(!flipped_plan.contains("parallel="), "{flipped_plan}");
+
+    // A fast enough parallel history re-enables the same shape.
+    record_parallel_feedback(&path, AUTO_SQL, 1000.0);
+    let reenabled_plan = with_parallel_scan(None, || explain_analyze_plan(&path, AUTO_EXPLAIN_SQL));
+    assert!(reenabled_plan.contains(", parallel="), "{reenabled_plan}");
+}
+
+#[test]
+fn explicit_env_overrides_auto_parallel_decision() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("auto_override.apex");
+    create_batch_scan_fixture(&path);
+
+    // Flip state: the cost-based default would stay serial.
+    record_scan_feedback(&path, AUTO_SQL, 2500.0);
+    record_parallel_feedback(&path, AUTO_SQL, 3000.0);
+    let forced = with_parallel_scan(Some(2), || explain_analyze_plan(&path, AUTO_EXPLAIN_SQL));
+    assert!(forced.contains(", parallel=2)"), "{forced}");
+
+    // Explicit 0 forces serial despite the calibration above threshold.
+    let _guard = BATCH_SCAN_ENV_LOCK.lock().unwrap();
+    std::env::set_var("APEX_PARALLEL_SCAN", "0");
+    let serial_plan = explain_analyze_plan(&path, AUTO_EXPLAIN_SQL);
+    std::env::remove_var("APEX_PARALLEL_SCAN");
+    drop(_guard);
+    assert!(!serial_plan.contains("parallel="), "{serial_plan}");
 }
 
 #[test]
@@ -3891,6 +4003,7 @@ fn explain_analyze_reports_index_plan_divergence() {
 
 use crate::query::planner::{
     ExecutionStrategy, PlannerContext, QueryPlan, is_index_cost_class, record_plan_feedback,
+    ExecutedCostClass,
 };
 use crate::query::sql_parser::{SqlParser, SqlStatement};
 
@@ -3945,7 +4058,7 @@ fn time_calibration_flips_index_to_scan() {
         &first.strategy,
         first.cost.output_rows,
         500.0,
-        true,
+        ExecutedCostClass::Index,
         index_cost,
         1_000_000.0,
     );
@@ -4023,7 +4136,7 @@ fn time_calibration_flips_scan_to_index() {
         &first.strategy,
         first.cost.output_rows,
         500.0,
-        false,
+        ExecutedCostClass::Scan,
         scan_cost,
         1_000_000.0,
     );
@@ -4061,7 +4174,7 @@ fn time_calibration_ignores_zero_cost_samples() {
         &first.strategy,
         first.cost.output_rows,
         first.cost.output_rows,
-        true,
+        ExecutedCostClass::Index,
         0.0,
         0.0,
     );
@@ -4111,7 +4224,7 @@ fn plan_feedback_persists_to_sidecar_and_reloads() {
         &ExecutionStrategy::OlapAggregation,
         100.0,
         90.0,
-        false,
+        ExecutedCostClass::Scan,
         50.0,
         1234.0,
     );
@@ -4142,7 +4255,7 @@ fn plan_feedback_persists_to_sidecar_and_reloads() {
         &ExecutionStrategy::OlapAggregation,
         100.0,
         80.0,
-        false,
+        ExecutedCostClass::Scan,
         50.0,
         1300.0,
     );
@@ -4175,7 +4288,7 @@ fn plan_feedback_ignores_unreadable_sidecar() {
         &ExecutionStrategy::OlapFullScan,
         10.0,
         8.0,
-        false,
+        ExecutedCostClass::Scan,
         4.0,
         100.0,
     );
