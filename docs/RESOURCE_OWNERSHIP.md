@@ -35,9 +35,9 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `CLASSIFY_CACHE`（query_signature.rs） | 查询签名分类器 | SQL 文本 | `QuerySignature` | 无上限（见 G1） | 不失效 | 进程退出 | 无 |
 | `STATS_CACHE`（planner.rs） | 查询规划器 | 表 key | 表统计 + 观察时间 | 无上限（见 G1） | 写入后 `invalidate_table_stats` | 进程退出 | 无 |
-| `PLAN_FEEDBACK`（planner.rs） | 查询规划器 | (表 key, 查询形状) | 计划反馈：行维度估计/实际行数滑动均值 + 按实际执行成本类（scan/index）的模型成本与实测时间滑动均值（R5.3 时间校准）；持久化于每表 sidecar `<table>.plan_feedback`（bincode + 版本），每进程惰性加载一次，随表文件回收（R5.8） | 无上限（见 G1；sidecar 条目数 = 曾 EXPLAIN ANALYZE 的形状数） | 仅 EXPLAIN ANALYZE 记录（记录时同步写 sidecar） | 进程退出（内存态）；sidecar 跨会话持久 | 有（sidecar 文件；他进程更新仅在本进程下次启动时可见） |
+| `PLAN_FEEDBACK`（planner.rs） | 查询规划器 | (表 key, 查询形状) | 计划反馈：行维度估计/实际行数滑动均值 + 按实际执行成本类（scan/index/parallel，R5.12 并行批量扫描独立成本类）的模型成本与实测时间滑动均值（R5.3 时间校准）；持久化于每表 sidecar `<table>.plan_feedback`（bincode + 版本，R5.12 起版本 2），每进程惰性加载一次，随表文件回收（R5.8） | 无上限（见 G1；sidecar 条目数 = 曾 EXPLAIN ANALYZE 的形状数） | 仅 EXPLAIN ANALYZE 记录（记录时同步写 sidecar） | 进程退出（内存态）；sidecar 跨会话持久 | 有（sidecar 文件；他进程更新仅在本进程下次启动时可见） |
 | `JIT_FILTER_CACHE`（jit.rs） | JIT 过滤器 | 谓词模式 | 编译后的过滤闭包 | 有界（内部 LRU） | 内部驱逐 | 进程退出 | 无 |
-| `PARALLEL_SCAN_TOKENS`（executor/batch_group.rs） | 查询执行器（并行批量管道 worker 预算，R5.7/R5.11） | —（进程级计数） | 在飞并行扫描+折叠 worker token 池（`APEX_PARALLEL_SCAN` opt-in 路径） | `min(hardware_concurrency - 1, 8)`（R5.11 实测曲线/矩阵定案），惰性初始化（首次并行请求前零状态） | 每查询取 `min(请求, 可用)`，<2 退串行；RAII guard 查询结束归还 | 进程退出 | 无（仅计数，不保留查询数据） |
+| `PARALLEL_SCAN_TOKENS`（executor/batch_group.rs） | 查询执行器（并行批量管道 worker 预算，R5.7/R5.11） | —（进程级计数） | 在飞并行扫描+折叠 worker token 池（`APEX_PARALLEL_SCAN` 显式诊断路径 + R5.12 成本自动启用路径，后两者共用同一预算） | `min(hardware_concurrency - 1, 8)`（R5.11 实测曲线/矩阵定案），惰性初始化（首次并行请求前零状态） | 每查询取 `min(请求, 可用)`，<2 退串行；RAII guard 查询结束归还 | 进程退出 | 无（仅计数，不保留查询数据） |
 
 ### 1.3 存储层（`apexbase/src/storage/`）
 

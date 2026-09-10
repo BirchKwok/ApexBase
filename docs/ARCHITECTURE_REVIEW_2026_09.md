@@ -525,9 +525,9 @@ CTE 路径标签，§14.9）、R5.6（规划器候选携带可直接执行的索
 信息，全路由 plan 驱动，§14.10）、R5.7（morsel 并行 A 期：opt-in
 并行批量折叠，§14.11）、R5.8（成本校准状态跨会话驻留，§14.12）与
 R5.9（morsel 并行 B 期前置测量：争抢矩阵 + 加速曲线，§14.13）、
-R5.10（存储层并行扫描设计/评估，B 期，§14.14）与 R5.11（存储层并行
-扫描实现：fused 扫描+折叠、CAP 定案，§14.15）完成；§14.5 余项仅剩
-morsel 并行 R5.12 成本自动启用（余项 3）。
+R5.10（存储层并行扫描设计/评估，B 期，§14.14）、R5.11（存储层并行
+扫描实现：fused 扫描+折叠、CAP 定案，§14.15）与 R5.12（并行扫描成本
+自动启用：独立成本类 + 反馈翻回，§14.16）完成；§14.5 余项全部关闭。
 
 ### 14.1 交付物
 
@@ -659,9 +659,11 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
    §14.15）：fused 扫描+折叠（行组范围切分、复用 A 期合并/预算机制），
    CAP = min(hw-1, 8) 由实测定案（1M 5.49x@8 worker、3.28x@4；
    cap-8 矩阵 12/12 格吞吐为正、p99 最大 1.77x < 2.0x）。余项：
-   R5.12 成本自动启用（2 ms 阈值 + 并行扫描独立成本类 + 反馈翻回，
-   机制复用 R5.3/R5.8，CAP 已定、前置满足）；并行段现覆盖扫描+
-   聚合，输出段（HAVING/ORDER BY/TopK）仍串行。
+   R5.12 成本自动启用（§14.16）：校准后预测串行时间 ≥ 2 ms 自动启用
+   并行（env 未设；`APEX_PARALLEL_SCAN` 保留显式覆盖）、并行扫描独立
+   成本类 + 实测不优于串行预测时同一闭环翻回串行。B 期全部完成，
+   余项 3 关闭；并行段现覆盖扫描+聚合，输出段（HAVING/ORDER BY/TopK）
+   仍串行。
 4. **JOIN 路径标签**（已完成，见 §14.9）：`execute_select_with_joins`
    的 4 条快路径与通用 hash join、CTE 的递归/内联/物化三条路由均有
    路由标签，其 EXPLAIN ANALYZE 输出 `Actual Path` 行；并入余项 1
@@ -1690,3 +1692,117 @@ B 期自动启用（R5.12）以 2 ms 预测串行阈值 + 反馈翻回兜底（�
 4. **B 期入口**：存储层并行扫描已落地且 CAP 定案；余项仅剩 R5.12
    成本自动启用（2 ms 阈值 + `PLAN_FEEDBACK` 并行扫描独立成本类 +
    反馈翻回串行），机制全部复用 R5.3/R5.8，顺序依赖满足（CAP 已定）。
+### 14.16 R5.12：并行扫描成本自动启用（独立成本类 + 反馈翻回）
+
+本节为 B 期收尾（§14.14.6 R5.12）：在 R5.11 fused 扫描+折叠之上加
+成本自动启用——校准后预测串行时间 ≥ 2 ms（§14.8.5 初值）且形状在批量
+管道门控内时自动启用并行；并行扫描作为独立成本类进入 `PLAN_FEEDBACK`
+（复用 R5.3/R5.8 机制，不新增校准路径），实测不优于串行预测时由同一
+闭环翻回串行。
+
+#### 14.16.1 交付物
+
+1. **成本自动启用**（env 未设为默认）：(表, 形状) 的 R5.3 校准后串行
+   预测（serial 成本类实测时间，µs）≥ 2 ms 时，按 CAP
+   `min(hw-1, 8)` 请求 fused 并行 worker；争抢经既有
+   `min(请求, 可用)` token 机制退化（§14.13.4-(a)）。无校准样本的形状
+   无预测 → 串行，默认行为与 pre-R5.12 完全一致。
+2. **并行扫描独立成本类**：`PlanFeedback` 新增 parallel 类
+   （模型成本/实测时间滑动均值 + 样本数，schema v2）；EXPLAIN ANALYZE
+   按实际执行路径分桶——并行执行的时间不再污染 serial 类预测，翻回
+   比较双方各自纯净。
+3. **反馈翻回**：parallel 类实测均值 ≥ 校准串行预测（不更快）时同一
+   闭环翻回串行；实测更快则维持/恢复启用。
+4. **`APEX_PARALLEL_SCAN` 语义**：未设 = 成本自动决策（新）；N ≥ 2
+   强制 N（诊断）；0/1/非法强制串行（诊断覆盖自动决策）。
+5. **门禁覆盖扩展**（AGENTS.md §1.3）：canary 与完整模式 par 段新增
+   `Parallel batch scan (auto)` 指标——首次运行以 EXPLAIN ANALYZE 校准
+   该形状，后续运行无 env 走自动路径；base wheel 无自动路径（串行
+   对照基线）。
+6. **v1 `plan_feedback` sidecar 主动作废**：布局变化（新增 parallel
+   类字段）后旧文件不再匹配（版本 2），该表形状在下次 EXPLAIN
+   ANALYZE 重新校准；无样本 = 串行，无行为风险。
+
+#### 14.16.2 实现明细
+
+- `query/planner.rs`：`PlanFeedback` +`parallel_cost_avg /
+  parallel_time_avg_us / parallel_samples`；`FEEDBACK_SCHEMA_VERSION`
+  1→2（旧 sidecar 作废）；`ExecutedCostClass`（Scan/Index/
+  ParallelScan）替换记录点的 bool；`record_plan_feedback` 三分桶
+  （共享桶更新，均值语义不变）；只读决策输入 `parallel_decision_input`
+  （惰性加载复用 R5.8 每表一次机制，规划读路径不变）；
+  `PARALLEL_SCAN_AUTO_ENABLE_US = 2000.0`（§14.8.5 初值）。
+- `query/executor/batch_group.rs`：`ParallelScanOverride`
+  （Auto/ForceSerial/Request）；`parallel_workers_requested`（显式 env
+  恒优先，未设 → 自动决策）；`auto_parallel_workers`（≥2 ms 阈值 +
+  翻回规则 → 请求 CAP）；`parallel_scan_capacity` 抽出（CAP 公式单源，
+  token 池初始化与自动请求共用）；`try_batch_group_pipeline` 增加
+  `table_key` 参数（与记录点同键）。
+- `query/executor/scan_pipeline.rs`：调用点传 `backend.table_key()`。
+- `storage/backend.rs`：`TableStorageBackend::table_key()`（路径
+  字符串；非 UTF-8 路径退化为无反馈 → 串行）。
+- `query/executor/ddl.rs`：EXPLAIN ANALYZE 记录点按路径细节
+  `", parallel="` 识别并行执行 → ParallelScan 类；并行类成本锚点取
+  scan 类候选（同一逻辑扫描工作的模型成本）。
+- 判定语义（执行期，批量管道门控内）：serial 类无样本 → 串行；
+  预测 < 2 ms → 串行；parallel 类有样本且实测均值 ≥ 预测 → 串行
+  （翻回，"不更快"即不并行）；否则请求 CAP worker。
+
+#### 14.16.3 测试覆盖（Rust + Python 两侧）
+
+Rust（3 新增，70K 宽行 fixture = 3 行组，复用 R5.11 fixture/helper）：
+
+1. `auto_parallel_enables_from_calibrated_threshold`：形状首次
+   EXPLAIN ANALYZE 为串行（无预测，默认行为不变）→ 注入 2.5 ms
+   serial 校准样本 → 同形状自动启用（路径细节 `parallel=`）→ 结果与
+   env=0 强制串行逐行一致。
+2. `auto_parallel_flip_back_when_measured_slower`：serial 2.5 ms +
+   parallel 实测 3.0 ms（更慢）→ 翻回串行；再录 1.0 ms parallel
+   样本（均值 2.0 < 2.5）→ 恢复启用（闭环可恢复）。
+3. `explicit_env_overrides_auto_parallel_decision`：翻回态 env=2
+   强制 `parallel=2`；启用态 env=0 强制串行（诊断覆盖双向生效）。
+
+Python（2 新增，`test_batch_scan_pipeline.py`）：
+
+1. `test_parallel_batch_scan_auto_enables_after_calibration`：200K
+   seed；env 未设时首次 EXPLAIN ANALYZE 串行 + `Feedback Recorded:
+   yes`；同形状第二次 EXPLAIN 自动并行（`, parallel=`）；普通执行
+   结果 == env=0 串行。
+2. `test_parallel_batch_scan_auto_stays_serial_below_threshold`：1K
+   行（单行组、亚毫秒串行）；两次 EXPLAIN 均串行（校准 < 2 ms 不
+   触发）。
+
+翻回情形在真实硬件上无法构造（本机并行恒快于串行），由 Rust 合成
+样本测试覆盖。机械更新：`try_batch_group_pipeline` 6 处调用点带
+table_key；`record_plan_feedback` 6 处调用点改 `ExecutedCostClass`。
+
+benchmark 覆盖（AGENTS.md §1.3）：canary（200K）与完整模式 par 段
+（1M）各新增 `Parallel batch scan (auto)` 指标，base/current 两侧同
+脚本执行（base wheel 无自动路径 = 串行对照）。
+
+#### 14.16.4 验收链（conda base，release wheel，2026-09-10）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功；warning A/B（同命令干净树 vs 当前树 `cargo build --release`）196 = 196，零新增 |
+| pytest（完整串行） | 1777 passed（1775+2 新增），35.23s，完整串行 |
+| cargo test（完整） | 554 lib（551+3 新增）+ 6 doc passed |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103/103 项执行；与基线 492956b 中位数比 0.9817（R5.11 当日 0.9449）；9 项 ≥+15%（运行负载 4.1~6.6，紧随完整 benchmark + canary）：两项大项 CSV Read + ORDER BY LIMIT 100 +28.9%（16.9→21.8 ms）与 JSON Read + ORDER BY LIMIT 100 +20.6%（46.6→56.3 ms）经同构建自 A/B 证伪（两个独立进程交错 8 窗口 × 30 次、每侧 240 样本：+2.25%/+0.15%，逐次 span 13.7~69.8 / 41.0~89.4 ms 完全覆盖基线与 flag 值；base wheel 客户端不支持 read_csv/read_json 表函数，base 侧 A/B 不可能，同 R5.11 协议）；其余 7 项（Persistent VIEW +84%、INTERSECT +63%、GROUP BY city 10 groups +31.9%、Point lookup projected +28.3%、Insert 1 row +24.0%、UNION DISTINCT +23.8%、Derived table GROUP BY +15.5%）均为 ≤1.9 ms 形状，处于已记录的亚 3ms 机器状态带（负载 4~7 下亚毫秒形状反复 flag，R5.4/R5.5/R5.11 同型先例经交错 A/B 推翻）；9 项均不经 R5.12 差异路径（benchmark 进程不运行 EXPLAIN ANALYZE → 无校准 → 自动启用不触发；CSV/JSON 为表函数读，GROUP BY city 无 WHERE 不进批量管道，Derived table 走派生子查询路径）。重叠形状在完整模式 1M 同窗复核通过（COUNT WHERE category +11.64%、GROUP BY category ORDER BY count +2.22%，五样本最终）。A/B 明细 local-perf-results/20260910-r512-ab/（含 README），原始表格 local-perf-results/20260910-r512-public/ |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时） | 首轮 20260910-152709 **exit 1**（如实记录）：3 样本初判 3 项亚 3ms 形状 flag（Numeric equality aggregation +30.59%、Filtered numeric TopK +20.13%、Derived CASE bucket GROUP BY +20.82%），自动五样本扩展后最终判定维持 3 项 REGRESSED；三项均经与 origin/main 交错 A/B 证伪（8 窗口 × 30 次、每侧 240 样本：−0.28%/−4.55%/−2.39%，无方向性差异；三项在 canary 清单中位于 DML 指标之前 = 干净表状态，且均不经 R5.12 差异路径）；auto 指标（200K）首轮 −56.28%（base 无自动路径）。机器状态背景：该轮紧随完整公开 benchmark + canary 运行，负载 4~7。重叠形状由完整模式 1M 门禁全部通过复核（下项）。 |
+| 完整模式（1M 行 / 2 预热 / 5 计时，base=origin/main 7da4db2e385a，热路径修改必跑） | **exit 0**：perf 表 109/109（3 样本初判 2 项亚毫秒 flag：COUNT WHERE category +18.20%、GROUP BY category ORDER BY count +94.62%；自动五样本最终判定回阈内 +11.64%（0.249→0.278 ms）与 +2.22%（0.590→0.603 ms））；qps 10/10、quant 8/8、idx 4/4；par 段 4/4：2/4/8 线程 = −37.68%/−64.93%/−76.51%（31.197→19.443 / 29.523→10.354 / 31.026→7.288 ms），**auto = −77.24%（31.661→7.206 ms）**——base 无自动路径，该行端到端验证 R5.12 决策：指标内 EXPLAIN ANALYZE 校准 1M 形状后，无 env 自动以 8 worker CAP 启用（与显式 8 线程同级） |
+
+#### 14.16.5 残余风险与出口结论
+
+1. **自动启用只对被 EXPLAIN ANALYZE 过的形状生效**：校准闭环即
+   R5.3/R5.8 机制，未 EXPLAIN 的形状默认完全不变（保守，零默认行为
+   风险）；已校准形状的首次并行执行是无样本"乐观启用"，若该环境
+   结构性偏慢，一个反馈样本后闭环翻回（与 §14.15.6-1 的 C=8/P=4
+   p99 残余同机制兜底）。
+2. **翻回比较用运行均值**：旧样本影响缓慢衰减，负载大幅波动时可在
+   并行/串行间振荡数轮，每轮一个新样本即收敛；最坏情形 = 串行路径
+   （无正确性风险，确定性合并语义不变）。
+3. **v1 sidecar 作废**：跨版本升级时各形状校准样本丢失一次（经
+   EXPLAIN ANALYZE 重新获取）；无样本 = 串行，行为不变。
+4. **B 期出口**：存储层并行扫描（R5.11）+ 成本自动启用（R5.12）
+   全部落地，§14.5 余项 1/2/3 全部关闭；并行段覆盖扫描+聚合，输出段
+   （HAVING/ORDER BY/TopK）不并行化（§14.14.3 设计不变）。
