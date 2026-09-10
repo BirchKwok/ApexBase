@@ -524,10 +524,10 @@ python benchmarks/run_local_perf_guard.py --base-ref origin/main --mode full
 CTE 路径标签，§14.9）、R5.6（规划器候选携带可直接执行的索引物化
 信息，全路由 plan 驱动，§14.10）、R5.7（morsel 并行 A 期：opt-in
 并行批量折叠，§14.11）、R5.8（成本校准状态跨会话驻留，§14.12）与
-R5.9（morsel 并行 B 期前置测量：争抢矩阵 + 加速曲线，§14.13）与
-R5.10（存储层并行扫描设计/评估，B 期，§14.14）完成；§14.5 余项
-仅剩 morsel 并行 B 期实现（R5.11 存储层并行扫描 + R5.12 成本自动
-启用，余项 3）。
+R5.9（morsel 并行 B 期前置测量：争抢矩阵 + 加速曲线，§14.13）、
+R5.10（存储层并行扫描设计/评估，B 期，§14.14）与 R5.11（存储层并行
+扫描实现：fused 扫描+折叠、CAP 定案，§14.15）完成；§14.5 余项仅剩
+morsel 并行 R5.12 成本自动启用（余项 3）。
 
 ### 14.1 交付物
 
@@ -655,15 +655,13 @@ base = 干净 venv 中的 origin/main release 轮子（`/tmp/apex_ab_base_venv2`
    opt-in（0=关为默认）+ 进程级在飞 worker 预算（min(hw-1, 4)）+ 每
    查询专属 scoped 线程池（不共享 rayon 全局池）；并行化批量管道的
    聚合阶段（每 morsel 部分状态 + 块序确定性合并），默认行为零变化。
-   B 期两份前置实测证据已完成（争抢矩阵 + 加速曲线，§14.13）：
-   p99 有界达成（最大 1.71x < 2.0x），C=2/4 吞吐为正（C=8 因超订阅
-   小幅为负，有界）；端到端加速两规模最高 1.112x、有效 worker 在
-   预算上限 4 处饱和。设计/评估已完成（§14.14）：fused 扫描+折叠、
-   行组范围切分、复用 A 期合并/预算机制、CAP 由 R5.11 实测定案。
-   余项：R5.11 存储层并行扫描实现（opt-in，CAP 定案）+ R5.12 成本
-   自动启用（2 ms 阈值 + 并行扫描独立成本类 + 反馈翻回，机制复用
-   R5.3/R5.8）；并行段目前仅覆盖聚合阶段，扫描/物化段仍串行
-   （§14.11.5-1，现以实测曲线背书，§14.13）。
+   B 期前置实测证据、设计/评估与 R5.11 实现均已完成（§14.13/§14.14/
+   §14.15）：fused 扫描+折叠（行组范围切分、复用 A 期合并/预算机制），
+   CAP = min(hw-1, 8) 由实测定案（1M 5.49x@8 worker、3.28x@4；
+   cap-8 矩阵 12/12 格吞吐为正、p99 最大 1.77x < 2.0x）。余项：
+   R5.12 成本自动启用（2 ms 阈值 + 并行扫描独立成本类 + 反馈翻回，
+   机制复用 R5.3/R5.8，CAP 已定、前置满足）；并行段现覆盖扫描+
+   聚合，输出段（HAVING/ORDER BY/TopK）仍串行。
 4. **JOIN 路径标签**（已完成，见 §14.9）：`execute_select_with_joins`
    的 4 条快路径与通用 hash join、CTE 的递归/内联/物化三条路由均有
    路由标签，其 EXPLAIN ANALYZE 输出 `Actual Path` 行；并入余项 1
@@ -1434,8 +1432,10 @@ R3 批量管道形状，单源聚合保持门控内）。
    体（zone map 裁剪 → `read_rg_into_accumulators` →
    `build_arrow_batch`）无跨行组状态。每个 worker 可对一段连续行组
    独立构建自己的流——这是存储层并行化的结构前提。
-3. **morsel 粒度 = 行组（65536 行）**：200K ≈ 4 个行组、1M ≈ 16 个。
-   canary 规模并行粒度粗（与 200K 曲线 1.09x 一致），1M 粒度充足。
+3. **morsel 粒度 = 行组（自适应 32768~131072 行）**：bench 宽表取
+   32768 行/RG——200K = 7 行组、1M = 31 行组（R5.11 实测回填，§14.15.4）；
+   canary 规模并行粒度偏粗（A 期 200K 曲线 1.09x；R5.11 fused 2.6x
+   饱和），1M 粒度充足。
 4. **合并基础已存在且有测试**：partial `BatchGroupAggregator` 按块序
    （行组序）归并、键 lane 确定性重 interning（含 float 不可结合性
    说明 §14.11.5-2 与 parity 回归）——B 期直接复用，不新增合并路径。
@@ -1456,11 +1456,12 @@ R3 批量管道形状，单源聚合保持门控内）。
 JSON+GROUP BY 58.8 / JSON+ORDER BY 48.8 / CSV+GROUP BY 29.2 /
 CSV+ORDER BY 17.7 ms）中扫描段占 80~95%；§14.13 曲线证明仅并行
 fold 的端到端上限 ≤1.112x——必须并行扫描段才能突破 Amdahl 封顶。
-预期（估计，**R5.11 必须实测定案，不得以本估计替代**，§14.8.2
-规则）：暖态 fused 段 CPU 受限、约 85% 可并行，Amdahl 下 4 worker
-约 2.5~3x、8 worker 约 3~4x；200K 受 4 行组粒度限制，收益有限
-（~1.2~1.5x 量级）——这正是自动启用阈值以"预测串行时间"而非行数
-为判据的原因（§14.8.5）。
+预期（设计期估计，**R5.11 已实测定案，§14.15.4**，§14.8.2 规则）：
+暖态 fused 段 CPU 受限、约 85% 可并行，Amdahl 下 4 worker 约 2.5~3x、
+8 worker 约 3~4x。**R5.11 实测回填**：1M 在 4 worker 3.28~3.38x、
+8 worker **5.49x**（预测偏保守——实际 Amdahl 串行段小于假设的
+15%）；200K 在 4 worker 即饱和于 2.6x（7 行组粒度足够 4 worker）——
+自动启用阈值以"预测串行时间"而非行数为判据的结论不变（§14.8.5）。
 
 #### 14.14.3 并行结构（设计：fused 扫描+折叠、行组范围切分）
 
@@ -1543,12 +1544,149 @@ O(T × 一批 + 部分组状态)（14.14.1-6）。
 1. **冷态**：首次触碰的 page fault 按 worker 请求串行化，加速退化；
    token 池界定最坏情形，R5.12 反馈翻回处理结构性慢的环境。门禁表
    为暖态，冷态不入门禁基线（观测项）。
-2. **200K 粒度粗（4 行组）**：canary 规模可测加速有限，门禁 par
-   指标（200K 2/4 线程）可能贴近串行基线——粒度约束而非缺陷；1M
-   是加速验证主规模。
+2. **200K 粒度（7 行组，R5.11 实测）**：fused 路径 4 worker 即
+   饱和（2.6x），canary 规模可测加速真实但有限；1M 是加速验证主
+   规模（8 worker 5.49x）。行组大小属既有自适应存储参数，非并行缺陷。
 3. **裁剪偏斜的负载不均**：zone map 可能整段裁掉某些 worker 的行组
    （提前完成）；块序合并与完成顺序无关，确定性不受影响——观测项。
 4. **CAP 未定案前不得启动 R5.12**：上限值是自动启用的输入，顺序
    不可颠倒。
 5. **14.14.2 的预期值仅为设计输入**，R5.11 实测后回填本文档，
    不得用于门禁基线或验收判据。
+
+### 14.15 R5.11：存储层并行扫描实现（fused 扫描+折叠，CAP 定案）
+
+本节为实现阶段（§14.14.6 R5.11）：把 A 期的"串行收集 + 并行折叠"
+替换为"行组范围切分 + 每 worker fused 扫描+折叠"，并以实测曲线/矩阵
+定案 worker 预算上限（§14.14.4-2 承诺"CAP 不预设，由实测定案"）。
+`APEX_PARALLEL_SCAN=N` 门控、token 预算机制、确定性合并、回退语义
+全部复用 A 期，默认路径（env 未设）行为不变。
+
+#### 14.15.1 交付物
+
+1. **fused 并行扫描**：每个 worker 拥有自己的连续行组范围流
+   （`scan_batches_ranges` / `RgBatchStream::with_range`），独立完成
+   扫描（mmap 行组读取 + zone map 裁剪 + 列解码）+ 类型化谓词 +
+   折叠进独立 partial 组状态；partial 按范围序（行组序）确定性合并
+   （A 期合并函数抽取为 `merge_partial_into` 复用）。
+2. **消除 A 期全表物化**：A 期先把全部 morsel 收集进
+   `Vec<RecordBatch>`（内存 ≈ 投影宽 × 行数）再并行折叠；fused 路径
+   内存 = O(worker 数 × 一个行组 + 部分组状态)。
+3. **CAP 由实测定案 = 8**：`min(hardware_concurrency - 1, 8)`（原
+   A 期值 4）。测量协议与判据见 14.15.4；临时测量钩子
+   （`APEX_PARALLEL_TOKEN_CAP` env 覆盖上限）仅在测量期间存在，
+   定案后已撤除，最终产品不保留该表面。
+4. **取消语义在池线程可见**：取消 token 是调用线程的 thread-local，
+   池 worker 不可见——新增 `query_cancel_token()` getter，fused 路径
+   在派发前捕获共享 `Arc<AtomicBool>`，worker 按行组边界检查
+   （与 A 期"每批边界一次原子检查，绝不每行"纪律一致）。
+5. **删除 A 期死代码**：`parallel_batch_group_fold` /
+   `serial_fold_batches` 被 fused 路径 + `serial_fold_stream` 替换
+   （默认路径、无 token 回退、单行组回退、`Unsupported` 回退单批
+   路径语义不变）。
+
+#### 14.15.2 实现明细
+
+| 文件 | 变更 |
+| --- | --- |
+| `apexbase/src/storage/on_demand/mmap_scan/projection.rs` | `RgBatchStream` 增加 `end_rg` 范围边界（`new` 初始化为全空间）+ `with_range(start, end)`（共享读视图：`Arc<Mmap>` 克隆 + footer 快照克隆，仅并行路径使用）；新增 `scan_rg_batches_ranges`：连续行组区间切分（chunk 取整向上、尾段收敛），行组数 <2 或请求 <2 时收敛为单流 |
+| `apexbase/src/storage/scan.rs` | `BatchMorselStream` 内部迭代器加 `Send` 约束（worker 跨线程池移动流的前提；具体迭代器 `RgBatchStream` 全字段 Send，读视图共享不可变） |
+| `apexbase/src/storage/backend.rs` | `scan_batches` 的门控+建流拆为 `scan_batches_split(request, part)`（part=1 即原语义）；新增 `scan_batches_ranges(request, range_count)` 委托同一门控 |
+| `apexbase/src/query/executor/batch_group.rs` | 并行分支重写：先取 token（RAII guard 同句创建，无泄漏窗口）→ `scan_batches_ranges` → 范围数 ≥2 走 `parallel_fused_scan_fold`（每查询专属 scoped 池，`into_par_iter` 保序收集），否则 `serial_fold_stream` 单流；无 token / env 未设走同一 `serial_fold_stream` 默认路径；新增 `ParallelFusedOutcome`（Folded/Err/FallBack/Cancelled）与 `merge_partial_into`（A 期合并体抽取）；token 上限 4→8（14.15.4 定案）；删除 A 期收集循环与 `parallel_batch_group_fold`/`serial_fold_batches` |
+| `apexbase/src/query/executor/mod.rs` | 新增 `query_cancel_token()`（thread-local 的共享克隆 getter，供调用线程在派发前捕获） |
+
+#### 14.15.3 测试覆盖（Rust + Python 两侧）
+
+- Rust（2 项新增 + 既有 5 项并行测试扩展，`tests.rs`）：
+  - `fused_parallel_scan_ranges_partition_row_groups`：70K 宽行
+    fixture（自适应 32768 行/RG = 3 行组），range_count ∈ {1,2,3,5,8}
+    逐一拉空全部范围流，`_id` 集合必须恰好覆盖 1..=70000（无洞、
+    无重复；5/8 > 行组数验证收敛）。
+  - `fused_parallel_scan_reports_worker_count_in_path_detail`：EXPLAIN
+    ANALYZE 路径细节——串行无 `parallel=`；请求 2 worker 报告
+    `parallel=2`（env 锁下预算恒有 ≥2 空闲 token，3 行组 → 2 范围）。
+  - 既有 `parallel_batch_scan_matches_serial_pipeline` 线程集 2/4 →
+    2/4/8（请求多于预算授权数时必须仍与串行一致）。
+- Python（1 项新增 + 既有扩展，`test/test_batch_scan_pipeline.py`）：
+  - `test_parallel_batch_scan_reports_fused_path_detail`：200K 种子，
+    fused 结果与串行一致 + EXPLAIN ANALYZE 路径含
+    `batched_scan_pipeline(batches=` 与 `, parallel=2)`。
+  - 既有 parity 测试线程集 2/4 → 2/4/8。
+- 既有覆盖经 fused 路径回归：A 期 5 项 Rust 测试（parity / 无 token
+  回退 / 单行组 / delta 状态回退 / 取消）与 Python 并行测试全部不改
+  断言直接通过（同一公共 API + env 门控）。
+- 门禁扩展：并行指标（200K 2/4 线程；1M 2/4/8 线程，canary/完整模式
+  既有 par 段）在 R5.11 起测量 fused 路径；曲线/矩阵测量脚本
+  `benchmarks/bench_parallel_evidence.py`（R5.9 交付）复用，无新
+  benchmark 形状（AGENTS.md §1.3 由既有 par 段 + 本轮曲线/矩阵满足）。
+
+#### 14.15.4 CAP 定案测量（conda base，release wheel，同机 M1 Pro 10 核，2026-09-10）
+
+**加速曲线**（端到端中位时延，3 窗口中位数的中位；有效 worker 取自
+EXPLAIN ANALYZE 路径细节；200K = 7 行组，1M = 31 行组）：
+
+| 请求 | 200K cap4 | 200K cap8 | 1M cap4 | 1M cap8 |
+| --- | --- | --- | --- | --- |
+| 1（串行） | 6.935 ms / 1.000 | 6.879 / 1.000 | 34.176 / 1.000 | 33.122 / 1.000 |
+| 2 | 4.796 / 1.446 | 4.779 / 1.439 | 19.170 / 1.783 | 18.655 / 1.776 |
+| 3 | 4.827 / 1.437 | 4.796 / 1.434 | 14.553 / 2.348 | 14.548 / 2.277 |
+| 4 | 2.661 / **2.606** | 2.684 / 2.563 | 10.116 / **3.378** | 10.089 / 3.283 |
+| 8（有效 4 / 8） | 2.671 / 2.596（有效 4） | 2.671 / 2.575（**有效 8**） | 10.118 / 3.378（有效 4） | 6.033 / **5.490**（**有效 8**） |
+
+- **1M：8 worker 显著优于 4 worker**（6.033 vs 10.089 ms，同一运行内
+  4→8 改善 40%，非负载伪影）：31 行组 / 8 worker ≈ 4 行组/worker，
+  负载均衡 + 解码/折叠重叠更充分；§14.8.2 的 3~5x（4~8 线程）理想
+  区间在 8 worker 处实测落位（5.49x）。
+- **200K：4 worker 即饱和**（cap8 的 8 worker 无增益，2.575 vs
+  2.563，噪声内）：7 行组粒度下 4 worker 已足够。
+- **判据核对**（§14.14.4-2）：cap4 的 1M 曲线在 4 处**未**走平
+  （3→4 仍 +44%），不能以 4 定案；cap8 的 1M 曲线尾部（8）为当前
+  机器（8 个性能核）的工作上限，200K 两档一致 → **CAP = 8**。
+
+**争抢矩阵**（200K，3 窗口 × 2000 查询/窗口，cap 8；运行窗口负载
+3.7~9.1）：
+
+| C | P=2 Δ（p99x） | P=4 Δ（p99x） | P=8 Δ（p99x） |
+| --- | --- | --- | --- |
+| 1 | +48.3%（0.67） | +156.2%（0.38） | +155.6%（0.39） |
+| 2 | +49.9%（0.67） | +163.6%（0.45） | +69.4%（1.16） |
+| 4 | +50.0%（0.72） | +45.0%（1.29） | +35.9%（1.08） |
+| 8 | +13.3%（1.32） | +2.4%（**1.77**） | +6.8%（1.28） |
+
+对照 §14.8.3-2：≥2 并发吞吐不低于串行——**12/12 格全部为正**（最差
+C=8/P=4 +2.4%）；p99 放大 <2.0x——**最大 1.77x（C=8/P=4）达成**。
+对照 A 期 cap4 矩阵（R5.9，fold-only 并行）：C=2/4 仅 +1.4%~+8.9%、
+C=8 三格为负——fused 并行把扫描段也纳入后，所有 (C, P) 格转正且增益
+放大一个数量级。残余：C=8/P=4 的 1.77x p99 在高负载窗口逼近阈值，
+B 期自动启用（R5.12）以 2 ms 预测串行阈值 + 反馈翻回兜底（§14.8.5
+机制不变）。
+
+原始数据：`local-perf-results/r511-curve-{200k,1m}-cap{4,8}/` 与
+`local-perf-results/r511-matrix-200k-cap8/`（每窗口 JSON + 汇总）。
+
+#### 14.15.5 验收链（conda base，release wheel，2026-09-10）
+
+| 项目 | 结果 |
+| --- | --- |
+| release 构建（maturin develop --release） | 成功；warning A/B（同命令干净树对比）196 = 196，零新增 |
+| pytest（完整串行） | 1775 passed（1774+1 新增），32.84s |
+| cargo test（完整） | 551 lib（549+2 新增）+ 6 doc passed |
+| 公开 benchmark（1M 行 / 2 预热 / 5 计时，结果缓存关闭） | 103/103 项执行;与基线 492956b 中位数比 0.9449(R5.9 当日 0.9938);2 项 ≥+15%(CSV Read + COUNT(*) +18.9%、GROUP BY category ORDER BY count +18.6%):CSV 经同构建自 A/B 证伪(base 旧 wheel 客户端不支持 read_csv 表函数,base 侧 A/B 不可能;同 wheel 两个独立进程交错 8 窗口 × 30 次、每侧 240 样本:+0.25%,单次 span 5.99~7.86 ms 完全覆盖基线与 flag 值;CSV 解码路径与 R5.11 差异字节一致);GROUP BY 对 origin/main A/B(8 窗口 × 30 次、每侧 240 样本、方向一致)+8.59%——小而一致的累积 R5.x 差异(base 为 pre-R5 构建),R5.11 在该路径结构零差异(无 WHERE → 批量管道未使用,规划器未变);该指标当日同构建两次完整公开运行跨度 0.67~2.07 ms。Numeric OR (age=20\|30\|40\|50)(名称含字面 `|` 使朴素 表格解析失配)单独核对 26.88 ms vs 基线 27.313 ms = −1.6%(非 flag)。A/B 明细 local-perf-results/20260910-r511-ab/(含 README),原始表格 local-perf-results/20260910-r511-public/ |
+| 本地同机 canary（base=origin/main 7da4db2e385a，200K 行 / 2 预热 / 7 计时，62 项） | 首轮 20260910-111236 **exit 0**:62/62 项 ok(3 样本初判即无 flag,无需五样本扩展);par 指标(200K 2/4 线程)自此测量 fused 路径,与 pre-R5.11 base 比较全部在阈内 |
+| 完整模式（1M 行 / 2 预热 / 5 计时，78 项，base=origin/main 7da4db2e385a） | 首轮 20260910-112539 **exit 0**：perf 表 109/109 项 ok（3 样本初判即无 flag，无需五样本扩展）；par 段 2/4/8 线程 = −36.76%/−66.26%/−76.58%（30.739→19.438 / 31.049→10.476 / 32.461→7.602 ms；base 无并行路径，即 fused 相对 pre-R5.11 串行 1.6~4.3x 加速）；qps 10/10、quant 8/8、idx 4/4 全部 ok（热路径修改必跑项，已跑） |
+
+#### 14.15.6 残余风险与入口结论
+
+1. **C=8/P=4 的 1.77x p99**（高负载窗口）：低于 2.0x 阈值但裕量小于
+   C≤4；R5.12 自动启用的启用决策与反馈翻回须覆盖该最坏情形
+   （启用阈值 2 ms 预测串行时间 + 并行扫描独立成本类 + 翻回串行，
+   §14.8.5 机制复用 R5.3/R5.8）。
+2. **200K 粒度粗**（7 行组）：4 worker 即饱和，canary 规模（200K）
+   的并行指标收益有限（~2.6x 形状），1M 是加速验证主规模（5.49x）；
+   行组大小固定 32768~131072（自适应），粒度随表宽度变化，属既有
+   存储参数而非并行缺陷。
+3. **footer 快照克隆/worker**：并行路径每 worker 克隆一次 footer
+   （行数组数 × 元数据，1M 约 KB 级）；串行路径零变化。
+4. **B 期入口**：存储层并行扫描已落地且 CAP 定案；余项仅剩 R5.12
+   成本自动启用（2 ms 阈值 + `PLAN_FEEDBACK` 并行扫描独立成本类 +
+   反馈翻回串行），机制全部复用 R5.3/R5.8，顺序依赖满足（CAP 已定）。
