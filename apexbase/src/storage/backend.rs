@@ -1500,6 +1500,30 @@ impl TableStorageBackend {
         &'a self,
         request: &crate::storage::ScanRequest<'a>,
     ) -> io::Result<Option<crate::storage::BatchMorselStream<'a>>> {
+        let streams = self.scan_batches_split(request, 1)?;
+        Ok(streams.and_then(|mut v| v.pop()))
+    }
+
+    /// B-phase fused parallel scan: `range_count` batch streams over
+    /// contiguous, disjoint row-group ranges (same gate as
+    /// `scan_batches`); a row-group space with fewer than two groups
+    /// collapses to the single full-range stream.
+    pub(crate) fn scan_batches_ranges<'a>(
+        &'a self,
+        request: &crate::storage::ScanRequest<'a>,
+        range_count: usize,
+    ) -> io::Result<Option<Vec<crate::storage::BatchMorselStream<'a>>>> {
+        self.scan_batches_split(request, range_count)
+    }
+
+    /// Shared gate + stream construction for the batched scan: `part`
+    /// streams over contiguous, disjoint row-group ranges (part = 1 is
+    /// the serial single stream).
+    fn scan_batches_split<'a>(
+        &'a self,
+        request: &crate::storage::ScanRequest<'a>,
+        part: usize,
+    ) -> io::Result<Option<Vec<crate::storage::BatchMorselStream<'a>>>> {
         if let Some(columns) = request.projection {
             for column in columns {
                 let clean = column
@@ -1558,19 +1582,22 @@ impl TableStorageBackend {
             None => None,
         };
 
-        let stream = match self.storage.scan_rg_batches(
+        let streams = match self.storage.scan_rg_batches_ranges(
             projection_names.as_deref(),
             include_id,
             request.predicate,
+            part,
         )? {
-            Some(stream) => stream,
+            Some(streams) => streams,
             None => return Ok(None),
         };
 
-        Ok(Some(crate::storage::BatchMorselStream::new(
-            stream,
-            request.predicate,
-        )))
+        Ok(Some(
+            streams
+                .into_iter()
+                .map(|stream| crate::storage::BatchMorselStream::new(stream, request.predicate))
+                .collect(),
+        ))
     }
 
     /// Get row count

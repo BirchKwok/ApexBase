@@ -1199,6 +1199,37 @@ impl OnDemandStorage {
         RgBatchStream::new(self, column_names, include_id, predicate)
     }
 
+    /// B-phase fused parallel scan: `range_count` streams over
+    /// contiguous, disjoint row-group ranges covering the full row-group
+    /// space (same gate as `scan_rg_batches`); a row-group space with
+    /// fewer than two groups collapses to the single full-range stream.
+    pub(crate) fn scan_rg_batches_ranges<'a>(
+        &'a self,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+        predicate: Option<&'a crate::storage::ScanPredicateExpr>,
+        range_count: usize,
+    ) -> io::Result<Option<Vec<RgBatchStream<'a>>>> {
+        let base = match RgBatchStream::new(self, column_names, include_id, predicate)? {
+            Some(base) => base,
+            None => return Ok(None),
+        };
+        let total = base.footer.row_groups.len();
+        if range_count < 2 || total < 2 {
+            return Ok(Some(vec![base]));
+        }
+        let part = range_count.min(total);
+        let chunk = (total + part - 1) / part;
+        let mut streams = Vec::with_capacity(part);
+        let mut start = 0usize;
+        while start < total {
+            let end = (start + chunk).min(total);
+            streams.push(base.with_range(start, end));
+            start = end;
+        }
+        Ok(Some(streams))
+    }
+
     pub(super) fn read_column_auto(
         &self,
         col_idx: usize,
@@ -5040,6 +5071,7 @@ impl OnDemandStorage {
         include_id: bool,
         predicate: Option<&'a crate::storage::ScanPredicateExpr>,
         next_rg: usize,
+        end_rg: usize,
     }
 
 impl<'a> RgBatchStream<'a> {
@@ -5080,12 +5112,29 @@ impl<'a> RgBatchStream<'a> {
         Ok(Some(Self {
             storage,
             mmap,
-            footer,
             col_indices,
             include_id,
             predicate,
             next_rg: 0,
+            end_rg: footer.row_groups.len(),
+            footer,
         }))
+    }
+
+    /// Contiguous row-group range view of this stream (B-phase fused
+    /// parallel scan): shares the stable read view, iterates only
+    /// [start_rg, end_rg).
+    pub(crate) fn with_range(&self, start_rg: usize, end_rg: usize) -> Self {
+        Self {
+            storage: self.storage,
+            mmap: self.mmap.clone(),
+            footer: self.footer.clone(),
+            col_indices: self.col_indices.clone(),
+            include_id: self.include_id,
+            predicate: self.predicate,
+            next_rg: start_rg,
+            end_rg,
+        }
     }
 }
 
@@ -5095,7 +5144,7 @@ impl Iterator for RgBatchStream<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let rg_idx = self.next_rg;
-            if rg_idx >= self.footer.row_groups.len() {
+            if rg_idx >= self.end_rg {
                 return None;
             }
             self.next_rg += 1;

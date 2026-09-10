@@ -330,14 +330,14 @@ pub(crate) enum BatchMorselOutcome {
 /// (active) row space, so concatenating the batches reproduces the
 /// single-shot row order.
 pub(crate) struct BatchMorselStream<'a> {
-    inner: Box<dyn Iterator<Item = io::Result<RecordBatch>> + 'a>,
+    inner: Box<dyn Iterator<Item = io::Result<RecordBatch>> + Send + 'a>,
     predicate: Option<&'a ScanPredicateExpr>,
     row_offset: usize,
 }
 
 impl<'a> BatchMorselStream<'a> {
     pub(crate) fn new(
-        inner: impl Iterator<Item = io::Result<RecordBatch>> + 'a,
+        inner: impl Iterator<Item = io::Result<RecordBatch>> + Send + 'a,
         predicate: Option<&'a ScanPredicateExpr>,
     ) -> Self {
         Self {

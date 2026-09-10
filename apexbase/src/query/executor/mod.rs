@@ -279,6 +279,13 @@ pub fn query_cancelled() -> bool {
     })
 }
 
+/// Clone of the current thread's query cancellation token, if installed.
+/// Workers on other threads (the parallel scan pool) cannot see the
+/// thread-local, so the caller captures the token before dispatching.
+pub fn query_cancel_token() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    QUERY_CANCEL.with(|c| c.borrow().clone())
+}
+
 // ============================================================================
 // Helper functions to reduce code duplication
 // ============================================================================
