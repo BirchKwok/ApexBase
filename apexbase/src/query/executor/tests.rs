@@ -3207,7 +3207,9 @@ fn parallel_batch_scan_matches_serial_pipeline() {
         .iter()
         .map(|sql| run_with_parallel_scan(None, &path, sql))
         .collect::<Vec<_>>();
-    for &threads in &[2usize, 4] {
+    // 8 requests more workers than the process budget grants; the fused
+    // path must still match serial at every granted count.
+    for &threads in &[2usize, 4, 8] {
         for (sql, expected) in queries.iter().zip(serial.iter()) {
             let parallel = run_with_parallel_scan(Some(threads), &path, sql);
             assert_batches_logically_equal(expected, &parallel, sql);
@@ -3316,6 +3318,87 @@ fn parallel_batch_scan_honors_cancellation_token() {
     let parallel = run_with_parallel_scan(Some(2), &path, sql);
     let serial = run_with_parallel_scan(None, &path, sql);
     assert_batches_logically_equal(&serial, &parallel, sql);
+}
+
+#[test]
+fn fused_parallel_scan_ranges_partition_row_groups() {
+    // 70K wide rows force the adaptive 32768-row RG size (three RGs);
+    // any requested range count must partition the row-group space
+    // exactly once (no gaps, no overlaps) at the storage level.
+    use arrow::array::Int64Array;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fused_ranges.apex");
+    create_batch_scan_fixture(&path);
+
+    let backend = TableStorageBackend::open(&path).unwrap();
+    let projection: &[&str] = &["_id", "code"];
+    let request = crate::storage::ScanRequest {
+        projection: Some(projection),
+        predicate: None,
+    };
+    for range_count in [1usize, 2, 3, 5, 8] {
+        let mut ranges = backend
+            .scan_batches_ranges(&request, range_count)
+            .unwrap()
+            .expect("range streams");
+        let mut ids: Vec<i64> = Vec::new();
+        for stream in &mut ranges {
+            for outcome in stream {
+                let batch = match outcome {
+                    Ok(crate::storage::BatchMorselOutcome::Morsel(morsel)) => {
+                        morsel.into_record_batch().unwrap()
+                    }
+                    Ok(crate::storage::BatchMorselOutcome::Unsupported) => {
+                        panic!("typed columns must stay supported")
+                    }
+                    Err(err) => panic!("stream error: {err}"),
+                };
+                let id_array = batch
+                    .column_by_name("_id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for i in 0..id_array.len() {
+                    ids.push(id_array.value(i));
+                }
+            }
+        }
+        ids.sort_unstable();
+        let expected: Vec<i64> = (1..=70_000).collect();
+        assert_eq!(
+            ids, expected,
+            "range_count={range_count}: ranges must cover every row exactly once"
+        );
+    }
+}
+
+#[test]
+fn fused_parallel_scan_reports_worker_count_in_path_detail() {
+    // The fused path must report the granted worker count in the EXPLAIN
+    // ANALYZE path detail; the serial default must not.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fused_path.apex");
+    create_batch_scan_fixture(&path);
+
+    let sql = "EXPLAIN ANALYZE SELECT city, COUNT(*) AS n FROM default WHERE amount > 0 GROUP BY city ORDER BY n DESC, city LIMIT 5";
+
+    let serial_plan = with_parallel_scan(None, || explain_analyze_plan(&path, sql));
+    assert!(
+        serial_plan.contains("batched_scan_pipeline(batches="),
+        "{serial_plan}"
+    );
+    assert!(!serial_plan.contains("parallel="), "{serial_plan}");
+
+    // Two requested workers: the budget (min(hw-1, 4)) always has at
+    // least two free tokens while the env lock is held, and the 3-RG
+    // fixture yields two ranges, so the detail must say parallel=2.
+    let parallel_plan = with_parallel_scan(Some(2), || explain_analyze_plan(&path, sql));
+    assert!(
+        parallel_plan.contains("batched_scan_pipeline(batches="),
+        "{parallel_plan}"
+    );
+    assert!(parallel_plan.contains(", parallel=2)"), "{parallel_plan}");
 }
 
 #[test]

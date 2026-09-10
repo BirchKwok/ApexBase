@@ -282,12 +282,38 @@ def test_parallel_batch_scan_matches_serial_pipeline():
                     serial = _run(client, sql)
                 finally:
                     os.environ.pop("APEX_BATCH_SCAN", None)
-                for threads in (2, 4):
+                for threads in (2, 4, 8):
                     parallel = _run_parallel(client, sql, threads)
                     assert parallel == serial, (
                         f"parallel({threads})/serial results diverge:\n{sql}\n"
                         f"serial   ={str(serial[:3])}\nparallel={str(parallel[:3])}"
                     )
+        finally:
+            client.close()
+
+
+def test_parallel_batch_scan_reports_fused_path_detail():
+    # B-phase fused scan+fold: the granted worker count is reported in
+    # the EXPLAIN ANALYZE path detail, and results match serial.
+    with tempfile.TemporaryDirectory() as tmp:
+        client = _make_client(tmp)
+        _seed(client)
+        try:
+            sql = QUERIES[0]
+            serial = _run(client, sql)
+            os.environ["APEX_PARALLEL_SCAN"] = "2"
+            try:
+                parallel = _run(client, sql)
+                plan = _run(client, "EXPLAIN ANALYZE " + sql)
+            finally:
+                os.environ.pop("APEX_PARALLEL_SCAN", None)
+            assert parallel == serial, (
+                f"fused/serial results diverge:\n{sql}\n"
+                f"serial   ={str(serial[:3])}\nparallel={str(parallel[:3])}"
+            )
+            plan_text = plan[0]["plan"]
+            assert "batched_scan_pipeline(batches=" in plan_text, plan_text
+            assert ", parallel=2)" in plan_text, plan_text
         finally:
             client.close()
 
