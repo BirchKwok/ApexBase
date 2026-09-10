@@ -184,3 +184,14 @@ def test_benchmark_git_metadata_accepts_dirty_override(monkeypatch):
 
     monkeypatch.setenv("APEXBASE_BENCHMARK_DIRTY", "1")
     assert benchmark.get_git_info()["dirty"] is True
+
+
+def test_commit_canary_runs_real_wal_commit_and_reopen():
+    path = ROOT / "benchmarks" / "bench_perf_canary.py"
+    spec = importlib.util.spec_from_file_location("commit_canary", path)
+    benchmark = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(benchmark)
+    results = benchmark.run_commit_canary(50, 1, 2)
+    assert len(results) == 1
+    assert results[0]["query"] == "Rust Safe TXN INSERT 10 + COMMIT"
+    assert results[0]["ApexBase"] > 0

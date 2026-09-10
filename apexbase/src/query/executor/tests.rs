@@ -3,6 +3,79 @@ use crate::storage::OnDemandStorage;
 use std::collections::HashMap;
 use tempfile::tempdir;
 
+#[test]
+fn commit_contract_invalid_transaction_preserves_error_kind() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t.apex");
+    let error = crate::Session::new(dir.path(), &path).commit_txn(u64::MAX).err().expect("invalid transaction must fail");
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let detail = error.get_ref().unwrap().downcast_ref::<crate::txn::CommitError>().unwrap();
+    assert_eq!(detail.outcome, crate::txn::CommitOutcome::Unknown);
+    assert_eq!(detail.txn_id, u64::MAX);
+    let txn_id = crate::txn::txn_manager().begin();
+    let session = crate::Session::new(dir.path(), &path);
+    session.commit_txn(txn_id).unwrap();
+    let repeated = session.commit_txn(txn_id).err().expect("finished transaction must fail");
+    let detail = repeated.get_ref().unwrap().downcast_ref::<crate::txn::CommitError>().unwrap();
+    assert_eq!(detail.outcome, crate::txn::CommitOutcome::Unknown);
+}
+
+#[test]
+#[cfg(unix)]
+fn commit_contract_real_io_failures_and_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+    use crate::txn::{CommitError, CommitOutcome};
+    for (suffix, expected, recovered_rows) in [
+        ("wal", CommitOutcome::NotCommitted, 1),
+        ("delta", CommitOutcome::Unknown, 2),
+        ("wal.meta", CommitOutcome::Committed, 2),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.apex");
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path, crate::storage::DurabilityLevel::Safe,
+            &[("value".to_string(), crate::storage::ColumnType::Int64)],
+        ).unwrap();
+        storage.insert_rows(&[HashMap::from([("value".to_string(), crate::storage::ColumnValue::Int64(0))])]).unwrap();
+        storage.save_full().unwrap();
+        drop(storage);
+        let session = crate::Session::new(dir.path(), &path);
+        let mgr = crate::txn::txn_manager();
+        let txn_id = mgr.begin();
+        session.execute_in_txn(txn_id, SqlParser::parse("INSERT INTO t (value) VALUES (1)").unwrap()).unwrap();
+        let epoch = crate::storage::epoch::current(&path);
+        let fault = dir.path().join(format!("t.apex.{suffix}"));
+        if suffix == "wal.meta" {
+            if fault.exists() { std::fs::remove_file(&fault).unwrap(); }
+            std::fs::create_dir(&fault).unwrap();
+        } else {
+            if !fault.exists() { std::fs::write(&fault, []).unwrap(); }
+            std::fs::set_permissions(&fault, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let result = session.commit_txn(txn_id);
+        if suffix == "wal.meta" {
+            std::fs::remove_dir(&fault).unwrap();
+        } else {
+            std::fs::set_permissions(&fault, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let error = result.err().expect("real I/O fault must fail the commit");
+        let detail = error.get_ref().unwrap().downcast_ref::<CommitError>().unwrap();
+        assert_eq!(detail.outcome, expected, "{suffix}: {error}");
+        assert!(!mgr.is_active(txn_id));
+        if expected == CommitOutcome::Committed {
+            assert!(crate::storage::epoch::current(&path) > epoch);
+        }
+        let reopened = OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe).unwrap();
+        assert_eq!(reopened.row_count(), recovered_rows, "{suffix}");
+        drop(reopened);
+        let next = mgr.begin();
+        session.execute_in_txn(next, SqlParser::parse("INSERT INTO t (value) VALUES (2)").unwrap()).unwrap();
+        session.commit_txn(next).unwrap();
+        let reopened = OnDemandStorage::open_with_durability(&path, crate::storage::DurabilityLevel::Safe).unwrap();
+        assert_eq!(reopened.row_count(), recovered_rows + 1, "{suffix}");
+    }
+}
+
 fn create_test_storage(path: &Path) {
     let storage = OnDemandStorage::create(path).unwrap();
 

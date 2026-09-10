@@ -361,7 +361,9 @@ class TestTransactionIsolation:
             )
 
             owner.execute('COMMIT')
-            with pytest.raises(RuntimeError, match='conflict'):
+            with pytest.raises(
+                RuntimeError, match='commit_outcome=not_committed.*conflict'
+            ):
                 contender.execute('COMMIT')
 
             assert contender._in_txn is False

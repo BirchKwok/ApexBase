@@ -138,7 +138,7 @@ def test_failed_commit_after_marker_converges_after_reopen():
             pass
         os.chmod(delta_path, 0o444)
         try:
-            with pytest.raises(RuntimeError):
+            with pytest.raises(RuntimeError, match="commit_outcome=unknown"):
                 c.execute("COMMIT")
         finally:
             os.chmod(delta_path, 0o644)
@@ -171,7 +171,7 @@ def test_failed_commit_before_marker_aborts_cleanly():
         wal_path = os.path.join(d, "t.apex.wal")
         os.chmod(wal_path, 0o444)
         try:
-            with pytest.raises(RuntimeError):
+            with pytest.raises(RuntimeError, match="commit_outcome=not_committed"):
                 c.execute("COMMIT")
         finally:
             os.chmod(wal_path, 0o644)
@@ -183,3 +183,70 @@ def test_failed_commit_before_marker_aborts_cleanly():
         names = [r["name"] for r in c2.execute("SELECT name FROM t ORDER BY _id").to_dict()]
         assert names == ["seed"]
         c2.close()
+
+
+def test_commit_watermark_failure_is_committed_and_visible(tmp_path):
+    c = ApexClient(str(tmp_path), _auto_manage=False, durability="safe")
+    c.create_table("t", {"name": "string", "value": "int"})
+    c.use_table("t")
+    c.store([{"name": "seed", "value": 0}])
+    c.flush()
+    other = ApexClient(str(tmp_path), _auto_manage=False, durability="safe")
+    other.use_table("t")
+    assert other.execute("SELECT COUNT(*) FROM t").scalar() == 1
+
+    c._storage.execute("BEGIN")
+    c._in_txn = True
+    c.execute("INSERT INTO t (name, value) VALUES ('committed', 1)")
+    marker = tmp_path / "t.apex.wal.meta"
+    if marker.exists():
+        marker.unlink()
+    marker.mkdir()  # Real I/O failure, without replacing the storage path.
+    try:
+        with pytest.raises(RuntimeError, match="commit_outcome=committed") as error:
+            c.execute("COMMIT")
+        assert "do not replay DML" in str(error.value)
+        assert c._in_txn is False
+    finally:
+        marker.rmdir()
+    assert other.execute("SELECT COUNT(*) FROM t").scalar() == 2
+    c._storage.execute("BEGIN")
+    c._in_txn = True
+    c.execute("INSERT INTO t (name, value) VALUES ('next', 2)")
+    c.execute("COMMIT")
+    other.close()
+    c.close()
+    with ApexClient(str(tmp_path), _auto_manage=False, durability="safe") as reopened:
+        reopened.use_table("t")
+        assert reopened.execute("SELECT name FROM t ORDER BY _id").to_dict() == [
+            {"name": "seed"}, {"name": "committed"}, {"name": "next"},
+        ]
+
+
+def test_cross_table_apply_failure_is_unknown(tmp_path):
+    c = ApexClient(str(tmp_path), _auto_manage=False, durability="safe")
+    for table in ("left_t", "right_t"):
+        c.create_table(table, {"value": "int"})
+        c.use_table(table)
+        c.store([{"value": 0}])
+        c.flush()
+    c._storage.execute("BEGIN")
+    c._in_txn = True
+    c.execute("INSERT INTO left_t (value) VALUES (1)")
+    c.execute("INSERT INTO right_t (value) VALUES (2)")
+    delta = tmp_path / "right_t.apex.delta"
+    delta.touch()
+    delta.chmod(0o444)
+    try:
+        with pytest.raises(RuntimeError, match="commit_outcome=unknown"):
+            c.execute("COMMIT")
+        assert c._in_txn is False
+    finally:
+        delta.chmod(0o644)
+    c.close()
+    with ApexClient(str(tmp_path), _auto_manage=False, durability="safe") as reopened:
+        for table, value in (("left_t", 1), ("right_t", 2)):
+            reopened.use_table(table)
+            assert reopened.execute(f"SELECT value FROM {table} ORDER BY _id").to_dict() == [
+                {"value": 0}, {"value": value},
+            ]

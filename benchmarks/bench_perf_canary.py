@@ -163,6 +163,47 @@ def run_quantized_canary(rows, warmup, iterations):
             client.close()
 
 
+def run_commit_canary(rows, warmup, iterations):
+    """Exercise the Rust Safe commit protocol, bypassing Python fast transactions.
+
+    Seed the same row count as the parent suite. Each sample inserts ten rows
+    through WAL, data application, publication and the applied watermark.
+    Setup and integrity checks are outside the timed region.
+    """
+    full_bench.ensure_optional_imports()
+    with tempfile.TemporaryDirectory(prefix="apexbase_commit_canary_") as tmpdir:
+        client = full_bench.open_apex_benchmark_client(
+            tmpdir, _auto_manage=False, durability="safe"
+        )
+        try:
+            client.create_table("commit_t", {"value": "int"})
+            client.use_table("commit_t")
+            client.store({"value": np.arange(rows, dtype=np.int64)})
+            client.flush()
+            values = ",".join(f"({i})" for i in range(10))
+
+            def commit():
+                client._storage.execute("BEGIN")
+                client._storage.execute(f"INSERT INTO commit_t (value) VALUES {values}")
+                return client._storage.execute("COMMIT")
+
+            elapsed = full_bench.run_bench(commit, warmup, iterations)
+            expected = rows + 10 * (warmup + iterations)
+            assert client.execute("SELECT COUNT(*) FROM commit_t").scalar() == expected
+            client.close()
+            client = full_bench.open_apex_benchmark_client(
+                tmpdir, _auto_manage=False, durability="safe"
+            )
+            client.use_table("commit_t")
+            assert client.execute("SELECT COUNT(*) FROM commit_t").scalar() == expected
+            name = "Rust Safe TXN INSERT 10 + COMMIT"
+            print(f"{name:<34} {elapsed:>12.6f} ms")
+            return [{"category": "ApexBase commit", "query": name,
+                     "ApexBase": round(elapsed, 6)}]
+        finally:
+            client.close()
+
+
 def run_canary(rows, warmup, iterations, qps_only=False, index_only=False, parallel_only=False):
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
@@ -266,6 +307,8 @@ def run_canary(rows, warmup, iterations, qps_only=False, index_only=False, paral
                     "ApexBase": round(qps.get(key, 0.0), 3),
                 })
                 print(f"{label:<34} {qps.get(key, 0.0):>12.3f} Q/s")
+        if not qps_only and not index_only and not parallel_only:
+            results.extend(run_commit_canary(rows, warmup, iterations))
         return results
     finally:
         bench.close()
