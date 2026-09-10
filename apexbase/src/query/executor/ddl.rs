@@ -856,6 +856,15 @@ impl ApexExecutor {
             let result = Self::execute_parsed_multi(stmt.clone(), base_dir, default_table_path);
             let actual_path = crate::query::executor::finish_path_trace();
             let index_ran = actual_path.as_deref() == Some("index_accelerated_read");
+            // The parallel batch scan reports its granted worker count in
+            // the path detail; its time belongs to the parallel cost
+            // class, never the serial prediction (architecture review R5.12).
+            let parallel_ran = actual_path
+                .as_deref()
+                .is_some_and(|path| {
+                    path.starts_with("batched_scan_pipeline")
+                        && path.contains(", parallel=")
+                });
             let plan_divergence = crate::query::executor::finish_plan_divergence();
             let result = result?;
             let elapsed = start.elapsed();
@@ -890,6 +899,15 @@ impl ApexExecutor {
                                 &table_path.to_string_lossy(),
                                 Self::planner_context(&backend, select.where_clause.as_ref()),
                             );
+                            let executed_class = if index_ran {
+                                crate::query::planner::ExecutedCostClass::Index
+                            } else if parallel_ran {
+                                crate::query::planner::ExecutedCostClass::ParallelScan
+                            } else {
+                                crate::query::planner::ExecutedCostClass::Scan
+                            };
+                            // The parallel class anchors on the scan-class
+                            // candidate cost: the same logical scan work.
                             let executed_cost = if crate::query::planner::is_index_cost_class(
                                 &plan.strategy,
                             ) == index_ran {
@@ -912,7 +930,7 @@ impl ApexExecutor {
                                 &plan.strategy,
                                 plan.cost.output_rows,
                                 batch.num_rows() as f64,
-                                index_ran,
+                                executed_class,
                                 executed_cost,
                                 elapsed.as_micros() as f64,
                             );

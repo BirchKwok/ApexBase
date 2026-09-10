@@ -119,6 +119,13 @@ pub(crate) struct PlanFeedback {
     pub(crate) index_cost_avg: f64,
     pub(crate) index_time_avg_us: f64,
     pub(crate) index_samples: u64,
+    /// Parallel batch scan class (architecture review R5.12): the
+    /// auto-enabled fused parallel scan records here so its measured time
+    /// never contaminates the serial prediction the auto-enable decision
+    /// compares against.
+    pub(crate) parallel_cost_avg: f64,
+    pub(crate) parallel_time_avg_us: f64,
+    pub(crate) parallel_samples: u64,
 }
 
 /// Process-global plan feedback, keyed by table key and then by shape hash
@@ -138,7 +145,10 @@ static FEEDBACK_LOADED: Lazy<RwLock<HashSet<String>>> =
 static FEEDBACK_PERSIST_LOCK: Lazy<std::sync::Mutex<()>> =
     Lazy::new(|| std::sync::Mutex::new(()));
 
-const FEEDBACK_SCHEMA_VERSION: u32 = 1;
+// R5.12 added the parallel cost class to PlanFeedback: sidecars written
+// before the bump no longer match the layout and count as "no persisted
+// feedback" (their shape re-calibrates on the next EXPLAIN ANALYZE).
+const FEEDBACK_SCHEMA_VERSION: u32 = 2;
 
 /// On-disk form of one table's plan feedback entries.
 #[derive(Debug, Serialize, Deserialize)]
@@ -246,17 +256,50 @@ pub fn is_index_cost_class(strategy: &ExecutionStrategy) -> bool {
     )
 }
 
+/// The cost class that actually executed, as recorded into PLAN_FEEDBACK
+/// (architecture review R5.3; the parallel batch scan class added by R5.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutedCostClass {
+    Scan,
+    Index,
+    ParallelScan,
+}
+
+/// The initial threshold for the cost-based auto-enable of the parallel
+/// batch scan (architecture review 14.8.5): the R5.3-calibrated serial
+/// prediction must reach 2 ms for the parallel dispatch cost to amortize.
+pub const PARALLEL_SCAN_AUTO_ENABLE_US: f64 = 2000.0;
+
+/// Decision input for the R5.12 auto-enable: the calibrated serial
+/// prediction, the parallel-class sample count, and the parallel-class
+/// measured-time average for (table, shape), in microseconds. None while
+/// the shape has no calibrated serial sample (the default stays serial).
+pub fn parallel_decision_input(
+    table_key: &str,
+    select: &SelectStatement,
+) -> Option<(f64, u64, f64)> {
+    ensure_feedback_loaded(table_key);
+    let guard = PLAN_FEEDBACK.read();
+    let entry = guard.get(table_key)?.get(&feedback_key(table_key, select))?;
+    (entry.scan_samples > 0).then_some((
+        entry.scan_time_avg_us,
+        entry.parallel_samples,
+        entry.parallel_time_avg_us,
+    ))
+}
+
 /// Record runtime feedback for EXPLAIN ANALYZE and future executions of the
 /// same normalized AST shape: row estimates (row-dimension calibration) and
 /// model cost vs measured time for the cost class that actually executed
-/// (time-dimension calibration, architecture review R5.3).
+/// (time-dimension calibration, architecture review R5.3; the parallel
+/// batch scan class, R5.12).
 pub fn record_plan_feedback(
     table_key: &str,
     select: &SelectStatement,
     strategy: &ExecutionStrategy,
     estimated_rows: f64,
     actual_rows: f64,
-    executed_index_class: bool,
+    executed_class: ExecutedCostClass,
     executed_cost: f64,
     actual_time_us: f64,
 ) {
@@ -280,6 +323,9 @@ pub fn record_plan_feedback(
             index_cost_avg: 0.0,
             index_time_avg_us: 0.0,
             index_samples: 0,
+            parallel_cost_avg: 0.0,
+            parallel_time_avg_us: 0.0,
+            parallel_samples: 0,
         });
         entry.strategy = strategy.clone();
         entry.estimated_rows =
@@ -288,23 +334,28 @@ pub fn record_plan_feedback(
         entry.actual_rows = (entry.actual_rows * entry.samples as f64 + actual_rows)
             / (entry.samples as f64 + 1.0);
         entry.samples = entry.samples.saturating_add(1);
-        if executed_index_class {
-            entry.index_cost_avg =
-                (entry.index_cost_avg * entry.index_samples as f64 + executed_cost)
-                    / (entry.index_samples as f64 + 1.0);
-            entry.index_time_avg_us =
-                (entry.index_time_avg_us * entry.index_samples as f64 + actual_time_us)
-                    / (entry.index_samples as f64 + 1.0);
-            entry.index_samples = entry.index_samples.saturating_add(1);
-        } else {
-            entry.scan_cost_avg =
-                (entry.scan_cost_avg * entry.scan_samples as f64 + executed_cost)
-                    / (entry.scan_samples as f64 + 1.0);
-            entry.scan_time_avg_us =
-                (entry.scan_time_avg_us * entry.scan_samples as f64 + actual_time_us)
-                    / (entry.scan_samples as f64 + 1.0);
-            entry.scan_samples = entry.scan_samples.saturating_add(1);
-        }
+        let bucket = match executed_class {
+            ExecutedCostClass::Index => (
+                &mut entry.index_cost_avg,
+                &mut entry.index_time_avg_us,
+                &mut entry.index_samples,
+            ),
+            ExecutedCostClass::ParallelScan => (
+                &mut entry.parallel_cost_avg,
+                &mut entry.parallel_time_avg_us,
+                &mut entry.parallel_samples,
+            ),
+            ExecutedCostClass::Scan => (
+                &mut entry.scan_cost_avg,
+                &mut entry.scan_time_avg_us,
+                &mut entry.scan_samples,
+            ),
+        };
+        let (cost_avg, time_avg_us, samples) = bucket;
+        *cost_avg = (*cost_avg * *samples as f64 + executed_cost) / (*samples as f64 + 1.0);
+        *time_avg_us =
+            (*time_avg_us * *samples as f64 + actual_time_us) / (*samples as f64 + 1.0);
+        *samples = samples.saturating_add(1);
         inner
             .iter()
             .map(|(shape, entry)| (*shape, entry.clone()))

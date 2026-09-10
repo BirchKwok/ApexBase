@@ -770,15 +770,28 @@ enum ParallelFusedOutcome {
 static PARALLEL_SCAN_TOKENS: std::sync::OnceLock<std::sync::atomic::AtomicUsize> =
     std::sync::OnceLock::new();
 
+/// In-flight worker budget capacity: min(hardware_concurrency - 1, 8).
+fn parallel_scan_capacity() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .saturating_sub(1)
+        .min(8)
+}
+
 fn parallel_scan_tokens() -> &'static std::sync::atomic::AtomicUsize {
-    PARALLEL_SCAN_TOKENS.get_or_init(|| {
-        let capacity = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2)
-            .saturating_sub(1)
-            .min(8);
-        std::sync::atomic::AtomicUsize::new(capacity)
-    })
+    PARALLEL_SCAN_TOKENS
+        .get_or_init(|| std::sync::atomic::AtomicUsize::new(parallel_scan_capacity()))
+}
+
+/// `APEX_PARALLEL_SCAN` diagnostic override (R5.12 semantics): unset
+/// lets the cost-based default decide; explicit 0/1 or malformed values
+/// force the serial default; explicit N >= 2 forces N requested workers,
+/// mirroring the APEX_BATCH_SCAN diagnostics.
+enum ParallelScanOverride {
+    Auto,
+    ForceSerial,
+    Request(usize),
 }
 
 /// Holds in-flight worker tokens; returns them on drop so every exit path
@@ -810,6 +823,7 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
         predicate: &crate::storage::ScanPredicateExpr,
+        table_key: &str,
     ) -> io::Result<Option<ApexResult>> {
         if !Self::batch_scan_enabled() {
             return Ok(None);
@@ -883,13 +897,14 @@ impl ApexExecutor {
             projection: Some(&projection),
             predicate: Some(predicate),
         };
-        // APEX_PARALLEL_SCAN (B phase, opt-in): N requests fused
+        // Parallel batch scan (architecture review R5.11/R5.12): fused
         // scan+fold workers over contiguous row-group ranges; the
         // process-wide in-flight budget decides how many are actually
-        // granted. Unset / 0 / 1 / malformed values, and a query that is
-        // granted no free tokens, stay on the unchanged serial streaming
-        // default, so oversubscription stays bounded.
-        let granted = Self::parallel_scan_requested()
+        // granted. APEX_PARALLEL_SCAN=N (N >= 2) forces N, 0/1/malformed
+        // forces serial, unset runs the cost-based auto-enable; a query
+        // granted no free tokens stays on the serial streaming default,
+        // so oversubscription stays bounded.
+        let granted = Self::parallel_workers_requested(table_key, stmt)
             .and_then(|requested| Self::try_acquire_parallel_tokens(requested));
         let (agg, batch_count, parallel_threads) = match granted {
             Some(threads) => {
@@ -1005,14 +1020,57 @@ impl ApexExecutor {
         }
     }
 
-    /// `APEX_PARALLEL_SCAN=N` (R5.7 phase A, opt-in): N >= 2 requests N
-    /// fold threads for the batched pipeline; unset, 0, 1, or malformed
-    /// values stay serial, mirroring the APEX_BATCH_SCAN diagnostics.
-    fn parallel_scan_requested() -> Option<usize> {
-        let value = std::env::var_os("APEX_PARALLEL_SCAN")?;
-        let text = value.to_str()?;
-        let requested = text.parse::<usize>().ok()?;
-        (requested >= 2).then_some(requested)
+    fn parallel_scan_override() -> ParallelScanOverride {
+        let Some(value) = std::env::var_os("APEX_PARALLEL_SCAN") else {
+            return ParallelScanOverride::Auto;
+        };
+        let Some(text) = value.to_str() else {
+            return ParallelScanOverride::ForceSerial;
+        };
+        let Some(requested) = text.parse::<usize>().ok() else {
+            return ParallelScanOverride::ForceSerial;
+        };
+        if requested >= 2 {
+            ParallelScanOverride::Request(requested)
+        } else {
+            ParallelScanOverride::ForceSerial
+        }
+    }
+
+    /// Requested worker count for the parallel batch pipeline: the
+    /// explicit override always wins; with APEX_PARALLEL_SCAN unset the
+    /// cost-based default decides (R5.12).
+    fn parallel_workers_requested(
+        table_key: &str,
+        stmt: &crate::query::sql_parser::SelectStatement,
+    ) -> Option<usize> {
+        match Self::parallel_scan_override() {
+            ParallelScanOverride::Request(requested) => Some(requested),
+            ParallelScanOverride::ForceSerial => None,
+            ParallelScanOverride::Auto => Self::auto_parallel_workers(table_key, stmt),
+        }
+    }
+
+    /// Cost-based auto-enable (architecture review R5.12): request the
+    /// in-flight budget cap when the R5.3-calibrated serial prediction
+    /// for (table, shape) reaches the 2 ms threshold and the measured
+    /// parallel history (if any) is still strictly faster than that
+    /// prediction - otherwise stay serial. The explicit override bypasses
+    /// this entirely. Contention degrades through the existing
+    /// min(requested, available) token mechanism.
+    fn auto_parallel_workers(
+        table_key: &str,
+        stmt: &crate::query::sql_parser::SelectStatement,
+    ) -> Option<usize> {
+        let (predicted_serial_us, parallel_samples, parallel_time_avg_us) =
+            crate::query::planner::parallel_decision_input(table_key, stmt)?;
+        if predicted_serial_us < crate::query::planner::PARALLEL_SCAN_AUTO_ENABLE_US {
+            return None;
+        }
+        if parallel_samples > 0 && parallel_time_avg_us >= predicted_serial_us {
+            return None;
+        }
+        Some(parallel_scan_capacity())
     }
 
     /// Take in-flight fold tokens for one query: min(requested, available);

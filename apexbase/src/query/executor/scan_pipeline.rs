@@ -441,7 +441,9 @@ impl ApexExecutor {
         // incremental group state keep scan memory bounded by one row group.
         // Any shape or state outside its gate falls through to the
         // single-batch path below.
-        if let Some(result) = Self::try_batch_group_pipeline(backend, stmt, &predicate)? {
+        if let Some(result) = Self::try_batch_group_pipeline(
+            backend, stmt, &predicate, backend.table_key(),
+        )? {
             return Ok(Some(result));
         }
 

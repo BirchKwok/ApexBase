@@ -965,6 +965,14 @@ impl TableStorageBackend {
         Ok(())
     }
 
+    /// The table file path as a string: the plan-feedback table key used
+    /// by the R5.12 auto-enable decision (the EXPLAIN ANALYZE recording
+    /// site keys on the same path; a non-UTF-8 path degrades to no
+    /// feedback, i.e. the serial default).
+    pub(crate) fn table_key(&self) -> &str {
+        self.path.to_str().unwrap_or_default()
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_with_durability(path, super::DurabilityLevel::Fast)
     }
